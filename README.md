@@ -64,6 +64,33 @@ $E run --confirm <TOKEN>               # sends traffic; run it inside tmux or sc
 
 The full walk-through, including opt-outs, stopping a run and packing results, is in [`run/QUICKSTART.md`](run/QUICKSTART.md).
 
+## Choosing how much of the Internet to scan
+
+The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:
+
+```yaml
+scope:
+  sample_fraction: 0.000001    # share of routable IPv4 addresses to scan
+approval:
+  max_sample_fraction: 0.000001   # the most your approval allows
+```
+
+`sample_fraction` is a fraction, not a percentage. There are about 3.7 billion routable IPv4 addresses, and every port is scanned on the same sample:
+
+| `sample_fraction` | Share of the Internet | Targets per port |
+|---|---|---|
+| `0.000001` (default) | 0.0001% | about 3,700 (the pilot) |
+| `0.00001` | 0.001% | about 37,000 |
+| `0.0001` | 0.01% | about 370,000 |
+| `0.001` | 0.1% | about 3.7 million |
+
+- `approval.max_sample_fraction` is copied from your real approval. A `sample_fraction` above it is rejected by `apply`, and so by `doctor`, `plan` and `run`.
+- A sample larger than a pilot is refused until a completed pilot exists in the output folder (`--skip-pilot-check` overrides this on purpose).
+- `seed` picks which addresses are in the sample. The same seed and fraction give the same addresses.
+- `plan` prints the fraction, the number of targets per port and the ZMap time estimate before it gives you the confirmation token. Nothing is sent until you run with that token.
+
+[`run/settings.example.yaml`](run/settings.example.yaml) is a copy of the file `init` writes, with every setting and its comment.
+
 ## Repository layout
 
 | Path | What is in it |

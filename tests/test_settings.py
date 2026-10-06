@@ -163,3 +163,9 @@ def test_sharding_is_refused_with_zmap_4_4_0(tmp_path):
     from scanner.internet.config import ConfigError
     with pytest.raises(ConfigError, match="not supported with ZMap 4.4.0"):
         load_config(tmp_path / "config.yaml")
+
+
+def test_settings_example_matches_what_init_writes(tmp_path):
+    written = st.write_settings(tmp_path, {})
+    example = Path(__file__).resolve().parent.parent / "run" / "settings.example.yaml"
+    assert example.read_text(encoding="utf-8") == written.read_text(encoding="utf-8")

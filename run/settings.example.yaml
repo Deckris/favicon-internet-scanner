@@ -1,0 +1,39 @@
+# scanner settings. This is the ONE file to edit; config.yaml and approval.yaml are generated from it.
+# `scanner apply` runs automatically before plan, doctor and run. Replace every REPLACE_ME.
+
+scanner_name: research-scanner        # first word of the user agent
+contact: REPLACE_ME                  # opt-out and abuse e-mail; someone must read it during the run
+info_url: REPLACE_ME                # public page: purpose, ports, tools, contact, how to opt out
+incident_contact: ""   # who is called if something goes wrong (default: contact)
+
+host:
+  public_ip: REPLACE_ME            # the address the Internet sees; must be an address your institution approved
+  source_ip: ""            # leave empty if the host carries public_ip itself; behind NAT give the private address
+  interface: eth0            # network interface that owns source_ip
+  egress_check: auto      # auto | nic (no outside lookup) | url (ask a public-IP service) | off
+  gateway_mac: ""        # optional; detected when empty
+
+scope:
+  exclusions_file: exclusions.txt   # one CIDR per line: the list from the network owner plus every opt-out
+  ports: [80, 443, 8080, 8090, 8443]
+  sample_fraction: 0.000001   # share of routable IPv4; 0.000001 is a pilot of about 3,700 targets per port
+  seed: 4
+  rate_pps: 100              # ZMap packets per second
+  min_seconds_between_probes_per_ip: 15   # pause between any two requests to the same address
+  dns_resolver: REPLACE_ME      # resolver for PTR and name checks; it sees every scanned address
+  try_unverified_names: false       # also request pages under certificate names that did not verify
+  offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it)
+
+approval:                           # copy these from the real approval; they cap what a run may ask for
+  status: blocked         # `blocked` until the approving authority has approved, then `approved`
+  reference: REPLACE_ME   # ticket or message reference of the approval
+  valid_until: "REPLACE_ME"      # ISO 8601 with timezone, e.g. 2026-12-31T23:59:59+00:00
+  max_rate_pps: 100
+  max_sample_fraction: 0.000001
+  min_seconds_between_probes_per_ip: 15   # the approved pause between requests to one address; never below 15
+  data_handling: REPLACE_ME    # where raw output is kept, who may read it, when it is deleted
+
+run:
+  label: pilot
+  output_dir: runs
+  kill_switch_file: STOP   # `scanner stop` creates this file
