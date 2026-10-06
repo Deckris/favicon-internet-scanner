@@ -14,6 +14,8 @@ CONFIG="config.yaml"
 IMAGE="${SCANNER_IMAGE:-scanner:1}"
 NAME="scanner-run"
 PY="${SCANNER_PYTHON:-$HOME/scanner-venv/bin/python}"
+# Docker mode runs as you. A work folder on a Windows drive is not writable by another uid: set SCANNER_DOCKER_USER=0:0 there.
+DOCKER_USER="${SCANNER_DOCKER_USER:-$(id -u):$(id -g)}"
 
 usage() {
   cat <<'EOF'
@@ -150,7 +152,7 @@ scanner() {
     [ -t 0 ] && [ -t 1 ] && tty=(-it)
     docker run --rm --init "${tty[@]}" --name "$NAME" --stop-timeout 60 \
       --network host --cap-drop ALL --cap-add NET_RAW \
-      --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp \
+      --user "$DOCKER_USER" --read-only --tmpfs /tmp \
       -v "$WORKDIR:/work" -w /work "$IMAGE" "$@"
   else
     [ -x "$PY" ] || die "python venv not found at $PY (run: sudo bash run/setup-wsl.sh)"
@@ -186,7 +188,7 @@ case "$CMD" in
     out="$WORKDIR/verify-$(date -u +%Y%m%dT%H%M%SZ)"
     if [ "$MODE" = docker ]; then
       check_image
-      docker run --rm --init --network none --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp:rw,exec \
+      docker run --rm --init --network none --user "$DOCKER_USER" --read-only --tmpfs /tmp:rw,exec \
         -v "$WORKDIR:/work" -w /work --entrypoint python "$IMAGE" /opt/app/run/verify_offline.py --output "/work/${out##*/}"
     else
       [ -x "$PY" ] || die "python venv not found at $PY"

@@ -13,7 +13,7 @@ The scanner takes a seeded random sample of IPv4 addresses, finds responsive web
 | Network | `--network host` | Direct |
 | Privileges | Runs as your user, all capabilities dropped except raw sockets | `setcap` on the ZMap binary, the pipeline runs unprivileged |
 
-Both run the same Python program. Docker mode expects the work folder to be owned by you on a Linux filesystem; a folder mounted from Windows is not supported.
+Both run the same Python program. Docker mode expects the work folder to be owned by you on a Linux filesystem. On a Windows drive the container user cannot write to it: set `SCANNER_DOCKER_USER=0:0` for that run. In Docker mode `--exclusions` must name a file inside the work folder as the container sees it, for example `--exclusions /work/list.txt`.
 
 ## 2. Get the code and install
 
