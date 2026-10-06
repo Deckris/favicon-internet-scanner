@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+runs/
+verify-*/
+settings.yaml
+config.yaml
+approval.yaml
+exclusions.txt
+STOP
+*.results.tar.gz

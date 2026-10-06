@@ -1,0 +1,1 @@
+{"ip":"127.0.0.1","port":9447,"data":{"tls":{"status":"io-timeout","protocol":"tls","port":9447,"timestamp":"2026-10-04T19:52:46+02:00","error":"could not successfully complete tls handshake for target 127.0.0.1: read tcp 127.0.0.1:34106-\u003e127.0.0.1:9447: read: connection reset by peer"}}}

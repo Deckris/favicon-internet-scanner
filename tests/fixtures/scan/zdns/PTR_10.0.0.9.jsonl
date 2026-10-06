@@ -1,0 +1,1 @@
+{"name":"10.0.0.9","results":{"PTR":{"data":{"additionals":[{"flags":"","type":"EDNS0","udpsize":8192,"version":0}],"answers":[{"answer":"host.test.","class":"IN","name":"9.0.0.10.in-addr.arpa","ttl":60,"type":"PTR"}],"protocol":"udp","resolver":"127.0.0.1:5353"},"duration":0.005948964,"status":"NOERROR","timestamp":"2026-10-04T19:52:55+02:00"}}}

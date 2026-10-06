@@ -1,0 +1,112 @@
+# scanner run configuration template. Copy, fill in every REPLACE_ME, and
+# supply a real approval file. Loading this file as-is is refused.
+run_label: pilot
+
+vantage:
+  id: REPLACE_ME                 # short label for this scanning host
+  interface: eth0                # interface that owns source_ipv4
+  source_ipv4: REPLACE_ME        # address ZMap sends from. On a host whose NIC carries the public address this is the SAME
+                                 # value as public_egress_ip; behind NAT it is the private address.
+  public_egress_ip: REPLACE_ME   # the PUBLIC IPv4 the Internet sees; must be listed in the approval's source_addresses
+  # How the run confirms its public address (before starting and every 15-120 s while running; a change stops the run):
+  #   url: ask https://api.ipify.org (then ifconfig.me, icanhazip.com; or list your own in egress_check_urls)
+  #   nic: the interface itself carries the public address (needs source_ipv4 == public_egress_ip); no web service is used
+  #   off: not checked (the preflight reports a warning)
+  # egress_check: url
+  # egress_check_urls: ["https://api.ipify.org"]
+  # gateway_mac: "aa:bb:cc:dd:ee:ff"   # optional; ZMap auto-detects the gateway when omitted
+
+sample:
+  fraction: 0.000001             # 0.0001% of the allowed IPv4 space (about 3,700 targets per port): a PILOT. A larger sample is
+                                 # refused until a completed pilot exists. Never exceed approval max_sample_fraction.
+  seed: 4                        # fixed seed => the same sample on every port and every rerun
+  # shards: leave unset. With ZMap 4.4.0 the target count is divided across shards, so the sample-list check
+                                 # refuses a sharded run before any packet is sent. Run unsharded.
+
+measurement:
+  zmap_version: "4.4.0"        # exact tested release; changes the iterator, pacing and CSV flags
+  ports: [80, 443, 8080, 8090, 8443]
+  zmap_rate: 100                 # packets/second; conservative start. Must be <= approval max_rate_per_second
+  zmap_max_runtime: 3600         # seconds per port; preflight refuses if too short for the sample
+  zmap_cooldown: 8
+  zmap_probes: 1
+  min_seconds_between_probes_per_ip: 15   # pause between any two requests to the same address
+  zgrab_connect_timeout: 4.0
+  zgrab_target_timeout: 8.0
+  zgrab_senders: 50
+  zgrab_batch_size: 2000
+
+target_policy:
+  exclusions_file: REPLACE_ME    # opt-out / protected ranges, one CIDR per line
+  exclusions_sha256: REPLACE_ME  # sha256sum of that file; must equal the approval's exclusions_checksum
+  approval_file: REPLACE_ME      # machine-readable approval (see approval.example.yaml)
+  hostname_policy:
+    mode: any_public             # any_public | suffix_allowlist
+    suffixes: []
+
+dns:
+  resolvers: ["REPLACE_ME"]      # IPv4 resolver(s); an institutional recursive resolver may be private
+  timeout: 10          # whole-name budget, seconds
+  network_timeout: 5   # per-try budget, seconds
+  retries: 2
+  threads: 50
+  max_cnames: 8
+  canary_name: example.com
+
+hostnames:
+  max_candidates_per_ip: 20
+
+sni_confirm:
+  enabled: true
+  max_per_endpoint: 3
+
+# Flag (never skip) addresses that open this many scanned ports without any TLS/HTTP answer.
+tarpit:
+  min_open_ports: 4
+  tiny_window_below: 246   # SYN-ACK windows below this (bytes) are tarpit-like
+
+favicon:
+  enabled: true
+  max_hostnames_per_endpoint: 3
+  workers: 64
+  max_icons_per_page: 4
+  # Keep every icon that decodes as an image under <run>/favicons/ (named by sha256) with an index.jsonl.
+  # store_images: true
+  # Also request the page under candidate names that did NOT verify (Host/SNI only, same scanned ip:port). 0 = off.
+  max_unverified_names_per_endpoint: 2
+  # Icons a page declares on OTHER hosts (CDNs). This contacts hosts outside the sample, so the approval must
+  # list offhost_icon_fetch. Web ports only, public addresses only, one request per unique URL.
+  offhost_icons:
+    enabled: false               # contacts hosts outside the sample: enable only if the approval names offhost_icon_fetch
+    max_total_fetches: 500
+    max_per_host: 3
+    min_interval_seconds: 1.0
+    max_bytes: 262144
+
+fetch:
+  connect_timeout: 4.0
+  read_timeout: 8.0
+  total_timeout: 15.0
+  max_document_bytes: 1048576
+  max_favicon_bytes: 524288
+  max_decoded_bytes: 4194304
+  max_redirects: 3
+  user_agent: "REPLACE_ME (+https://REPLACE_ME; contact REPLACE_ME)"   # must embed the info URL or contact below
+
+transparency:
+  info_url: "REPLACE_ME"
+  contact: "REPLACE_ME"
+
+output:
+  dir: runs   # use an absolute path; relative paths are resolved against THIS file
+  # max_listed_targets: 1000000      # above this many targets per shard the full target list is not written
+
+operations:
+  kill_switch_file: /tmp/scanner.KILL     # `touch` it: running tools are stopped within ~1 s and the run is marked partial
+  # egress_check_seconds: 120             # how often the public address is re-checked during a run (0 = off)
+  # min_free_mib: 512                     # the run stops when free disk space drops below this
+
+binaries:
+  zmap: /opt/scanner/zmap-4.4.0/sbin/zmap
+  zgrab2: /usr/local/bin/zgrab2
+  zdns: /usr/local/bin/zdns

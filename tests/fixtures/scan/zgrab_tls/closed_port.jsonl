@@ -1,0 +1,1 @@
+{"ip":"127.0.0.1","port":9999,"data":{"tls":{"status":"connection-timeout","protocol":"tls","port":9999,"timestamp":"2026-10-04T19:52:52+02:00","error":"could not initiate a L4 connection with L4 dialer: dial context failed: dial tcp 127.0.0.1:9999: connect: connection refused"}}}

@@ -1,0 +1,1 @@
+{"name":"10.0.0.77","results":{"PTR":{"data":{"additionals":[{"flags":"","type":"EDNS0","udpsize":8192,"version":0}],"protocol":"udp","resolver":"127.0.0.1:5353"},"duration":0.006681405,"error":"cycling lookup failed - out of retries. Last error: %!w(\u003cnil\u003e)","status":"NXDOMAIN","timestamp":"2026-10-04T19:52:55+02:00"}}}

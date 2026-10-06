@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# scanner - single entry point for the scanner (native Python or Docker).
+#
+#   scanner [--docker|--native] [--workdir DIR] [--config FILE] COMMAND [options]
+#
+# All limits (approval, rate cap, egress guard, kill switch, run-once guard) are enforced by the
+# Python program, not by this script; the script only starts it the same way every time.
+set -euo pipefail
+
+PKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MODE="${SCANNER_MODE:-native}"
+WORKDIR="$PWD"
+CONFIG="config.yaml"
+IMAGE="${SCANNER_IMAGE:-scanner:1}"
+NAME="scanner-run"
+PY="${SCANNER_PYTHON:-$HOME/scanner-venv/bin/python}"
+
+usage() {
+  cat <<'EOF'
+usage: scanner [--docker|--native] [--workdir DIR] COMMAND [options]
+       scanner help COMMAND        details and examples for one command
+
+Set up (once):
+  init                           create settings.yaml: the one file with contact, addresses, exclusions, limits
+  exclusions                     add opt-out ranges to the exclusion list
+  apply                          check settings.yaml and generate config.yaml + approval.yaml (done automatically)
+
+Run:
+  doctor [--offline]             check the host, address, tools and approval (sends almost nothing)
+  plan                           show what would be scanned and the confirmation token (sends nothing)
+  run --confirm TOKEN            run the pipeline: ZMap -> ZGrab2 -> ZDNS -> favicons
+  stop                           ask a running scan to stop
+  summary RUN_DIR                print the run's report
+  pack RUN_DIR                   make a results archive (raw tool output excluded)
+
+Other:
+  build                          docker mode: build the image from this package
+  verify                         offline test suite (sends nothing)
+  favicons --source-run DIR      repeat the favicon lookups of a finished run
+
+--workdir holds settings.yaml, the exclusion list and the output folder (default: current directory).
+Docker mode needs host networking and runs without root, with only the raw-socket capability.
+All limits are enforced by the Python program, not by this script.
+EOF
+}
+
+cmd_help() {
+  case "${1:-}" in
+    init) cat <<'EOF'
+scanner init [--contact EMAIL] [--info-url URL] [--egress-ip IP] [--source-ip IP] [--interface IF]
+             [--resolver IP] [--incident-contact EMAIL] [--exclusions FILE] [--label NAME] [--force]
+
+Writes settings.yaml into the work folder. Anything you leave out is written as REPLACE_ME and must be
+filled in before `scanner apply` accepts it. --exclusions FILE copies the list from the network owner to
+exclusions.txt.
+  scanner --workdir ~/scan init --contact scan-optout@uni.example --info-url https://uni.example/scan \
+          --egress-ip 192.0.2.10 --interface eth0 --resolver 192.0.2.53 --exclusions owner-list.txt
+EOF
+    ;;
+    apply) cat <<'EOF'
+scanner apply
+
+Validates settings.yaml (e-mail, URL, addresses, rate and size against the approved caps, exclusion list) and
+writes config.yaml and approval.yaml, with the exclusion list's checksum in both. It runs by itself before
+doctor, plan, run and favicons, and tells you in plain words what is missing.
+EOF
+    ;;
+    exclusions) cat <<'EOF'
+scanner exclusions --add CIDR [CIDR ...] | --from-file FILE
+
+Adds ranges (an opt-out, or a list from the network owner) to the exclusion list named in settings.yaml.
+Run `scanner apply` afterwards (it runs automatically before the next plan) so the checksum follows; a changed
+list means a new plan token.
+  scanner exclusions --add 203.0.113.0/24 198.51.100.7/32
+EOF
+    ;;
+    doctor) cat <<'EOF'
+scanner doctor [--offline]
+
+Checks the tools, the approval, the exclusion list, the source address and the DNS resolver. --offline skips
+the network checks. With egress_check auto and no NAT it reads the address from the network card and asks no
+outside service.
+EOF
+    ;;
+    plan) cat <<'EOF'
+scanner plan
+
+Prints targets, ports, rate, estimated time and the confirmation token. Sends nothing.
+EOF
+    ;;
+    run) cat <<'EOF'
+scanner run --confirm TOKEN [--allow-rerun] [--skip-pilot-check]
+
+Runs the pipeline. Refused without a contact and information page, past the approved rate or size, outside the
+approval's validity, and for a large sample until a small pilot has completed (--skip-pilot-check overrides the
+last). Requests to one address are at least min_seconds_between_probes_per_ip apart. `scanner stop` ends it.
+EOF
+    ;;
+    stop|summary|pack|build|verify|favicons) usage ;;
+    *) usage ;;
+  esac
+}
+
+die() { echo "scanner: $*" >&2; exit 2; }
+
+ARGS=(); HELP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --docker) MODE=docker; shift ;;
+    --native) MODE=native; shift ;;
+    --workdir) WORKDIR="${2:?--workdir needs a directory}"; shift 2 ;;
+    --config) CONFIG="${2:?--config needs a file}"; shift 2 ;;
+    -h|--help) HELP=1; shift ;;
+    help) HELP=1; shift ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+if [ "$HELP" = 1 ]; then cmd_help "${ARGS[0]:-}"; exit 0; fi
+[ ${#ARGS[@]} -gt 0 ] || { usage >&2; exit 2; }
+CMD="${ARGS[0]}"; REST=("${ARGS[@]:1}")
+WORKDIR="$(cd "$WORKDIR" && pwd)"
+case "$CONFIG" in /*) CONFIG_ABS="$CONFIG" ;; *) CONFIG_ABS="$WORKDIR/$CONFIG" ;; esac
+
+# Paths as the program sees them (inside the container the workdir is /work).
+if [ "$MODE" = docker ]; then
+  case "$CONFIG_ABS" in "$WORKDIR"/*) CONFIG_IN="/work/${CONFIG_ABS#"$WORKDIR"/}" ;; *) die "in docker mode --config must be inside --workdir" ;; esac
+else
+  CONFIG_IN="$CONFIG_ABS"
+fi
+
+# Run the scanner program; $1.. are its arguments.
+scanner() {
+  if [ "$MODE" = docker ]; then
+    command -v docker >/dev/null || die "docker not found"
+    local tty=()
+    [ -t 0 ] && [ -t 1 ] && tty=(-it)
+    docker run --rm --init "${tty[@]}" --name "$NAME" --stop-timeout 60 \
+      --network host --cap-drop ALL --cap-add NET_RAW \
+      --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp \
+      -v "$WORKDIR:/work" -w /work "$IMAGE" "$@"
+  else
+    [ -x "$PY" ] || die "python venv not found at $PY (run: sudo bash run/setup-wsl.sh)"
+    PYTHONPATH="$PKG_ROOT" PYTHONDONTWRITEBYTECODE=1 "$PY" -m scanner.internet "$@"
+  fi
+}
+
+kill_switch() {   # path of the kill-switch file as the program sees it
+  local ks
+  ks=$(awk '/^[[:space:]]*kill_switch_file:/ {print $2; exit}' "$CONFIG_ABS" | tr -d "\"'")
+  [ -n "$ks" ] || die "no operations.kill_switch_file in $CONFIG_ABS"
+  case "$ks" in /*) echo "$ks" ;; *) echo "$(dirname "$CONFIG_IN")/$ks" ;; esac
+}
+
+WORK_IN="$WORKDIR"; [ "$MODE" = docker ] && WORK_IN=/work
+
+# settings.yaml is the one file people edit; make config.yaml and approval.yaml follow it.
+ensure_applied() {
+  [ -f "$WORKDIR/settings.yaml" ] || return 0
+  scanner apply --workdir "$WORK_IN" >/dev/null || die "settings.yaml needs attention (run: scanner apply)"
+}
+
+case "$CMD" in
+  init)       scanner init --workdir "$WORK_IN" "${REST[@]}" ;;
+  apply)      scanner apply --workdir "$WORK_IN" ;;
+  exclusions) scanner exclusions --workdir "$WORK_IN" "${REST[@]}" ;;
+  build)
+    [ "$MODE" = docker ] || die "build is for docker mode (use --docker)"
+    docker build -f "$PKG_ROOT/run/Dockerfile" --build-arg "PACKAGE_VERSION=$(cat "$PKG_ROOT/VERSION" 2>/dev/null || echo unversioned)" \
+      -t "$IMAGE" "$PKG_ROOT"
+    ;;
+  verify)
+    out="$WORKDIR/verify-$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ "$MODE" = docker ]; then
+      docker run --rm --init --network none --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp:rw,exec \
+        -v "$WORKDIR:/work" -w /work --entrypoint python "$IMAGE" /opt/app/run/verify_offline.py --output "/work/${out##*/}"
+    else
+      [ -x "$PY" ] || die "python venv not found at $PY"
+      "$PY" "$PKG_ROOT/run/verify_offline.py" --output "$out"
+    fi
+    ;;
+  doctor)    ensure_applied; scanner preflight --config "$CONFIG_IN" "${REST[@]}" ;;
+  plan)      ensure_applied; scanner plan --config "$CONFIG_IN" ;;
+  run)       ensure_applied; scanner run --config "$CONFIG_IN" "${REST[@]}" ;;
+  favicons)
+    src=""; extra=()
+    while [ ${#REST[@]} -gt 0 ]; do
+      case "${REST[0]}" in
+        --source-run) src="${REST[1]:?--source-run needs a directory}"; REST=("${REST[@]:2}") ;;
+        *) extra+=("${REST[0]}"); REST=("${REST[@]:1}") ;;
+      esac
+    done
+    [ -n "$src" ] || die "favicons needs --source-run DIR"
+    case "$src" in /*) ;; *) src="$WORKDIR/$src" ;; esac
+    if [ "$MODE" = docker ]; then case "$src" in "$WORKDIR"/*) src="/work/${src#"$WORKDIR"/}" ;; *) die "--source-run must be inside --workdir in docker mode" ;; esac; fi
+    ensure_applied
+    scanner favicon-refetch --config "$CONFIG_IN" --source-run "$src" "${extra[@]}"
+    ;;
+  stop)
+    ks="$(kill_switch)"
+    if [ "$MODE" = docker ]; then docker exec "$NAME" touch "$ks"; else touch "$ks"; fi
+    echo "stop requested: $ks (running tools stop within about a second; the run is marked partial)"
+    ;;
+  summary)
+    [ ${#REST[@]} -ge 1 ] || die "summary needs RUN_DIR"
+    cat "${REST[0]}/report/summary.md"
+    ;;
+  pack)
+    [ ${#REST[@]} -ge 1 ] || die "pack needs RUN_DIR"
+    run="$(cd "${REST[0]}" && pwd)"; raw=0
+    [ "${REST[1]:-}" = "--with-raw" ] && raw=1
+    grep -q '"complete": true' "$run/manifest.json" || echo "scanner: WARNING: this run's manifest is not marked complete" >&2
+    tarball="$run.results.tar.gz"
+    excl=(); [ "$raw" -eq 1 ] || excl=(--exclude="$(basename "$run")/raw")
+    tar -C "$(dirname "$run")" "${excl[@]}" -czf "$tarball" "$(basename "$run")"
+    ( cd "$(dirname "$tarball")" && sha256sum "$(basename "$tarball")" | tee "$(basename "$tarball").SHA256SUMS" )
+    ls -l "$tarball"
+    ;;
+  *) usage >&2; die "unknown command: $CMD" ;;
+esac

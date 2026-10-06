@@ -1,0 +1,1 @@
+{"name":"a.test","results":{"AAAA":{"data":{"additionals":[{"flags":"","type":"EDNS0","udpsize":8192,"version":0}],"answers":[{"answer":"2001:db8::1","class":"IN","name":"a.test","ttl":60,"type":"AAAA"}],"protocol":"udp","resolver":"127.0.0.1:5353"},"duration":0.006434009,"status":"NOERROR","timestamp":"2026-10-04T19:52:55+02:00"}}}

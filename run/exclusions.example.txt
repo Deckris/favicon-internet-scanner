@@ -1,0 +1,9 @@
+# Example only: replace with the list agreed with the network owner and the institution.
+# A real list covers, at least: government and military ranges, national CERT/CSIRT and security-team ranges,
+# network telescopes and research honeypots, and every address whose owner has asked to be left alone.
+# Keep the real list private: publishing it can reveal who opted out. Add new opt-outs before the next run.
+# One CIDR per line. The runner separately excludes reserved IPv4 space.
+# Compute SHA-256 of the final private list and bind config + approval to it.
+192.0.2.0/24
+198.51.100.0/24
+203.0.113.0/24

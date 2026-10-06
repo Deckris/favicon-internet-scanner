@@ -1,0 +1,1 @@
+{"name":"timeout.test","results":{"A":{"data":{"protocol":"udp","resolver":"127.0.0.1:5353"},"duration":2.000558323,"error":"cycling lookup failed - context expired","status":"TIMEOUT","timestamp":"2026-10-04T19:52:55+02:00"}}}

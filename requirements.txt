@@ -1,0 +1,13 @@
+# Pipeline + ground-truth tooling. Scanning itself is done by ZMap/ZGrab2 (system
+# binaries), not pip packages.
+mmh3>=4.1
+Pillow>=10.0
+ImageHash>=4.3
+httpx>=0.27          # ground-truth collection only (not the internet scan)
+PyYAML>=6.0
+defusedxml>=0.7      # SVG parsing hardened against entity expansion
+resvg-py>=0.1        # deterministic SVG rasterisation in a bounded subprocess
+dnspython>=2.6       # DNS / rDNS enrichment
+cryptography>=42.0   # TLS certificate (SAN) parsing
+brotli>=1.2.0         # bounded output_buffer_limit API used by the streaming decoder
+pytest>=8.0           # run-sample.sh runs the offline test suite before anything is sent
