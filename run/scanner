@@ -213,7 +213,7 @@ case "$CMD" in
   stop)
     ks="$(kill_switch)"
     if [ "$MODE" = docker ]; then docker exec "$NAME" touch "$ks"; else touch "$ks"; fi
-    echo "stop requested: $ks (running tools stop within about a second; the run is marked partial)"
+    echo "stop requested: $ks (the running stage stops within a few seconds; the run is marked partial)"
     ;;
   summary)
     [ ${#REST[@]} -ge 1 ] || die "summary needs RUN_DIR"

@@ -18,7 +18,7 @@ import time
 import zlib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
 import httpx
@@ -127,6 +127,7 @@ class WebFetcher:
         retry_statuses: tuple[int, ...] = (429, 503),
         max_retries: int = 1,
         retry_after_cap: float = 2.0,
+        killed: Callable[[], bool] = lambda: False,
     ) -> None:
         self.policy = policy
         self.resolver = resolver
@@ -136,6 +137,7 @@ class WebFetcher:
         self.retry_statuses = retry_statuses
         self.max_retries = max_retries
         self.retry_after_cap = retry_after_cap
+        self.killed = killed
 
     def fetch(self, url: str, *, connect_ip: str | None, kind: str, context: str = "") -> tuple[FetchResult, bytes | None]:
         limits = self.favicon_limits if kind == "favicon" else self.document_limits
@@ -299,8 +301,15 @@ class WebFetcher:
                     client.close()
                 except Exception:
                     pass
-        watchdog = threading.Timer(min(max(0.05, deadline - time.monotonic()), 3600.0), expire)
-        watchdog.daemon = True
+        done = threading.Event()
+
+        def watch() -> None:
+            # Ends the request at its deadline, or within half a second of the kill switch.
+            while not done.wait(0.25):
+                if time.monotonic() >= deadline or self.killed():
+                    expire()
+                    return
+        watchdog = threading.Thread(target=watch, daemon=True)
         watchdog.start()
         try:
             result = self._one_request_inner(parts, hostname, port, connect_ip, limits, timeout, deadline, holder)
@@ -309,7 +318,7 @@ class WebFetcher:
                 raise
             result = None
         finally:
-            watchdog.cancel()
+            done.set()
         if result is None or (fired.is_set() and result.kind == "transport"):
             return _RequestOutcome(kind="transport", outcome="timeout", http_status=None, content_type=None, content_encoding=None, location=None,
                                    body=None, body_bytes=0, certificate=None, retry_after_seconds=None, connect_ip=connect_ip,

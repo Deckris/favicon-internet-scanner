@@ -122,3 +122,40 @@ def test_icon_url_with_an_impossible_port_is_a_clean_failure_not_an_exception():
     fetcher = WebFetcher(TargetPolicy.for_tests(["127.0.0.1/32"]), None, user_agent="t", document_limits=lim, favicon_limits=lim)
     res, _ = fetcher.fetch("http://127.0.0.1:99999999/x", connect_ip="127.0.0.1", kind="favicon")
     assert res.outcome != "ok"
+
+
+def test_kill_switch_ends_a_request_that_is_still_dripping_its_response():
+    import socket
+    import threading
+    import time
+    from types import SimpleNamespace as NS
+
+    from scanner.internet import favicon as fav
+    from scanner.safety import TargetPolicy
+    from scanner.internet.selftest import _NoDns
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+
+    def drip():
+        c, _ = srv.accept()
+        try:
+            c.recv(4096)
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n")
+            for _ in range(100):
+                c.sendall(b"a")
+                time.sleep(0.2)
+        except OSError:
+            pass
+    threading.Thread(target=drip, daemon=True).start()
+    port = srv.getsockname()[1]
+    stop = {"now": False}
+    threading.Timer(1.0, lambda: stop.update(now=True)).start()
+    lim = fav._limits(NS(fetch=NS(connect_timeout=4, read_timeout=8, total_timeout=30, max_redirects=3, max_decoded_bytes=4194304)), 1 << 20)
+    fetcher = fav.GuardedFetcher(TargetPolicy.for_tests(["127.0.0.1/32"]), _NoDns(), user_agent="t", allowed_endpoints={("127.0.0.1", port)},
+                                 document_limits=lim, favicon_limits=lim, killed=lambda: stop["now"])
+    started = time.monotonic()
+    fav.probe_identity(fetcher, scheme="http", ip="127.0.0.1", port=port, hostname=None, max_icons=1)
+    assert time.monotonic() - started < 5          # without the kill check this waits for the 30 s total timeout
+    srv.close()

@@ -240,7 +240,7 @@ def offhost_policy(cfg: Any, exclusions: list[str]) -> TargetPolicy:
 def make_fetcher(cfg: Any, policy: TargetPolicy, resolver: Any, allowed_endpoints: set[tuple[str, int]],
                  *, exclusions: list[str] | None = None, killed: Any = lambda: False, state_path: Any = None,
                  pacer: Any = None) -> Any:
-    local = _make_local_fetcher(cfg, policy, resolver, allowed_endpoints, pacer)
+    local = _make_local_fetcher(cfg, policy, resolver, allowed_endpoints, pacer, killed)
     oh = cfg.favicon.offhost
     if not oh.enabled:
         return local
@@ -254,9 +254,9 @@ def make_fetcher(cfg: Any, policy: TargetPolicy, resolver: Any, allowed_endpoint
 
 
 def _make_local_fetcher(cfg: Any, policy: TargetPolicy, resolver: Any, allowed_endpoints: set[tuple[str, int]],
-                        pacer: Any = None) -> WebFetcher:
+                        pacer: Any = None, killed: Any = lambda: False) -> WebFetcher:
     return GuardedFetcher(
-        policy, resolver, user_agent=cfg.fetch.user_agent, allowed_endpoints=allowed_endpoints, pacer=pacer,
+        policy, resolver, user_agent=cfg.fetch.user_agent, allowed_endpoints=allowed_endpoints, pacer=pacer, killed=killed,
         document_limits=_limits(cfg, cfg.fetch.max_document_bytes),
         favicon_limits=_limits(cfg, cfg.fetch.max_favicon_bytes),
         retry_statuses=cfg.fetch.retry_statuses, max_retries=cfg.fetch.max_retries,
