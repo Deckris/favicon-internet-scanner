@@ -104,6 +104,7 @@ class FakeTools:
         self.windows: dict[tuple[str, int], int] = {}      # SYN-ACK window per endpoint (default: a normal 64240)
         self.commands: list[list[str]] = []
         self.zdns_inputs: dict[str, list[str]] = {}
+        self.zgrab_ips: list[str] = []                       # every address ZGrab2 was asked to contact
 
     def __call__(self, command: list[str], **kw: Any) -> Any:
         self.commands.append(list(command))
@@ -133,6 +134,7 @@ class FakeTools:
         for row in stdin.splitlines():
             ip, domain, _tag, port = (row.split(",") + ["", "", "", ""])[:4]
             port = int(port)
+            self.zgrab_ips.append(ip)
             if module == "tls":
                 kind = self.tls_sni.get((ip, domain)) if domain else self.tls.get((ip, port), "refused")
                 lines.append(_tls_line(ip, port, domain or None, kind or "close"))

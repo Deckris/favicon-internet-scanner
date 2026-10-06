@@ -267,3 +267,15 @@ def test_preflight_refuses_when_egress_ip_is_not_the_approved_source(cfg, tmp_pa
     assert egress(cfg.vantage.public_egress_ip)["status"] == "pass"
     assert egress("198.51.100.99")["status"] == "fail"            # the address moved
     assert egress(None)["status"] == "fail"                       # unknown is not good enough
+
+
+def test_tarpit_address_gets_only_the_syn_and_is_flagged(cfg):
+    ft = tools()
+    ft.windows[(IP_OK, 443)] = 0
+    run_dir = go(cfg, ft)
+    assert ft.zgrab_ips and IP_OK not in ft.zgrab_ips and IP_HTTP in ft.zgrab_ips
+    rows = [json.loads(l) for l in (run_dir / "normalized" / "endpoints.jsonl").read_text().splitlines()]
+    tar = next(r for r in rows if r["target_ip"] == IP_OK)
+    assert tar["tarpit_suspect"] and tar["tls_status"] == "not_attempted" and tar["protocol"] == "not_attempted"
+    assert next(r for r in rows if r["target_ip"] == IP_HTTP)["tls_status"] != "not_attempted"
+    assert json.loads((run_dir / "report" / "summary.json").read_text())["counts"]["tarpit_ips_not_probed"] == 1

@@ -344,6 +344,12 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     counts["l4_per_port"] = {str(p): len(l4.get(p, [])) for p in cfg.measurement.ports}
     counts["l4_endpoints"] = len(endpoints)
     counts["l4_unique_ips"] = len({ip for ip, _ in endpoints})
+    # An address whose SYN-ACK advertises a zero or tiny TCP window is a tarpit: it holds connections open on purpose.
+    # It stays in the results (flagged) but receives nothing beyond the ZMap SYN.
+    tiny = cfg.tarpit.tiny_window_below
+    tarpit_ips = {ip for (ip, _), f in synack.items() if f.get("window") is not None and f["window"] < tiny}
+    probe_endpoints = [e for e in endpoints if e[0] not in tarpit_ips]
+    counts["tarpit_ips_not_probed"] = len({ip for ip, _ in endpoints} & tarpit_ips)
     counts["sample_targets_per_port"] = splan.targets_per_port
 
     # ---- Stage 2: TLS first, direct IP (no SNI) ---------------------------------------------
@@ -353,7 +359,7 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         def one(batch):
             return tlsmod.run_tls_batches(batch, mode="direct_ip", cfg=cfgview, policy=policy, run_dir=run_dir,
                                           binary=cfg.binaries.zgrab2, executor=executor)
-        for j, res in pacing.paced_rounds([(ip, port, None) for ip, port in endpoints], lambda t: t[0], gap, one):
+        for j, res in pacing.paced_rounds([(ip, port, None) for ip, port in probe_endpoints], lambda t: t[0], gap, one):
             jobs.extend(j)
             for r in res:
                 if r.ip:

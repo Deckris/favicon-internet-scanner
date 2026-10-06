@@ -78,6 +78,7 @@ $E pack runs/<run-dir>          # archive of the manifest and report
 - The public egress address is checked before and during the run; a change stops it.
 - A kill-switch file, a disk-space guard and an approval-expiry guard.
 - Favicon fetches stay on the IP and port pairs that answered the scan; redirects and icon URLs elsewhere are refused.
+- An address whose SYN-ACK advertises a zero or tiny TCP window (a tarpit) gets nothing beyond the ZMap SYN; it stays in the results, flagged, and the summary counts `tarpit_ips_not_probed`.
 - ZMap runs one port at a time, with the configured pause between port runs.
 - A second run of an identical config is refused, and every run writes a manifest with checksums and its limits.
 
