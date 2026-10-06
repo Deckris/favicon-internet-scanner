@@ -8,6 +8,7 @@ are the approved values, kept separate from what a run asks for, so raising a ru
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
 import ipaddress
 import math
 import re
@@ -18,6 +19,7 @@ import yaml
 
 PLACEHOLDER = "REPLACE_ME"
 SETTINGS_NAME, CONFIG_NAME, APPROVAL_NAME = "settings.yaml", "config.yaml", "approval.yaml"
+MIN_PACE_SECONDS = 15.0                    # the shortest pause between two requests to one address that any approval may allow
 ALLOWED_ADDRESSES = 3_702_258_432          # routable IPv4 after reserved space; the run recomputes the exact figure
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -54,6 +56,7 @@ approval:                           # copy these from the real approval; they ca
   valid_until: "{valid_until}"      # ISO 8601 with timezone, e.g. 2026-12-31T23:59:59+00:00
   max_rate_pps: {max_rate_pps}
   max_sample_fraction: {max_fraction}
+  min_seconds_between_probes_per_ip: {approval_pace}   # the approved pause between requests to one address; never below 15
   data_handling: {data_handling}    # where raw output is kept, who may read it, when it is deleted
 
 run:
@@ -67,7 +70,7 @@ DEFAULTS: dict[str, Any] = {
     "public_ip": PLACEHOLDER, "source_ip": '""', "interface": "eth0", "egress_check": "auto", "gateway_mac": '""',
     "exclusions_file": "exclusions.txt", "ports": "[80, 443, 8080, 8090, 8443]", "sample_fraction": "0.000001",
     "seed": "4", "rate_pps": "100", "pace": "15", "dns_resolver": PLACEHOLDER, "approval_status": "blocked",
-    "approval_reference": PLACEHOLDER, "valid_until": PLACEHOLDER, "max_rate_pps": "100", "max_fraction": "0.000001",
+    "approval_reference": PLACEHOLDER, "valid_until": PLACEHOLDER, "max_rate_pps": "100", "max_fraction": "0.000001", "approval_pace": "15",
     "data_handling": PLACEHOLDER, "label": "pilot", "output_dir": "runs", "kill_switch": "STOP",
 }
 
@@ -143,9 +146,11 @@ def read_exclusions(path: Path) -> list[str]:
         if not text:
             continue
         try:
-            cidrs.append(str(ipaddress.ip_network(text, strict=False)))
+            net = ipaddress.ip_network(text, strict=False)
         except ValueError as exc:
             raise SettingsError(f"{path} line {number}: `{text}` is not an address or CIDR block") from exc
+        if net.version == 4:      # the scanner is IPv4-only; IPv6 entries stay in the file and are ignored
+            cidrs.append(str(net))
     return cidrs
 
 
@@ -200,14 +205,33 @@ def apply(workdir: Path) -> dict[str, Any]:
         raise SettingsError(f"info_url `{info}` must start with https:// (or http://)")
     for name, value in (("host.public_ip", host["public_ip"]), ("host.source_ip", host.get("source_ip") or host["public_ip"])):
         try:
-            ipaddress.IPv4Address(str(value))
+            address = ipaddress.IPv4Address(str(value))
         except ValueError as exc:
             raise SettingsError(f"{name} `{value}` is not an IPv4 address") from exc
+        if name == "host.public_ip" and not address.is_global:
+            raise SettingsError(f"host.public_ip `{value}` is not a public address; give the address the Internet sees")
+    ports = scope["ports"]
+    if (not isinstance(ports, list) or not ports
+            or not all(isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535 for p in ports)):
+        raise SettingsError("scope.ports must be a list of port numbers, e.g. [80, 443]")
+    try:
+        valid_until = datetime.fromisoformat(str(appr["valid_until"]).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise SettingsError("approval.valid_until must be an ISO 8601 time, e.g. 2026-12-31T23:59:59+00:00") from exc
+    if valid_until.tzinfo is None:
+        raise SettingsError("approval.valid_until needs a timezone, e.g. +00:00")
+    if appr["status"] == "approved" and valid_until <= datetime.now(UTC):
+        raise SettingsError(f"approval.valid_until {appr['valid_until']} has passed")
     rate, fraction = float(scope["rate_pps"]), float(scope["sample_fraction"])
     if rate > float(appr["max_rate_pps"]):
         raise SettingsError(f"scope.rate_pps {rate:g} is above the approved approval.max_rate_pps {appr['max_rate_pps']}")
     if fraction > float(appr["max_sample_fraction"]):
         raise SettingsError(f"scope.sample_fraction {fraction:g} is above the approved approval.max_sample_fraction {appr['max_sample_fraction']}")
+    approved_pace, pace = float(appr.get("min_seconds_between_probes_per_ip", MIN_PACE_SECONDS)), float(scope.get("min_seconds_between_probes_per_ip", MIN_PACE_SECONDS))
+    if approved_pace < MIN_PACE_SECONDS:
+        raise SettingsError(f"approval.min_seconds_between_probes_per_ip {approved_pace:g} is below the minimum of {MIN_PACE_SECONDS:g} s")
+    if pace < approved_pace:
+        raise SettingsError(f"scope.min_seconds_between_probes_per_ip {pace:g} is below the approved {approved_pace:g} s")
     if appr["status"] not in ("blocked", "approved"):
         raise SettingsError("approval.status must be `blocked` or `approved`")
     excl_path = _resolve(workdir, scope["exclusions_file"])
@@ -222,7 +246,6 @@ def apply(workdir: Path) -> dict[str, Any]:
     if check not in ("nic", "url", "off"):
         raise SettingsError("host.egress_check must be auto, nic, url or off")
     offhost = bool(scope.get("offhost_icons", False))
-    pace = float(scope.get("min_seconds_between_probes_per_ip", 15))
     probes = 1
     targets = ALLOWED_ADDRESSES * fraction
     runtime = int(min(7 * 24 * 3600, max(3600, math.ceil(targets * probes / rate * 1.5) + 600)))
@@ -254,6 +277,7 @@ def apply(workdir: Path) -> dict[str, Any]:
         "approved_domains": ["any"], "target_population": "Seeded random sample of routable IPv4 space, excluding the exclusions file",
         "exclusions_checksum": digest, "ports": [int(p) for p in scope["ports"]], "protocols": ["http", "https"],
         "max_rate_per_second": int(float(appr["max_rate_pps"])), "max_sample_fraction": float(appr["max_sample_fraction"]),
+        "min_seconds_between_probes_per_ip": approved_pace,
         "source_addresses": [public_ip], "transparency_url": info, "opt_out_contact": contact,
         "data_handling_reference": str(appr["data_handling"]),
         "incident_contact": str(s.get("incident_contact") or contact), "valid_until": str(appr["valid_until"]),

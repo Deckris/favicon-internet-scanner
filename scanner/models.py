@@ -255,7 +255,7 @@ class DNSVerification(Record):
 
 @dataclass(frozen=True)
 class HostnameMapping(Record):
-    """(hostname, ip) mapping judgement used for identity construction and oracle F8."""
+    """(hostname, ip) mapping judgement used for identity construction."""
     hostname: str
     target_ip: str                  # IP the mapping is judged against
     status: DNSStatus               # relative to target_ip
@@ -277,7 +277,7 @@ class ProbePlan(Record):
 
 @dataclass(frozen=True)
 class WebIdentity(Record):
-    """Primary oracle unit: (target_ip, port, scheme, request_hostname)."""
+    """Unit of observation: (target_ip, port, scheme, request_hostname)."""
     identity_id: str                # stable_id("WID", target_ip, port, scheme, request_hostname)
     target_ip: str
     port: int
@@ -395,7 +395,7 @@ class ObservationRecordV2(Record):
     content_encoding: str | None
     page_bytes: int | None
     page_sha256: str | None
-    same_as_direct_ip: bool | None        # VH-04 catch-all similarity
+    same_as_direct_ip: bool | None        # catch-all similarity
     favicon_declarations: tuple[FaviconDeclaration, ...]
     favicons: tuple[FaviconResource, ...]
     favicon_url: str | None               # first acquired icon (compatibility/ablation)

@@ -265,5 +265,5 @@ def test_preflight_refuses_when_egress_ip_is_not_the_approved_source(cfg, tmp_pa
         rep = preflight.run_preflight(cfg, splan, run_dir=tmp_path, executor=tools(), offline=False)
         return next(c for c in rep["checks"] if c["name"] == "egress_matches_approved_source")
     assert egress(cfg.vantage.public_egress_ip)["status"] == "pass"
-    assert egress("45.129.56.145")["status"] == "fail"            # e.g. the VPN moved to another server
+    assert egress("198.51.100.99")["status"] == "fail"            # the address moved
     assert egress(None)["status"] == "fail"                       # unknown is not good enough

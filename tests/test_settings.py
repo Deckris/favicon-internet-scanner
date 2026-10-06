@@ -102,3 +102,64 @@ def test_nic_check_when_no_nat_and_url_check_behind_nat(tmp_path):
 def test_missing_settings_file_points_to_init(tmp_path):
     with pytest.raises(st.SettingsError, match="scanner init"):
         st.load_settings(tmp_path)
+
+
+def _edit(path: Path, **changes) -> None:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for dotted, value in changes.items():
+        section, key = dotted.split(".")
+        data[section][key] = value
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+@pytest.mark.parametrize("change, message", [
+    ({"scope.min_seconds_between_probes_per_ip": 5}, "below the approved 15"),
+    ({"approval.min_seconds_between_probes_per_ip": 5, "scope.min_seconds_between_probes_per_ip": 5}, "below the minimum of 15"),
+    ({"host.public_ip": "10.1.2.3"}, "not a public address"),
+    ({"scope.ports": ["80", "443"]}, "scope.ports must be a list of port numbers"),
+    ({"approval.valid_until": "2020-01-01T00:00:00+00:00"}, "has passed"),
+    ({"approval.valid_until": "next year"}, "ISO 8601"),
+])
+def test_unsafe_or_malformed_settings_are_refused(tmp_path, capsys, change, message):
+    path = _init(tmp_path)
+    _approve(path)
+    _edit(path, **change)
+    assert main(["apply", "--workdir", str(tmp_path)]) == 2
+    assert message in capsys.readouterr().err
+
+
+def test_the_approval_carries_the_pause_and_a_config_below_it_is_not_authorized(tmp_path):
+    path = _init(tmp_path)
+    _approve(path)
+    assert main(["apply", "--workdir", str(tmp_path)]) == 0
+    approval = yaml.safe_load((tmp_path / "approval.yaml").read_text(encoding="utf-8"))
+    assert approval["min_seconds_between_probes_per_ip"] == 15
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    config["measurement"]["min_seconds_between_probes_per_ip"] = 0
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    from scanner.internet.config import ConfigError
+    with pytest.raises(ConfigError, match="below the approved 15"):
+        load_config(tmp_path / "config.yaml")
+
+
+def test_ipv6_lines_in_the_exclusion_list_are_ignored_not_fatal(tmp_path):
+    path = _init(tmp_path)
+    _approve(path)
+    with (tmp_path / "exclusions.txt").open("a", encoding="utf-8") as f:
+        f.write("2001:db8::/32\r\n192.0.2.0/25\r\n")
+    assert main(["apply", "--workdir", str(tmp_path)]) == 0
+    from scanner.internet import pipeline
+    cfg = load_config(tmp_path / "config.yaml")
+    pipeline.build_policy(cfg)
+
+
+def test_sharding_is_refused_with_zmap_4_4_0(tmp_path):
+    path = _init(tmp_path)
+    _approve(path)
+    assert main(["apply", "--workdir", str(tmp_path)]) == 0
+    config = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    config["sample"]["shards"] = 2
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    from scanner.internet.config import ConfigError
+    with pytest.raises(ConfigError, match="not supported with ZMap 4.4.0"):
+        load_config(tmp_path / "config.yaml")

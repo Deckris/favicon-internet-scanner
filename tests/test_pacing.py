@@ -91,3 +91,24 @@ def test_fetcher_asks_the_pacer_before_connecting_and_skips_when_stopped():
     assert out.outcome == "skipped_kill_switch" and seen == ["1.1.1.1"]
     refused = f._one_request(parts, "h", 22, "1.1.1.1", None, None, None)      # not an approved endpoint: no wait at all
     assert refused.outcome == "policy_refused" and seen == ["1.1.1.1"]
+
+
+def test_zmap_port_runs_are_spaced_by_the_minimum_interval(tmp_path):
+    import time
+
+    from scanner.internet import pipeline
+    from scanner.internet.config import load_config
+    from tests.helpers import FakeFetcher, write_config
+    from tests.test_pipeline import tools
+
+    cfg = load_config(write_config(tmp_path))
+    cfg.measurement.min_seconds_between_probes_per_ip = 0.4
+    ft, starts = tools(), []
+
+    def executor(command, **kw):
+        if command[0] == "zmap" and "--dryrun" not in command:
+            starts.append(time.monotonic())
+        return ft(command, **kw)
+    pipeline.run(cfg, run_id="t1", executor=executor, fetcher=FakeFetcher(), skip_preflight=True, offline_preflight=True)
+    assert len(starts) == len(cfg.measurement.ports) > 1
+    assert all(b - a >= 0.4 for a, b in zip(starts, starts[1:]))

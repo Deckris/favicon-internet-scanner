@@ -105,7 +105,7 @@ def _stages(tmp_path, guards=True):
 
 def test_changed_public_ip_stops_the_run(tmp_path, monkeypatch):
     cfg, st = _stages(tmp_path)
-    monkeypatch.setattr(pre, "_public_ip", lambda *a, **k: "45.129.56.145")
+    monkeypatch.setattr(pre, "_public_ip", lambda *a, **k: "198.51.100.99")
     assert st.killed() and st.reason == "egress_changed"
 
 

@@ -430,10 +430,7 @@ class WebFetcher:
             # httpcore exposes the raw low-level `_ssl._SSLSocket` C object
             # here, not the `ssl.SSLSocket` wrapper -- its `getpeercert`
             # only accepts the binary-form flag positionally and raises
-            # TypeError on `binary_form=True` (confirmed against the pinned
-            # httpx/httpcore versions). The previous bare `except Exception`
-            # silently swallowed that TypeError, so no hostname-aware HTTPS
-            # fetch ever captured a certificate (0/10080 in a full run).
+            # TypeError on `binary_form=True`, so the flag is passed positionally.
             der = ssl_object.getpeercert(True)
         except Exception:
             return None

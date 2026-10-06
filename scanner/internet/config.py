@@ -107,6 +107,9 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+MIN_PACE_SECONDS = 15.0     # the pause an approval is assumed to require when it does not state one
+
+
 def read_exclusions(path: Path) -> list[str]:
     nets: list[str] = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -114,9 +117,11 @@ def read_exclusions(path: Path) -> list[str]:
         if not text:
             continue
         try:
-            nets.append(str(ipaddress.ip_network(text, strict=False)))
+            net = ipaddress.ip_network(text, strict=False)
         except ValueError as exc:
             raise ConfigError(f"bad exclusion entry {text!r}: {exc}") from exc
+        if net.version == 4:          # the scanner is IPv4-only; IPv6 entries stay in the file and are ignored
+            nets.append(str(net))
     return nets
 
 
@@ -229,6 +234,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     zmap_version = str(m.get("zmap_version", "2.1.1"))
     if not supported(zmap_version):
         raise ConfigError("measurement.zmap_version must be 2.1.x or the pinned 4.4.0")
+    if zmap_version == "4.4.0" and shards != 1:
+        raise ConfigError("sample.shards is not supported with ZMap 4.4.0, which divides the target count across shards")
     ports = m["ports"]
     if not isinstance(ports, list) or not ports or len(ports) > HARD_MAX_PORTS:
         raise ConfigError("measurement.ports must be a non-empty list")
@@ -245,7 +252,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         zgrab_target_timeout=_float(m["zgrab_target_timeout"], "measurement.zgrab_target_timeout", 1, 120),
         zgrab_senders=_int(m["zgrab_senders"], "measurement.zgrab_senders", 1, 1000),
         zgrab_batch_size=_int(m["zgrab_batch_size"], "measurement.zgrab_batch_size", 1, 100_000),
-        # Minimum pause between any two requests to the same address (0 turns pacing off).
+        # Minimum pause between any two requests to the same address. `authorize` holds it to the approval's floor.
         min_seconds_between_probes_per_ip=_float(m.get("min_seconds_between_probes_per_ip", 15),
                                                  "measurement.min_seconds_between_probes_per_ip", 0, 3600),
         zmap_seed=seed,
@@ -412,6 +419,12 @@ def authorize(cfg: ScanConfig) -> ScanConfig:
         raise ConfigError("not authorized: approval exclusions_checksum differs from the configured exclusions file")
     if cfg.measurement.zmap_rate > approval.max_rate_per_second:
         raise ConfigError("not authorized: zmap_rate exceeds the approval's max_rate_per_second")
+    try:
+        floor = float(_read_record(cfg.approval_file).get("min_seconds_between_probes_per_ip", MIN_PACE_SECONDS))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("not authorized: approval min_seconds_between_probes_per_ip must be a number") from exc
+    if cfg.measurement.min_seconds_between_probes_per_ip < floor:
+        raise ConfigError(f"not authorized: measurement.min_seconds_between_probes_per_ip is below the approved {floor:g} s")
     outside = sorted(set(cfg.measurement.ports) - set(approval.ports))
     if outside:
         raise ConfigError(f"not authorized: ports outside approval: {outside}")

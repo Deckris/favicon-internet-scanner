@@ -17,6 +17,7 @@ ports: [80, 443, 8080, 8090, 8443]
 protocols: [http, https]
 max_rate_per_second: 100
 max_sample_fraction: 0.000001    # 0.0001% (pilot size); raise only with the approving authority's agreement
+min_seconds_between_probes_per_ip: 15   # the approved pause between requests to one address; the config may not go below it
 source_addresses: [REPLACE_ME]   # the PUBLIC egress IPv4 the network owner sees (vantage.public_egress_ip in the config)
 transparency_url: REPLACE_ME
 opt_out_contact: REPLACE_ME

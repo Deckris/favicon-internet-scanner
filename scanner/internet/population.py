@@ -34,7 +34,8 @@ def _overlap(a: ipaddress.IPv4Network, b: ipaddress.IPv4Network) -> int:
 
 def allowed_addresses(population: list[str], exclusions: list[str]) -> int:
     pop = [ipaddress.ip_network(p) for p in population]
-    excl = list(ipaddress.collapse_addresses(ipaddress.ip_network(e) for e in exclusions))
+    nets = (ipaddress.ip_network(e) for e in exclusions)
+    excl = list(ipaddress.collapse_addresses(n for n in nets if n.version == 4))
     total = sum(n.num_addresses for n in pop)
     removed = sum(_overlap(p, e) for p in pop for e in excl)
     return total - removed

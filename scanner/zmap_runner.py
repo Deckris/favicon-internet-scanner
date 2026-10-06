@@ -69,7 +69,7 @@ def run_zmap(
         # filter, so every response -- including RST/closed-port replies --
         # was being written to the CSV as if it were an open port. This
         # inflated every address to appear "open" on every scanned port
-        # (confirmed against the pinned zmap 2.1.1 binary), multiplying
+        # (confirmed with zmap 2.1.1), multiplying
         # downstream hostname-aware ZGrab2 work by the full port count.
         "--output-filter", "success = 1 && repeat = 0",
         "-o", str(output_path),
@@ -77,33 +77,17 @@ def run_zmap(
     command += list(getattr(measurement, "zmap_extra_args", ()))
     if gateway_mac:
         command += ["-G", gateway_mac]
-    # The lab overlay network drops a non-trivial fraction of single-packet
-    # zmap probes (confirmed directly: three back-to-back single-probe (-P 1,
-    # the zmap default) scans of the same stable 13-address population each
-    # returned a different subset, 13-14 addresses, with different addresses
-    # missing each time -- classic UDP-style probe loss, not a population
-    # change). This silently dropped a handful of random L4-positive IPs per
-    # run (e.g. the 10,000-name mass-edge hosts 203.0.113.150/151/152),
-    # cascading into thousands of "unexpected" hostname/identity/favicon
-    # oracle misses purely from scan flakiness. Repeating the probe (default
-    # 3x, confirmed stable/identical across repeated runs at that value)
-    # fixes this without weakening anything: a real closed port still never
-    # responds to any of the repeats.
     # ZMap 2.1.1 starts a sender thread per core unless told otherwise (measured: 17 threads, ~12 cores busy,
     # which starved the network path and stalled sending). Callers that care pass an explicit thread count.
     sender_threads = getattr(measurement, "zmap_sender_threads", None)
     if sender_threads:
         command += ["-T", str(sender_threads)]
-    zmap_probes = getattr(measurement, "zmap_probes", None) or 3
+    zmap_probes = getattr(measurement, "zmap_probes", None) or 1
     command += ["-P", str(zmap_probes)]
     max_targets = getattr(measurement, "zmap_max_targets", None)
     if max_targets:
         command += ["-n", str(max_targets)]
-    # R2/reproducibility: a fixed ZMap --seed makes randomized target order
-    # deterministic across runs. Read via getattr with a default because
-    # scanner/config.py is being edited concurrently (safety-hardening work);
-    # once `measurement.zmap_seed` lands there as a real field this still
-    # works unchanged.
+    # A fixed ZMap --seed makes the randomized target order deterministic across runs.
     zmap_seed = getattr(measurement, "zmap_seed", None)
     if zmap_seed is not None:
         command += ["--seed", str(zmap_seed)]
@@ -121,13 +105,8 @@ def run_zmap(
 
     found_ips: list[str] = []
     if raw_bytes:
-        # zmap's `-O csv -f saddr` output is a bare list of addresses with NO
-        # header row (confirmed against the real zmap 2.1.1 binary: `-f` only
-        # selects fields, it does not request a header line, and zmap has no
-        # flag that adds one). csv.DictReader previously treated the first
-        # result IP as the header row and then looked up a "saddr" key that
-        # never existed, silently discarding every single result -> L4
-        # discovery always returned zero endpoints.
+        # zmap's `-O csv -f saddr` output is a bare list of addresses with no header row
+        # (4.4.0 is run with --no-header-row; 2.1.x never writes one).
         reader = csv.reader(io.StringIO(raw_bytes.decode("utf-8", "replace")))
         for row in reader:
             if not row:

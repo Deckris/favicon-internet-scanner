@@ -10,4 +10,4 @@ resvg-py>=0.1        # deterministic SVG rasterisation in a bounded subprocess
 dnspython>=2.6       # DNS / rDNS enrichment
 cryptography>=42.0   # TLS certificate (SAN) parsing
 brotli>=1.2.0         # bounded output_buffer_limit API used by the streaming decoder
-pytest>=8.0           # run-sample.sh runs the offline test suite before anything is sent
+pytest>=8.0           # the offline test suite (`scanner verify`)

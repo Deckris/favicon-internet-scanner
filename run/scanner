@@ -31,7 +31,7 @@ Run:
   run --confirm TOKEN            run the pipeline: ZMap -> ZGrab2 -> ZDNS -> favicons
   stop                           ask a running scan to stop
   summary RUN_DIR                print the run's report
-  pack RUN_DIR                   make a results archive (raw tool output excluded)
+  pack RUN_DIR [--with-results]  make an archive: manifest and report only; --with-results adds per-address files
 
 Other:
   build                          docker mode: build the image from this package
@@ -93,7 +93,7 @@ scanner run --confirm TOKEN [--allow-rerun] [--skip-pilot-check]
 
 Runs the pipeline. Refused without a contact and information page, past the approved rate or size, outside the
 approval's validity, and for a large sample until a small pilot has completed (--skip-pilot-check overrides the
-last). Requests to one address are at least min_seconds_between_probes_per_ip apart. `scanner stop` ends it.
+last). Requests to one address are spaced by min_seconds_between_probes_per_ip (15 s or more). `scanner stop` ends it.
 EOF
     ;;
     stop|summary|pack|build|verify|favicons) usage ;;
@@ -111,13 +111,14 @@ while [ $# -gt 0 ]; do
     --workdir) WORKDIR="${2:?--workdir needs a directory}"; shift 2 ;;
     --config) CONFIG="${2:?--config needs a file}"; shift 2 ;;
     -h|--help) HELP=1; shift ;;
-    help) HELP=1; shift ;;
+    help) if [ ${#ARGS[@]} -eq 0 ]; then HELP=1; shift; else ARGS+=("$1"); shift; fi ;;   # only the command word, not a value
     *) ARGS+=("$1"); shift ;;
   esac
 done
 if [ "$HELP" = 1 ]; then cmd_help "${ARGS[0]:-}"; exit 0; fi
 [ ${#ARGS[@]} -gt 0 ] || { usage >&2; exit 2; }
 CMD="${ARGS[0]}"; REST=("${ARGS[@]:1}")
+mkdir -p "$WORKDIR" || die "cannot create the work folder $WORKDIR"
 WORKDIR="$(cd "$WORKDIR" && pwd)"
 case "$CONFIG" in /*) CONFIG_ABS="$CONFIG" ;; *) CONFIG_ABS="$WORKDIR/$CONFIG" ;; esac
 
@@ -128,10 +129,23 @@ else
   CONFIG_IN="$CONFIG_ABS"
 fi
 
+package_version() { git -C "$PKG_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unversioned; }
+
+# The image must have been built from this package, not an older one that happens to carry the same tag.
+check_image() {
+  command -v docker >/dev/null || die "docker not found"
+  local built now
+  built="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE" 2>/dev/null)"     || die "image $IMAGE not found (build it: scanner --docker build)"
+  now="$(package_version)"
+  if [ "$now" != unversioned ] && [ "$built" != "$now" ]; then
+    die "image $IMAGE was built from package version '$built' but this package is '$now'; rebuild: scanner --docker build"
+  fi
+}
+
 # Run the scanner program; $1.. are its arguments.
 scanner() {
   if [ "$MODE" = docker ]; then
-    command -v docker >/dev/null || die "docker not found"
+    check_image
     local tty=()
     [ -t 0 ] && [ -t 1 ] && tty=(-it)
     docker run --rm --init "${tty[@]}" --name "$NAME" --stop-timeout 60 \
@@ -165,12 +179,13 @@ case "$CMD" in
   exclusions) scanner exclusions --workdir "$WORK_IN" "${REST[@]}" ;;
   build)
     [ "$MODE" = docker ] || die "build is for docker mode (use --docker)"
-    docker build -f "$PKG_ROOT/run/Dockerfile" --build-arg "PACKAGE_VERSION=$(cat "$PKG_ROOT/VERSION" 2>/dev/null || echo unversioned)" \
+    docker build -f "$PKG_ROOT/run/Dockerfile" --build-arg "PACKAGE_VERSION=$(package_version)" \
       -t "$IMAGE" "$PKG_ROOT"
     ;;
   verify)
     out="$WORKDIR/verify-$(date -u +%Y%m%dT%H%M%SZ)"
     if [ "$MODE" = docker ]; then
+      check_image
       docker run --rm --init --network none --user "$(id -u):$(id -g)" --read-only --tmpfs /tmp:rw,exec \
         -v "$WORKDIR:/work" -w /work --entrypoint python "$IMAGE" /opt/app/run/verify_offline.py --output "/work/${out##*/}"
     else
@@ -206,12 +221,24 @@ case "$CMD" in
     ;;
   pack)
     [ ${#REST[@]} -ge 1 ] || die "pack needs RUN_DIR"
-    run="$(cd "${REST[0]}" && pwd)"; raw=0
-    [ "${REST[1]:-}" = "--with-raw" ] && raw=1
+    run="$(cd "${REST[0]}" && pwd)"; base="$(basename "$run")"; results=0; raw=0
+    for opt in "${REST[@]:1}"; do
+      case "$opt" in
+        --with-results) results=1 ;;
+        --with-raw) results=1; raw=1 ;;
+        *) die "unknown pack option: $opt (use --with-results or --with-raw)" ;;
+      esac
+    done
     grep -q '"complete": true' "$run/manifest.json" || echo "scanner: WARNING: this run's manifest is not marked complete" >&2
+    # Default: the manifest and the aggregate report only. Per-address results and raw tool output contain IPs,
+    # host names and certificate names, so they are added only on request.
+    items=("$base/manifest.json" "$base/report")
+    if [ "$results" -eq 1 ]; then
+      for f in normalized ip_results.csv scanned_ips.txt favicons; do [ -e "$run/$f" ] && items+=("$base/$f"); done
+    fi
+    [ "$raw" -eq 1 ] && items+=("$base/raw")
     tarball="$run.results.tar.gz"
-    excl=(); [ "$raw" -eq 1 ] || excl=(--exclude="$(basename "$run")/raw")
-    tar -C "$(dirname "$run")" "${excl[@]}" -czf "$tarball" "$(basename "$run")"
+    tar -C "$(dirname "$run")" -czf "$tarball" "${items[@]}"
     ( cd "$(dirname "$tarball")" && sha256sum "$(basename "$tarball")" | tee "$(basename "$tarball").SHA256SUMS" )
     ls -l "$tarball"
     ;;

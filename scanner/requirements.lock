@@ -1,4 +1,4 @@
-# Exact pins, resolved for linux on ubuntu:24.04 with python3 (see run/Dockerfile, build stage `lockgen`).
+# Exact pins, resolved for linux on ubuntu:24.04 with python3. Used by run/Dockerfile and run/setup-wsl.sh.
 # Regenerate whenever requirements.txt changes.
 # Every entry is an exact pin; no ranges, no `latest`.
 anyio==4.15.1

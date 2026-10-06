@@ -317,11 +317,17 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
             if killed():
                 st.skipped.append(f"zmap:{port}")
                 continue
+            # Every port probes the same seeded sample, so a pause between port runs keeps one address's SYNs apart.
+            if not gap.wait():
+                st.skipped.append(f"zmap:{port}")
+                continue
             try:
                 job, res = run_zmap(cfgview, policy, port, run_dir, executor=executor, gateway_mac=gateway_mac)
             except Exception as exc:
                 st.errors[f"zmap:{port}"] = f"{type(exc).__name__}: {exc}"[:500]
+                gap.mark()
                 continue
+            gap.mark()
             jobs.append(job)
             if job.error:
                 st.errors[f"zmap:{port}"] = job.error[:500]

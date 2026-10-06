@@ -34,7 +34,7 @@ def write_approval(tmp: Path, excl: Path, **over: Any) -> Path:
         "source_addresses": ["93.184.216.99"], "transparency_url": "https://example.org/scan",
         "opt_out_contact": "optout@example.org", "data_handling_reference": "dh-1",
         "incident_contact": "inc@example.org", "valid_until": "2099-01-01T00:00:00+00:00",
-        "max_sample_fraction": 0.0001,
+        "max_sample_fraction": 0.0001, "min_seconds_between_probes_per_ip": 0,
     }
     data.update(over)
     p = tmp / "approval.yaml"

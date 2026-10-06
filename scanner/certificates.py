@@ -2,7 +2,7 @@
 
 Not an external provider: this module turns raw DER bytes captured during a
 handshake (direct-IP or hostname-aware) into the fields the hostname-evidence
-union and oracle need. Malformed DER never raises past the scanner boundary
+union needs. Malformed DER never raises past the scanner boundary
 when callers use ``parse_der_safe``.
 """
 from __future__ import annotations

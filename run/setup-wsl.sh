@@ -59,7 +59,7 @@ setcap cap_net_raw,cap_net_admin+ep "$ZMAP_BIN"
 
 VENV="$TARGET_HOME/scanner-venv"
 sudo -u "$TARGET_USER" python3 -m venv "$VENV"
-sudo -u "$TARGET_USER" "$VENV/bin/pip" -q install -r "$REPO_ROOT/requirements.txt"
+sudo -u "$TARGET_USER" "$VENV/bin/pip" -q install -r "$REPO_ROOT/scanner/requirements.lock" "pytest==9.1.1"
 
 mkdir -p "$TARGET_HOME/.scanner"
 {

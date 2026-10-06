@@ -1,4 +1,4 @@
-"""Shipped templates are inert, and the instrument stays decoupled from lab ground truth."""
+"""Shipped templates are inert, and the instrument stays decoupled from the test fixtures."""
 import ast
 from pathlib import Path
 

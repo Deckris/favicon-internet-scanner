@@ -100,9 +100,20 @@ def test_shell_scripts_parse_and_gate_the_environment():
     setup = (root / "setup-wsl.sh").read_text(encoding="utf-8")
     assert "sys.version_info >= (3, 11)" in setup and "ZMAP_COMMIT=" in setup and "x86_64" in setup
     assert "RESPECT_INSTALL_PREFIX_CONFIG=ON" in setup
-    run = (root / "run-sample.sh").read_text(encoding="utf-8")
-    assert "VERB=campaign" in run and "tmux" in run
-    for name in ("setup-wsl.sh", "run-sample.sh"):
+    for name in ("setup-wsl.sh", "scanner"):
         res = subprocess.run(["bash", "-n", str(root / name)], capture_output=True, text=True)
         assert res.returncode == 0, res.stderr
     assert "pytest" in (root.parent / "requirements.txt").read_text(encoding="utf-8")
+
+
+def test_tracked_text_files_use_unix_line_endings():
+    from pathlib import Path
+    import subprocess as sp
+    root = Path(__file__).resolve().parent.parent
+    names = sp.run(["git", "ls-files"], cwd=root, capture_output=True, text=True).stdout.split()
+    if not names:
+        pytest.skip("not a git checkout")
+    suffixes = {".sh", ".py", ".md", ".yaml", ".txt", ".lock"}
+    bad = [n for n in names if (Path(n).suffix in suffixes or Path(n).name in {"scanner", "Dockerfile"})
+           and b"\r" in (root / n).read_bytes()]
+    assert not bad, f"CRLF line endings in: {bad}"

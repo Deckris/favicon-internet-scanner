@@ -41,7 +41,7 @@ def tarpit_assessment(endpoints: list[dict[str, Any]], scanned_port_count: int, 
     ``endpoints``: dicts with ``protocol``, ``window`` (SYN-ACK TCP window or None), ``doc_sha256`` and
     ``doc_status`` (the page fetched for the favicon attempt, or None).
 
-    Signals, strongest first (sources are in the experiment note):
+    Signals, strongest first:
     * ``zero_window`` / ``tiny_window``: the SYN-ACK advertises a window of 0 or below ``tiny_window_below``.
       Tarpits hold the connection with a closed window (LZR: a zero window on one port means all ports in
       99% of hosts; Degreaser: LaBrea and Netfilter tarpits advertise tiny windows). High confidence.
