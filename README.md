@@ -91,6 +91,22 @@ approval:
 
 [`run/settings.example.yaml`](run/settings.example.yaml) is a copy of the file `init` writes, with every setting and its comment.
 
+## Ports that are scanned
+
+By default five TCP ports are scanned, all on the same sample of addresses:
+
+| Port | Usually |
+|---|---|
+| 80 | HTTP |
+| 443 | HTTPS |
+| 8080 | alternative HTTP |
+| 8090 | alternative HTTP |
+| 8443 | alternative HTTPS |
+
+ZMap sends one SYN to each sampled address on each port. Only addresses that answer are contacted further: a TLS handshake (or a plain HTTP request where TLS is not spoken), then the page and its favicon on that address and port.
+
+To change the list, edit `scope.ports` in `settings.yaml` (for example `ports: [80, 443]`). The list goes into the generated approval, so make sure your approval covers the ports you scan. If you change it, also change the port line in [`INFO.md`](INFO.md), because network owners read that page to learn what touched their servers.
+
 ## Repository layout
 
 | Path | What is in it |
