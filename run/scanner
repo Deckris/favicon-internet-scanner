@@ -14,8 +14,8 @@ CONFIG="config.yaml"
 IMAGE="${SCANNER_IMAGE:-scanner:1}"
 NAME="scanner-run"
 PY="${SCANNER_PYTHON:-$HOME/scanner-venv/bin/python}"
-# Git Bash (Windows) rewrites paths such as /work in arguments to docker; stop it.
-export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+# Git Bash (Windows) rewrites paths such as /work in arguments to docker; stop it for docker only (git needs the rewriting).
+docker() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' command docker "$@"; }
 # Docker mode runs as you on Linux. A folder on a Windows drive is mounted owned by root and no other user can write
 # to it, so there the container user is root (still read-only, no capabilities except raw sockets).
 case "$(uname -s 2>/dev/null)" in
