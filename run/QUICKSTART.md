@@ -69,6 +69,12 @@ $E favicons --source-run runs/<run-dir>     # optional: repeat image lookups and
 $E pack runs/<run-dir>          # archive of the manifest and report
 ```
 
+If a run does not finish cleanly:
+
+- `REFUSED: preflight failed: egress_matches_approved_source`: the address the Internet sees is not the approved one (a VPN may have switched servers). Nothing was sent. Correct `host.public_ip` in `settings.yaml` only if the new address is approved, then run `plan` again for a new token.
+- Exit code 5 with `dns_degraded`: more than a few percent of the name lookups got no answer, so the hostname results are partial. Check the resolver in `settings.yaml` (a local or institutional resolver is better than a public one) and run again.
+- Every connection to the open ports reported as refused: the network was interrupted during the run. Run `doctor` and repeat the run.
+
 `run` refuses a second run of an identical config; `--allow-rerun` overrides that on purpose. A finished run has `manifest.json` with `"complete": true`; anything else is partial and says why.
 
 `pack` puts only `manifest.json` and the aggregate report in the archive. `pack RUN_DIR --with-results` adds the per-address files (IP addresses, host names, certificate names); `--with-raw` adds the raw tool output as well.
