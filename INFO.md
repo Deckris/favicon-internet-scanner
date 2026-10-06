@@ -18,7 +18,12 @@ It sends no credentials, forms, exploits or guesses at paths beyond the page and
 
 ## Opt out
 
-E-mail **the contact address in the User-Agent** with the address or address range (CIDR) you want left out. It is added to the exclusion list and not contacted again. Please include "scan opt-out" in the subject. Abuse and incident reports go to the same address.
+Either of these works:
+
+- Write to the e-mail address in the `User-Agent` header of the requests you received (`contact ...`), with the address or range (CIDR) you want left out.
+- Open an issue at https://github.com/Deckris/favicon-internet-scanner/issues titled "scan opt-out" that names the address or range. Please do not add personal details.
+
+The range is added to the exclusion list and not contacted again. Abuse and incident reports go to the same places.
 
 ## Data
 

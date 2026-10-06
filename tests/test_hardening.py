@@ -382,7 +382,10 @@ def test_zmap_rate_is_an_integer_on_the_command_line(cfg):
         assert r.isdigit(), r                                  # "100.0" was rejected by the real zmap
 
 
-@pytest.mark.skipif(shutil.which("zmap") is None or os.name != "posix", reason="needs the real zmap binary")
+_ZMAP = shutil.which("zmap") or next((p for p in ("/opt/scanner/zmap-4.4.0/sbin/zmap",) if os.path.exists(p)), None)
+
+
+@pytest.mark.skipif(_ZMAP is None or os.name != "posix", reason="needs the real zmap binary")
 def test_real_zmap_accepts_the_exact_generated_command(cfg, tmp_path):
     """The generated scan command, run through the REAL zmap with --dryrun (prints packets, sends none)."""
     from scanner.zmap_runner import run_zmap
@@ -391,11 +394,15 @@ def test_real_zmap_accepts_the_exact_generated_command(cfg, tmp_path):
 
     def dry(cmd, **kw):
         seen.append(cmd)
-        return subprocess.run(cmd + ["--dryrun"], capture_output=True, text=True, timeout=120)
-    cfgview = SimpleNamespace(vantage=SimpleNamespace(id="t", interface=_default_iface(), source_ipv4=_iface_ip()),
+        return subprocess.run([_ZMAP] + cmd[1:] + ["--dryrun"], capture_output=True, text=True, timeout=120)
+    try:
+        iface, source, mac = _default_iface(), _iface_ip(), None
+    except (ValueError, IndexError):          # no default route (a container without network): dry-run on loopback
+        iface, source, mac = "lo", "127.0.0.1", "00:00:00:00:00:00"
+    cfgview = SimpleNamespace(vantage=SimpleNamespace(id="t", interface=iface, source_ipv4=source),
                               measurement=SimpleNamespace(**{**vars(cfg.measurement), "zmap_max_targets": 30, "zmap_max_runtime": 20}))
     from scanner.internet.preflight import detect_gateway_mac
-    mac = detect_gateway_mac(subprocess.run)
+    mac = mac or detect_gateway_mac(subprocess.run)
     assert mac, "no gateway MAC detected on this host"
     job, _res = run_zmap(cfgview, policy, 443, tmp_path, executor=dry, gateway_mac=mac)
     assert job.error is None and job.exit_code == 0, job.error

@@ -215,8 +215,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "preflight":
-        Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-        report = pre.run_preflight(cfg, splan, run_dir=Path(cfg.output_dir), offline=args.offline)
+        (Path(cfg.output_dir) / "doctor").mkdir(parents=True, exist_ok=True)
+        report = pre.run_preflight(cfg, splan, run_dir=Path(cfg.output_dir) / "doctor", offline=args.offline)
         print(json.dumps(report, indent=2, default=str))
         return 0 if report["ok"] else 2
 

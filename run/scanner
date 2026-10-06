@@ -14,8 +14,15 @@ CONFIG="config.yaml"
 IMAGE="${SCANNER_IMAGE:-scanner:1}"
 NAME="scanner-run"
 PY="${SCANNER_PYTHON:-$HOME/scanner-venv/bin/python}"
-# Docker mode runs as you. A work folder on a Windows drive is not writable by another uid: set SCANNER_DOCKER_USER=0:0 there.
-DOCKER_USER="${SCANNER_DOCKER_USER:-$(id -u):$(id -g)}"
+# Git Bash (Windows) rewrites paths such as /work in arguments to docker; stop it.
+export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
+# Docker mode runs as you on Linux. A folder on a Windows drive is mounted owned by root and no other user can write
+# to it, so there the container user is root (still read-only, no capabilities except raw sockets).
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*) DEFAULT_DOCKER_USER=0:0 ;;
+  *) DEFAULT_DOCKER_USER="$(id -u):$(id -g)" ;;
+esac
+DOCKER_USER="${SCANNER_DOCKER_USER:-$DEFAULT_DOCKER_USER}"
 
 usage() {
   cat <<'EOF'
@@ -169,6 +176,28 @@ kill_switch() {   # path of the kill-switch file as the program sees it
 
 WORK_IN="$WORKDIR"; [ "$MODE" = docker ] && WORK_IN=/work
 
+# A file named on the command line (an exclusion list) must be visible to the program. In Docker mode a file outside
+# the work folder is copied into it for the duration of the command.
+STAGED=()
+trap 'rm -f ${STAGED[@]+"${STAGED[@]}"}' EXIT
+stage_in() {
+  local f="$1" abs name
+  if [ "$MODE" != docker ] || [ ! -f "$f" ]; then echo "$f"; return; fi
+  abs="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+  case "$abs" in "$WORKDIR"/*) echo "/work/${abs#"$WORKDIR"/}"; return ;; esac
+  name=".import-$$-$(basename "$f")"
+  cp "$f" "$WORKDIR/$name"; STAGED+=("$WORKDIR/$name")
+  echo "/work/$name"
+}
+stage_args() {   # prints the arguments with the file after --exclusions / --from-file made visible
+  local out=() prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--exclusions" ] || [ "$prev" = "--from-file" ]; then out+=("$(stage_in "$a")"); else out+=("$a"); fi
+    prev="$a"
+  done
+  REST=("${out[@]+"${out[@]}"}")
+}
+
 # settings.yaml is the one file people edit; make config.yaml and approval.yaml follow it.
 ensure_applied() {
   [ -f "$WORKDIR/settings.yaml" ] || return 0
@@ -176,9 +205,9 @@ ensure_applied() {
 }
 
 case "$CMD" in
-  init)       scanner init --workdir "$WORK_IN" "${REST[@]}" ;;
+  init)       stage_args "${REST[@]+"${REST[@]}"}"; scanner init --workdir "$WORK_IN" "${REST[@]+"${REST[@]}"}" ;;
   apply)      scanner apply --workdir "$WORK_IN" ;;
-  exclusions) scanner exclusions --workdir "$WORK_IN" "${REST[@]}" ;;
+  exclusions) stage_args "${REST[@]+"${REST[@]}"}"; scanner exclusions --workdir "$WORK_IN" "${REST[@]+"${REST[@]}"}" ;;
   build)
     [ "$MODE" = docker ] || die "build is for docker mode (use --docker)"
     docker build -f "$PKG_ROOT/run/Dockerfile" --build-arg "PACKAGE_VERSION=$(package_version)" \
