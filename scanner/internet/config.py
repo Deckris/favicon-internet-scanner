@@ -156,7 +156,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
-        raise ConfigError(f"cannot read config: {exc}") from exc
+        raise ConfigError(f"cannot read config: {exc}. For a new work folder run `scanner init` first") from exc
     if not isinstance(raw, dict):
         raise ConfigError("config must be a mapping")
     top = {"run_label", "vantage", "sample", "measurement", "target_policy", "dns", "hostnames",

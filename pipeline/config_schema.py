@@ -73,7 +73,7 @@ def load_approval(path: Path, *, now: datetime | None = None) -> Approval:
     if missing:
         raise ApprovalError(f"approval record missing fields: {', '.join(missing)}")
     if data["schema_version"] != 1 or data["status"] != "approved":
-        raise ApprovalError("approval record is not an approved schema-version 1 record")
+        raise ApprovalError("approval record is not approved: approval.status in settings.yaml is not `approved` (set it only after sign-off)")
     try:
         valid_until = datetime.fromisoformat(_nonempty(data["valid_until"], "valid_until").replace("Z", "+00:00"))
     except ValueError as exc:

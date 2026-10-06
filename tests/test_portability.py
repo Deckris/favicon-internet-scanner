@@ -110,7 +110,10 @@ def test_tracked_text_files_use_unix_line_endings():
     from pathlib import Path
     import subprocess as sp
     root = Path(__file__).resolve().parent.parent
-    names = sp.run(["git", "ls-files"], cwd=root, capture_output=True, text=True).stdout.split()
+    try:
+        names = sp.run(["git", "ls-files"], cwd=root, capture_output=True, text=True).stdout.split()
+    except FileNotFoundError:
+        names = []
     if not names:
         pytest.skip("not a git checkout")
     suffixes = {".sh", ".py", ".md", ".yaml", ".txt", ".lock"}

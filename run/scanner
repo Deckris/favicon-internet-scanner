@@ -127,8 +127,14 @@ done
 if [ "$HELP" = 1 ]; then cmd_help "${ARGS[0]:-}"; exit 0; fi
 [ ${#ARGS[@]} -gt 0 ] || { usage >&2; exit 2; }
 CMD="${ARGS[0]}"; REST=("${ARGS[@]:1}")
-mkdir -p "$WORKDIR" || die "cannot create the work folder $WORKDIR"
-WORKDIR="$(cd "$WORKDIR" && pwd)"
+if [ ! -d "$WORKDIR" ]; then
+  case "$CMD" in
+    init|verify) mkdir -p "$WORKDIR" || die "cannot create the work folder $WORKDIR" ;;
+    build) ;;
+    *) die "the work folder $WORKDIR does not exist; create it with: scanner --workdir $WORKDIR init ..." ;;
+  esac
+fi
+[ -d "$WORKDIR" ] && WORKDIR="$(cd "$WORKDIR" && pwd)"
 case "$CONFIG" in /*) CONFIG_ABS="$CONFIG" ;; *) CONFIG_ABS="$WORKDIR/$CONFIG" ;; esac
 
 # Paths as the program sees them (inside the container the workdir is /work).
@@ -138,11 +144,21 @@ else
   CONFIG_IN="$CONFIG_ABS"
 fi
 
+host_path() {   # a path as docker.exe wants it (C:/Users/... under Git Bash on Windows)
+  if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s
+' "$1"; fi
+}
+
+docker_ready() {
+  command -v docker >/dev/null || die "docker not found"
+  docker info >/dev/null 2>&1 || die "Docker is not running (start Docker Desktop, or the docker service on Linux)"
+}
+
 package_version() { git -C "$PKG_ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unversioned; }
 
 # The image must have been built from this package, not an older one that happens to carry the same tag.
 check_image() {
-  command -v docker >/dev/null || die "docker not found"
+  docker_ready
   local built now
   built="$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE" 2>/dev/null)"     || die "image $IMAGE not found (build it: scanner --docker build)"
   now="$(package_version)"
@@ -160,7 +176,7 @@ scanner() {
     docker run --rm --init "${tty[@]}" --name "$NAME" --stop-timeout 60 \
       --network host --cap-drop ALL --cap-add NET_RAW \
       --user "$DOCKER_USER" --read-only --tmpfs /tmp \
-      -v "$WORKDIR:/work" -w /work "$IMAGE" "$@"
+      -v "$(host_path "$WORKDIR"):/work" -w /work "$IMAGE" "$@"
   else
     [ -x "$PY" ] || die "python venv not found at $PY (run: sudo bash run/setup-wsl.sh)"
     PYTHONPATH="$PKG_ROOT" PYTHONDONTWRITEBYTECODE=1 "$PY" -m scanner.internet "$@"
@@ -180,19 +196,20 @@ WORK_IN="$WORKDIR"; [ "$MODE" = docker ] && WORK_IN=/work
 # the work folder is copied into it for the duration of the command.
 STAGED=()
 trap 'rm -f ${STAGED[@]+"${STAGED[@]}"}' EXIT
-stage_in() {
+stage_in() {   # sets STAGED_PATH (not a subshell, so the cleanup list is kept)
   local f="$1" abs name
-  if [ "$MODE" != docker ] || [ ! -f "$f" ]; then echo "$f"; return; fi
+  STAGED_PATH="$f"
+  if [ "$MODE" != docker ] || [ ! -f "$f" ]; then return; fi
   abs="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
-  case "$abs" in "$WORKDIR"/*) echo "/work/${abs#"$WORKDIR"/}"; return ;; esac
+  case "$abs" in "$WORKDIR"/*) STAGED_PATH="/work/${abs#"$WORKDIR"/}"; return ;; esac
   name=".import-$$-$(basename "$f")"
   cp "$f" "$WORKDIR/$name"; STAGED+=("$WORKDIR/$name")
-  echo "/work/$name"
+  STAGED_PATH="/work/$name"
 }
 stage_args() {   # prints the arguments with the file after --exclusions / --from-file made visible
   local out=() prev=""
   for a in "$@"; do
-    if [ "$prev" = "--exclusions" ] || [ "$prev" = "--from-file" ]; then out+=("$(stage_in "$a")"); else out+=("$a"); fi
+    if [ "$prev" = "--exclusions" ] || [ "$prev" = "--from-file" ]; then stage_in "$a"; out+=("$STAGED_PATH"); else out+=("$a"); fi
     prev="$a"
   done
   REST=("${out[@]+"${out[@]}"}")
@@ -210,19 +227,21 @@ case "$CMD" in
   exclusions) stage_args "${REST[@]+"${REST[@]}"}"; scanner exclusions --workdir "$WORK_IN" "${REST[@]+"${REST[@]}"}" ;;
   build)
     [ "$MODE" = docker ] || die "build is for docker mode (use --docker)"
-    docker build -f "$PKG_ROOT/run/Dockerfile" --build-arg "PACKAGE_VERSION=$(package_version)" \
-      -t "$IMAGE" "$PKG_ROOT"
+    docker_ready
+    docker build -f "$(host_path "$PKG_ROOT")/run/Dockerfile" --build-arg "PACKAGE_VERSION=$(package_version)" \
+      -t "$IMAGE" "$(host_path "$PKG_ROOT")"
     ;;
   verify)
     out="$WORKDIR/verify-$(date -u +%Y%m%dT%H%M%SZ)"
     if [ "$MODE" = docker ]; then
       check_image
       docker run --rm --init --network none --user "$DOCKER_USER" --read-only --tmpfs /tmp:rw,exec \
-        -v "$WORKDIR:/work" -w /work --entrypoint python "$IMAGE" /opt/app/run/verify_offline.py --output "/work/${out##*/}"
+        -v "$(host_path "$WORKDIR"):/work" -w /work --entrypoint python "$IMAGE" /opt/app/run/verify_offline.py --output "/work/${out##*/}"
     else
       [ -x "$PY" ] || die "python venv not found at $PY"
       "$PY" "$PKG_ROOT/run/verify_offline.py" --output "$out"
     fi
+    echo "test results are in $out"
     ;;
   doctor)    ensure_applied; scanner preflight --config "$CONFIG_IN" "${REST[@]}" ;;
   plan)      ensure_applied; scanner plan --config "$CONFIG_IN" ;;

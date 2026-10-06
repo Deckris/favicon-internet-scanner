@@ -33,7 +33,7 @@ Do these first; the scanner enforces some of them and cannot check the rest.
 
 | | Docker | Native |
 |---|---|---|
-| Host | Linux x86-64 with Docker 24+ | Ubuntu 24.04 or Debian 13, Python 3.11+, root once for the installer |
+| Host | Linux x86-64 (or Windows with Docker Desktop and Git Bash) with Docker 24+ | Ubuntu 24.04 or Debian 13 (including WSL2), Python 3.11+, root once for the installer |
 | Install | `bash run/scanner --docker build` | `sudo bash run/setup-wsl.sh` |
 | Tools | Pinned inside the image | Pinned by the installer, built on the host |
 | Privileges | Your user, only the raw-socket capability | `setcap` on ZMap, the pipeline runs unprivileged |
@@ -41,6 +41,8 @@ Do these first; the scanner enforces some of them and cannot check the rest.
 Both run the same Python program. Without any Internet traffic you can always run the offline test suite (`verify`).
 
 ## Quick start
+
+On Windows run these in Git Bash, or use `run\scanner.cmd` in place of `bash run/scanner`. On Windows the Docker network is the Docker Desktop VM's, so run the `doctor` check and look at its egress lines before a real run.
 
 ```bash
 git clone https://github.com/Deckris/favicon-internet-scanner.git scanner && cd scanner
@@ -50,7 +52,7 @@ $S help                                # all commands
 $S --docker build                      # or: sudo bash run/setup-wsl.sh
 $S --docker verify                     # offline tests, sends nothing (drop --docker for native)
 
-E="$S --docker --workdir $HOME/scanner-work"
+E="$S --docker --workdir $HOME/scanner-work"      # the work folder: settings, exclusions, output
 $E init --contact scan-optout@example.org --info-url https://example.org/scan \
         --egress-ip <public address of the scanner> --interface <nic> --resolver <resolver> \
         --exclusions <list from the network owner>

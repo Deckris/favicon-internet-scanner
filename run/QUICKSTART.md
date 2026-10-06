@@ -13,7 +13,9 @@ The scanner takes a seeded random sample of IPv4 addresses, finds responsive web
 | Network | `--network host` | Direct |
 | Privileges | Runs as your user, all capabilities dropped except raw sockets | `setcap` on the ZMap binary, the pipeline runs unprivileged |
 
-Both run the same Python program. Docker mode expects the work folder to be owned by you on a Linux filesystem. On a Windows drive the container user cannot write to it: set `SCANNER_DOCKER_USER=0:0` for that run. In Docker mode `--exclusions` must name a file inside the work folder as the container sees it, for example `--exclusions /work/list.txt`.
+Both run the same Python program. Docker mode expects the work folder to be owned by you on a Linux filesystem. On a Windows drive the container cannot write as another user, so the launcher runs it as root there (still read-only, with no capabilities except raw sockets); set `SCANNER_DOCKER_USER` to override. A file given to `--exclusions` or `--from-file` is copied into the work folder automatically in Docker mode.
+
+**Windows:** run the commands in Git Bash (Git for Windows) with Docker Desktop, or use `run\scanner.cmd` from a Command Prompt or PowerShell (it calls bash). The native route needs Linux or WSL.
 
 ## 2. Get the code and install
 
@@ -26,7 +28,7 @@ $S --docker build          # Docker: builds the image scanner:1 from this checko
 sudo bash run/setup-wsl.sh # Native
 ```
 
-Then run the offline tests. They send nothing:
+Then run the offline tests. They send nothing and write a `verify-<time>` folder with the results into the work folder (the current folder unless you pass `--workdir`):
 
 ```bash
 $S --docker verify         # drop --docker for native
@@ -43,15 +45,15 @@ $E init --contact scan-optout@example.org --info-url https://example.org/scan \
         --exclusions <list from the network owner>
 ```
 
-`init` writes `settings.yaml` in the work folder. That is the one file to edit: the opt-out contact, the information page, the scanner's address, the exclusion list, ports, sample size, rate, the pause between requests to one address (default and minimum 15 s), and the approval details (reference, expiry, caps, data handling). Replace every `REPLACE_ME`. `$E apply` lists what is still missing.
+`init` writes `settings.yaml` in the work folder. That is the one file to edit: the opt-out contact, the information page, the scanner's address, the exclusion list, ports, sample size, rate, the pause between requests to one address (default and minimum 15 s), and the approval details (reference, expiry, caps, data handling). Replace every `REPLACE_ME`. `$E apply` checks the file and lists what is still missing; it is the way to validate your settings before you have approval.
 
 `config.yaml` and `approval.yaml` are generated from `settings.yaml` before each `doctor`, `plan` and `run`; do not edit them, changes are overwritten.
 
-The approval status starts as `blocked`. While it is `blocked`, `doctor`, `plan` and `run` refuse to start. Set `approved` only when the approving authority has signed off. The default values are conservative: 100 packets per second, a pilot-size sample, no off-host icon fetching.
+The approval status starts as `blocked`. While it is `blocked`, `doctor` (also `--offline`), `plan` and `run` refuse to start; until you have approval, `apply` is the check you can run. Set `approved` only when the approving authority has signed off. The default values are conservative: 100 packets per second, a pilot-size sample, no off-host icon fetching.
 
 If the address is on the host's own network card, the scanner compares the card's address with the approved one and asks no outside service. Behind NAT, set `host.source_ip`; the scanner then asks a public-IP service once. It does not look for a VPN.
 
-To honour an opt-out: `$E exclusions --add 203.0.113.0/24` (or `--from-file FILE`), then `plan` again for a new token. The scanner is IPv4-only; IPv6 lines in an exclusion list are kept in the file and ignored.
+To honour an opt-out: `$E exclusions --add 203.0.113.0/24` (or `--from-file FILE`), then `$E apply` (it also runs before `plan`) and `plan` again for a new token. The scanner is IPv4-only; IPv6 lines in an exclusion list are kept in the file and ignored.
 
 Help: `$E help` lists the commands, `$E help run` explains one.
 
