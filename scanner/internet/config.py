@@ -97,6 +97,7 @@ class ScanConfig:
     min_free_mib: int = 512                    # abort when free disk falls below this
     target_ips: tuple[str, ...] = ()           # known-targets mode: probe exactly these addresses, not a random sample
     target_hostnames: tuple[str, ...] = ()     # operator-supplied names, verified like any other candidate
+    asn_ipasn: Path | None = None              # pyasn table (RouteViews snapshot); adds ASN and cloud/CDN columns to the rows
     tarpit: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(min_open_ports=4, tiny_window_below=246))
     max_sample_fraction: float = 0.0
     approval_sha256: str = ""
@@ -160,7 +161,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     if not isinstance(raw, dict):
         raise ConfigError("config must be a mapping")
     top = {"run_label", "vantage", "sample", "measurement", "target_policy", "dns", "hostnames",
-           "sni_confirm", "favicon", "fetch", "transparency", "output", "operations", "binaries", "tarpit"}
+           "sni_confirm", "favicon", "fetch", "transparency", "output", "operations", "binaries", "tarpit", "asn"}
     unknown = sorted(set(raw) - top)
     if unknown:
         raise ConfigError(f"unknown top-level keys: {', '.join(unknown)}")
@@ -303,6 +304,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
 
     h = _section(raw, "hostnames", {"max_candidates_per_ip"})
     tp_raw = _section({"tarpit": raw.get("tarpit") or {}}, "tarpit", {"min_open_ports", "tiny_window_below"}, set())
+    asn_raw = _section({"asn": raw.get("asn") or {"ipasn": ""}}, "asn", {"ipasn"}, set())
     sc = _section(raw, "sni_confirm", {"enabled", "max_per_endpoint"})
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
                                    "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images"},
@@ -372,6 +374,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         binaries=SimpleNamespace(zmap=bins.get("zmap", "zmap"), zgrab2=bins.get("zgrab2", "zgrab2"), zdns=bins.get("zdns", "zdns")),
         tarpit=SimpleNamespace(min_open_ports=_int(tp_raw.get("min_open_ports", 4), "tarpit.min_open_ports", 3, 20),
                                tiny_window_below=_int(tp_raw.get("tiny_window_below", 246), "tarpit.tiny_window_below", 1, 4096)),
+        asn_ipasn=rel(str(asn_raw["ipasn"])) if asn_raw.get("ipasn") else None,
         checksum=checksum, raw=raw,
     )
     if require_approval:

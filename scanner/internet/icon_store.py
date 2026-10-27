@@ -77,7 +77,7 @@ class IconStore:
             if not rec.get("favicon_is_image") or rel is None:
                 continue
             entry = by_sha.setdefault(sha, {
-                "sha256": sha, "file": rel, "bytes": rec.get("favicon_bytes"), "mmh3": rec.get("favicon_mmh3"),
+                "sha256": sha, "file": rel, "bytes": rec.get("favicon_bytes"), "mmh3": rec.get("favicon_mmh3"), "md5": rec.get("favicon_md5"),
                 "content_type_claimed": rec.get("favicon_content_type"), "observations": [],
             })
             entry["observations"].append({

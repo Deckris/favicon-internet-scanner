@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from scanner import asn_context
 from scanner.internet import candidates as cand
 from scanner.internet import enrich
 from scanner.internet import favicon as fav
@@ -41,7 +42,7 @@ from scanner.zmap_runner import run_zmap
 
 Executor = Callable[..., Any]
 SCHEMA_VERSION = 1
-INSTRUMENT_VERSION = "scanner.1"
+INSTRUMENT_VERSION = "scanner.2"
 WEB_PROTOCOLS = ("https", "http")
 # TLS outcomes after which a plain-HTTP probe is still worth sending: the port did not prove it speaks TLS.
 HTTP_FALLBACK = frozenset({tlsmod.NOT_TLS, tlsmod.CLOSED, tlsmod.RESET, tlsmod.TIMEOUT, tlsmod.OTHER})
@@ -672,6 +673,7 @@ def _cert_fields(t: tlsmod.TlsResult | None) -> dict[str, Any]:
 def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, ptr_status, names_by_ep,
                 resolutions, dns_status, sni_res, sni_skipped, fav_res, incomplete, synack=None):
     synack = synack or {}
+    asn = asn_context.AsnContext(cfg.asn_ipasn) if getattr(cfg, "asn_ipasn", None) else None
     rows: list[dict[str, Any]] = []
     ep_rows: list[dict[str, Any]] = []
     facts_by_ip: dict[str, list[dict[str, Any]]] = {}
@@ -690,6 +692,7 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
         direct_fav = fav_res.get((ip, port, None)) or {}
         base: dict[str, Any] = {
             "target_ip": ip, "port": port, "zmap_result": "synack",
+            **(asn.lookup(ip) if asn else asn_context.empty_fields()),
             "protocol": protocol_of(ep), **tarpit[ip],
             "synack_window": synack.get(ep, {}).get("window"), "synack_ttl": synack.get(ep, {}).get("ttl"),
             "tls_status": "success" if t and t.ok else ("not_tls" if t and t.outcome == tlsmod.NOT_TLS else ("failed" if t else "not_attempted")),
@@ -706,7 +709,7 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
             "dropped_names": names.dropped[:50],
             "direct_favicon_outcome": direct_fav.get("favicon_outcome"), "direct_favicon_is_image": bool(direct_fav.get("favicon_is_image")),
             "direct_favicon_sha256": direct_fav.get("favicon_sha256"), "direct_favicon_file": direct_fav.get("favicon_file"),
-            "direct_favicon_mmh3": direct_fav.get("favicon_mmh3"), "direct_favicon_url": direct_fav.get("favicon_url"),
+            "direct_favicon_mmh3": direct_fav.get("favicon_mmh3"), "direct_favicon_md5": direct_fav.get("favicon_md5"), "direct_favicon_url": direct_fav.get("favicon_url"),
             "direct_document_outcome": direct_fav.get("document_outcome"), "direct_document_status": direct_fav.get("http_status"),
             "direct_document_title": direct_fav.get("document_title"), "direct_document_body_sha256": direct_fav.get("document_body_sha256"),
             "direct_icon_declared_count": direct_fav.get("icon_declared_count"), "direct_icon_offhost_hosts": direct_fav.get("icon_offhost_hosts") or [],
@@ -719,9 +722,9 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
                          "sni_confirmation_attempted": False, "sni_confirmation_result": None, "sni_confirmation_outcome": None,
                          "sni_skipped_reason": None,
                          "sni_certificate_sha256": None, "sni_certificate_hostname_match": None,
-                         "hostname_favicon_outcome": None, "hostname_favicon_is_image": False, "hostname_favicon_sha256": None, "hostname_favicon_file": None, "hostname_favicon_mmh3": None,
+                         "hostname_favicon_outcome": None, "hostname_favicon_is_image": False, "hostname_favicon_sha256": None, "hostname_favicon_file": None, "hostname_favicon_mmh3": None, "hostname_favicon_md5": None,
                          "hostname_favicon_url": None, "hostname_document_title": None, "hostname_icon_offhost_hosts": [],
-                         "hostname_icon_embedded_images": None, "final_hostname_status": "no_hostname_evidence"})
+                         "hostname_icon_embedded_images": None, "final_hostname_status": "no_hostname_evidence", "icon_scope": "none"})
             continue
         for host in sorted(names.names):
             res = resolutions.get(host)
@@ -742,12 +745,21 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
                 "sni_certificate_hostname_match": sni.certificate.hostname_matches if sni and sni.certificate else None,
                 "hostname_favicon_outcome": hf.get("favicon_outcome"), "hostname_favicon_is_image": bool(hf.get("favicon_is_image")),
                 "hostname_favicon_sha256": hf.get("favicon_sha256"), "hostname_favicon_file": hf.get("favicon_file"),
-                "hostname_favicon_mmh3": hf.get("favicon_mmh3"), "hostname_favicon_url": hf.get("favicon_url"),
+                "hostname_favicon_mmh3": hf.get("favicon_mmh3"), "hostname_favicon_md5": hf.get("favicon_md5"), "hostname_favicon_url": hf.get("favicon_url"),
                 "hostname_document_title": hf.get("document_title"), "hostname_icon_offhost_hosts": hf.get("icon_offhost_hosts") or [],
                 "hostname_icon_embedded_images": hf.get("icon_embedded_images"),
                 "final_hostname_status": cand.final_status(status, sources),
+                # a name that does not verify describes the scanned address, never the domain
+                "icon_scope": _icon_scope(cand.final_status(status, sources) == "verified", bool(hf.get("favicon_is_image"))),
             })
     return rows, ep_rows
+
+
+def _icon_scope(verified: bool, is_image: bool) -> str:
+    """domain_verified: the name resolves to this address; served_at_ip: an icon came back but the name does not verify."""
+    if not is_image:
+        return "none"
+    return "domain_verified" if verified else "served_at_ip"
 
 
 def _sni_result(sni: Any) -> str | None:
@@ -818,9 +830,11 @@ def _write_ip_results(path: Path, sample_ips: list[str], ep_rows: list[dict[str,
                                                   | {x for h in hosts for x in h["hostname_icon_offhost_hosts"]})),
             # only real images: the hash of an HTML error page is not a favicon
             "favicon_sha256": "|".join(sorted({e["direct_favicon_sha256"] for e in eps if e["direct_favicon_is_image"] and e["direct_favicon_sha256"]}
-                                              | {h["hostname_favicon_sha256"] for h in hosts if h["hostname_favicon_is_image"] and h["hostname_favicon_sha256"]})),
+                                              | {h["hostname_favicon_sha256"] for h in hosts if h["icon_scope"] == "domain_verified" and h["hostname_favicon_sha256"]})),
+            # icons fetched under names that do not verify: they describe the address, so they stay out of favicon_sha256
+            "unverified_name_favicon_sha256": "|".join(sorted({h["hostname_favicon_sha256"] for h in hosts if h["icon_scope"] == "served_at_ip" and h["hostname_favicon_sha256"]})),
         })
-    _write_csv(path, out) if out else path.write_text("ip,responsive,open_ports,endpoints,ptr_names,verified_hostnames,other_hostnames,certificate_cns,tarpit_suspect,tarpit_confidence,tarpit_signals,tarpit_reason,document_titles,icon_offhost_hosts,favicon_sha256\n", encoding="utf-8")
+    _write_csv(path, out) if out else path.write_text("ip,responsive,open_ports,endpoints,ptr_names,verified_hostnames,other_hostnames,certificate_cns,tarpit_suspect,tarpit_confidence,tarpit_signals,tarpit_reason,document_titles,icon_offhost_hosts,favicon_sha256,unverified_name_favicon_sha256\n", encoding="utf-8")
 
 
 def _tally(rows: list[dict[str, Any]], key: str) -> dict[str, int]:

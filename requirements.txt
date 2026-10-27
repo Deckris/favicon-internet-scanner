@@ -8,6 +8,7 @@ PyYAML>=6.0
 defusedxml>=0.7      # SVG parsing hardened against entity expansion
 resvg-py>=0.1        # deterministic SVG rasterisation in a bounded subprocess
 dnspython>=2.6       # DNS / rDNS enrichment
+pyasn>=1.6          # optional: offline IP-to-ASN lookup from a RouteViews snapshot (asn.ipasn)
 cryptography>=42.0   # TLS certificate (SAN) parsing
 brotli>=1.2.0         # bounded output_buffer_limit API used by the streaming decoder
 pytest>=8.0           # the offline test suite (`scanner verify`)
