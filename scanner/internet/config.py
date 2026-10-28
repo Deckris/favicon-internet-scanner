@@ -31,6 +31,7 @@ OP_FAVICON = "favicon_fetch"
 OP_OFFHOST_ICONS = "offhost_icon_fetch"
 PLACEHOLDERS = ("REPLACE_ME", "CHANGEME", "TODO", "PLACEHOLDER")
 HARD_MAX_PORTS = 16
+HARD_MAX_ZMAP_RATE = 130_000       # packets per second; the approval's max_rate_per_second still applies
 # IANA special-purpose / non-global IPv4 space that is never part of a sample.
 RESERVED_V4 = (
     "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
@@ -247,7 +248,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         ports=tuple(ports),
         zmap_version=zmap_version,
         # ZMap's -r takes an integer: "100.0" is rejected by the binary, so the rate is an int end to end.
-        zmap_rate=_int(int(_float(m["zmap_rate"], "measurement.zmap_rate", 1, 100_000)), "measurement.zmap_rate", 1, 100_000),
+        zmap_rate=_int(int(_float(m["zmap_rate"], "measurement.zmap_rate", 1, HARD_MAX_ZMAP_RATE)), "measurement.zmap_rate", 1, HARD_MAX_ZMAP_RATE),
         zmap_max_runtime=_int(m["zmap_max_runtime"], "measurement.zmap_max_runtime", 1, 7 * 24 * 3600),
         zmap_cooldown=_int(m["zmap_cooldown"], "measurement.zmap_cooldown", 1, 3600),
         zmap_probes=_int(m["zmap_probes"], "measurement.zmap_probes", 1, 5),

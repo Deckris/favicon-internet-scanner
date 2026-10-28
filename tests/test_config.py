@@ -200,3 +200,19 @@ def test_parallel_batches_and_overlap_default_to_sequential_and_are_validated(tm
     for bad in ({"zgrab_parallel_batches": 0}, {"zgrab_parallel_batches": 65}, {"overlap_tls_with_zmap": "yes"}):
         with pytest.raises(ConfigError):
             load_config(_rewrite(tmp_path, lambda d, b=bad: d["measurement"].update(b)))
+
+
+def test_rate_ceiling_is_130000_and_the_approval_still_caps_it(tmp_path):
+    from tests.helpers import write_approval
+    excl = write_exclusions(tmp_path)
+    approval = write_approval(tmp_path, excl, max_rate_per_second=130_000)
+    for rate, ok in ((130_000, True), (130_001, False)):
+        d = config_dict(tmp_path, excl, approval)
+        d["measurement"]["zmap_rate"] = rate
+        p = tmp_path / "rate.yaml"
+        p.write_text(yaml.safe_dump(d))
+        if ok:
+            assert load_config(p).measurement.zmap_rate == 130_000
+        else:
+            with pytest.raises(ConfigError):
+                load_config(p)
