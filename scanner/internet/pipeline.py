@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import queue
 import re
 import shutil
 import signal
@@ -18,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +30,7 @@ from scanner.internet import candidates as cand
 from scanner.internet import enrich
 from scanner.internet import favicon as fav
 from scanner.internet import icon_store
+from scanner.internet import overlap as ovl
 from scanner.internet import pacing
 from scanner.internet import population as pop
 from scanner.internet import preflight as pre
@@ -87,6 +90,13 @@ def _scrub(value: Any) -> Any:
     if isinstance(value, dict):
         return {_scrub(k): _scrub(v) for k, v in value.items()}
     return value
+
+
+def _scrub_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``_scrub`` row by row in place: a second copy of every table would double the peak memory of the write-out."""
+    for i, row in enumerate(rows):
+        rows[i] = _scrub(row)
+    return rows
 
 
 def _jsonable(value: Any) -> Any:
@@ -252,7 +262,8 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     from scanner.internet.zmap_compat import output_args, packet_rate_args
     killed = st.killed
     pace = cfg.measurement.min_seconds_between_probes_per_ip
-    gap = pacing.Gap(pace, killed)             # pause between steps that contact targets
+    gap = pacing.Gap(pace, killed)             # pause between ZMap port runs
+    ledger = pacing.ContactLedger(pace, killed)    # last contact per address, shared by every target-facing step
     pacer = pacing.IpPacer(pace, killed)       # pause between HTTP requests to one address
     gateway_mac = cfg.vantage.gateway_mac or report.get("gateway_mac")
     # Stub manifest before the first probe: if the process is killed hard (OOM, WSL shutdown) the run still
@@ -274,6 +285,7 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
 
     # ---- Stage 0: the complete list of sampled targets (ZMap --dryrun prints targets, sends nothing) --
     sample_ips: list[str] = []
+    send_order: dict[str, int] = {}       # ZMap's send position of each target (the dry run lists them in order)
 
     def sample_stage() -> None:
         if splan.targets_per_port > cfg.max_listed_targets:
@@ -296,7 +308,10 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
             cmd += ["-G", gateway_mac]
         res = executor(cmd, capture_output=True, text=True, check=False)
         text = (getattr(res, "stdout", "") or "") + (getattr(res, "stderr", "") or "")
-        found = sorted(set(re.findall(r"daddr: (\d+\.\d+\.\d+\.\d+)", text)), key=lambda x: tuple(int(o) for o in x.split(".")))
+        listed = re.findall(r"daddr: (\d+\.\d+\.\d+\.\d+)", text)
+        for ip in listed:
+            send_order.setdefault(ip, len(send_order))
+        found = sorted(set(listed), key=lambda x: tuple(int(o) for o in x.split(".")))
         sample_ips.extend(ip for ip in found if policy.check_ip(ip, stage="zmap", context="sample_list") is None)
         expected = splan.targets_per_port
         if st.guards and not expected * 0.99 <= len(sample_ips) <= expected * 1.0001 + 1:
@@ -312,9 +327,28 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     # ---- Stage 1: ZMap L4 discovery (same seed -> same sample on every port) ----------------
     l4: dict[int, list[str]] = {}
     synack: dict[tuple[str, int], dict[str, int | None]] = {}      # SYN-ACK window and TTL, free from the same probes
+    m = cfg.measurement
+    tiny = cfg.tarpit.tiny_window_below
+    dns_kw = dict(nameservers=list(cfg.dns.resolvers), run_dir=run_dir, threads=cfg.dns.threads, timeout=cfg.dns.timeout,
+                  retries=cfg.dns.retries, network_timeout=cfg.dns.network_timeout, binary=cfg.binaries.zdns, executor=executor)
+    # PTR goes to the resolvers, never to the targets: each port's new addresses are looked up while ZMap sweeps the next.
+    ptr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ptr")
+    ptr_early: list[tuple[list[str], Any]] = []
+    ptr_sent: set[str] = set()
+
+    gate: ovl.OverlapGate | None = None
+    tls_ports: queue.Queue[int | None] = queue.Queue()
+    if m.overlap_tls_with_zmap:
+        if send_order:
+            gate = ovl.OverlapGate(ovl.ZmapProgress(m.zmap_probes), send_order, sweeps_total=len(m.ports),
+                                   rate_targets=m.zmap_rate / m.zmap_probes, pace=pace)
+            counts["overlap"] = {"enabled": True, "traffic": "outbound traffic during the sweep is the ZMap rate plus the "
+                                 "concurrent ZGrab2 TLS connections"}
+        else:
+            counts["overlap"] = {"enabled": False, "reason": "no ZMap send order: the sample listing was skipped or failed"}
 
     def zmap_stage() -> None:
-        for port in cfg.measurement.ports:
+        for port in m.ports:
             if killed():
                 st.skipped.append(f"zmap:{port}")
                 continue
@@ -322,13 +356,18 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
             if not gap.wait():
                 st.skipped.append(f"zmap:{port}")
                 continue
+            status = run_dir / "raw" / "zmap" / f"status-{port}.csv" if gate else None
+            if gate:
+                gate.progress.start_sweep(status)
             try:
-                job, res = run_zmap(cfgview, policy, port, run_dir, executor=executor, gateway_mac=gateway_mac)
+                job, res = run_zmap(cfgview, policy, port, run_dir, executor=executor, gateway_mac=gateway_mac, status_file=status)
             except Exception as exc:
                 st.errors[f"zmap:{port}"] = f"{type(exc).__name__}: {exc}"[:500]
-                gap.mark()
                 continue
-            gap.mark()
+            finally:
+                gap.mark()
+                if gate:
+                    gate.progress.end_sweep()
             jobs.append(job)
             if job.error:
                 st.errors[f"zmap:{port}"] = job.error[:500]
@@ -338,35 +377,94 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
                     synack[(ip_, port)] = fields
             except OSError:
                 pass
+            new = [ip for ip in l4[port] if ip not in ptr_sent]
+            if new:
+                ptr_sent.update(new)
+                ptr_early.append((new, ptr_pool.submit(run_zdns, "PTR", new, **dns_kw)))
+            if gate:
+                tls_ports.put(port)
 
-    st.run("zmap", zmap_stage, None)
-    gap.mark()
-    endpoints = sorted({(ip, port) for port, ips in l4.items() for ip in ips}, key=lambda e: (e[0], e[1]))
-    counts["l4_per_port"] = {str(p): len(l4.get(p, [])) for p in cfg.measurement.ports}
-    counts["l4_endpoints"] = len(endpoints)
-    counts["l4_unique_ips"] = len({ip for ip, _ in endpoints})
-    # An address whose SYN-ACK advertises a zero or tiny TCP window is a tarpit: it holds connections open on purpose.
-    # It stays in the results (flagged) but receives nothing beyond the ZMap SYN.
-    tiny = cfg.tarpit.tiny_window_below
-    tarpit_ips = {ip for (ip, _), f in synack.items() if f.get("window") is not None and f["window"] < tiny}
-    probe_endpoints = [e for e in endpoints if e[0] not in tarpit_ips]
-    counts["tarpit_ips_not_probed"] = len({ip for ip, _ in endpoints} & tarpit_ips)
-    counts["sample_targets_per_port"] = splan.targets_per_port
+    def tarpits() -> set[str]:
+        return {ip for (ip, _), f in list(synack.items()) if f.get("window") is not None and f["window"] < tiny}
 
     # ---- Stage 2: TLS first, direct IP (no SNI) ---------------------------------------------
     tls_direct: dict[tuple[str, int], tlsmod.TlsResult] = {}
+    tls_jobs: list[ToolJob] = []
+    # With overlap a batch must end by a known time: the gate leaves room for that, and the executor enforces it.
+    tls_limit = m.zgrab_connect_timeout + m.zgrab_target_timeout + 15
 
-    def tls_stage() -> None:
+    def tls_runner(timeout: float | None = None) -> Callable[[list], Any]:
         def one(batch):
             return tlsmod.run_tls_batches(batch, mode="direct_ip", cfg=cfgview, policy=policy, run_dir=run_dir,
-                                          binary=cfg.binaries.zgrab2, executor=executor)
-        for j, res in pacing.paced_rounds([(ip, port, None) for ip, port in probe_endpoints], lambda t: t[0], gap, one):
-            jobs.extend(j)
+                                          binary=cfg.binaries.zgrab2, executor=executor, timeout=timeout)
+        return one
+
+    def collect_tls(out: list[Any]) -> None:
+        for j, res in out:
+            tls_jobs.extend(j)
             for r in res:
                 if r.ip:
                     tls_direct[(r.ip, r.port)] = r
 
-    st.run("tls_direct", tls_stage, None)
+    def tls_stage() -> None:
+        collect_tls(pacing.paced_batches([(ip, port, None) for ip, port in probe_endpoints], lambda t: t[0], ledger,
+                                         tls_runner(), batch_size=m.zgrab_batch_size, workers=m.zgrab_parallel_batches))
+
+    def tls_overlap_stage() -> None:
+        assert gate is not None
+        size = max(1, min(m.zgrab_batch_size, m.zgrab_senders))      # every target of a batch in flight at once
+        while (port := tls_ports.get()) is not None:
+            if killed():
+                continue
+            # Tarpits seen on the ports swept so far are left alone; one flagged only on a later port is counted below.
+            skip = tarpits()
+            # ZMap's own order: neighbours in a batch become due together
+            items = sorted(((ip, port, None) for ip in l4.get(port, []) if ip not in skip),
+                           key=lambda t: (send_order.get(t[0], 1 << 62), t[0]))
+            collect_tls(pacing.paced_batches(items, lambda t: t[0], ledger, tls_runner(tls_limit), batch_size=size,
+                                             workers=m.zgrab_parallel_batches,
+                                             extra=lambda b: gate.admit([t[0] for t in b], tls_limit + 10)))
+
+    tls_thread = None
+    if gate:
+        tls_thread = threading.Thread(target=st.run, args=("tls_direct", tls_overlap_stage, None), name="tls-overlap", daemon=True)
+        tls_thread.start()
+    try:
+        st.run("zmap", zmap_stage, None)
+    finally:
+        ledger.mark_all()          # the sweep touched every sampled address: the pause counts from its end
+        if gate:
+            gate.progress.finish()
+            counts["overlap"]["tls_endpoints_during_sweep"] = len(tls_direct)
+            tls_ports.put(None)
+    while tls_thread is not None and tls_thread.is_alive():
+        try:
+            tls_thread.join(0.5)
+        except KeyboardInterrupt as exc:      # signals reach the main thread only; the tool is stopped via killed()
+            st.interrupted = True
+            st.errors.setdefault("tls_direct", f"interrupted: {exc}"[:200])
+    endpoints = sorted({(ip, port) for port, ips in l4.items() for ip in ips}, key=lambda e: (e[0], e[1]))
+    counts["l4_per_port"] = {str(p): len(l4.get(p, [])) for p in m.ports}
+    counts["l4_endpoints"] = len(endpoints)
+    counts["l4_unique_ips"] = len({ip for ip, _ in endpoints})
+    # An address whose SYN-ACK advertises a zero or tiny TCP window is a tarpit: it holds connections open on purpose.
+    # It stays in the results (flagged) but receives nothing beyond the ZMap SYN.
+    tarpit_ips = tarpits()
+    probe_endpoints = [e for e in endpoints if e[0] not in tarpit_ips]
+    counts["tarpit_ips_not_probed"] = len({ip for ip, _ in endpoints} & tarpit_ips)
+    counts["sample_targets_per_port"] = splan.targets_per_port
+
+    if gate:
+        counts["overlap"]["zmap_status_readings"] = gate.progress.readings
+        # A tarpit flagged only on a later port may already have had a handshake. Its result is dropped so no
+        # later step contacts it again; the handshake stays in the raw ZGrab2 output and the tool jobs.
+        late = [ep for ep in tls_direct if ep[0] in tarpit_ips]
+        counts["overlap"]["tarpit_ips_probed_before_flagged"] = len({ip for ip, _ in late})
+        for ep in late:
+            del tls_direct[ep]
+    else:
+        st.run("tls_direct", tls_stage, None)
+    jobs.extend(tls_jobs)
 
     # ---- Stage 3: plain HTTP only where TLS did not prove the port speaks TLS ---------------
     http_res: dict[tuple[str, int], Any] = {}
@@ -377,7 +475,8 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         def one(batch):
             return run_zgrab_batches(batch, scheme="http", mode="direct_ip", cfg=cfgview, policy=policy,
                                      run_dir=run_dir, executor=executor)
-        for j, res in pacing.paced_rounds(targets, lambda t: t.ip, gap, one):
+        for j, res in pacing.paced_batches(targets, lambda t: t.ip, ledger, one, batch_size=m.zgrab_batch_size,
+                                           workers=m.zgrab_parallel_batches):
             jobs.extend(j)
             for r in res:
                 if r.target_ip:
@@ -404,19 +503,33 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     # ---- Stage 4: PTR via ZDNS for every responsive IP --------------------------------------
     ptr_by_ip: dict[str, list[str]] = {}
     ptr_status: dict[str, str] = {}
-    dns_kw = dict(nameservers=list(cfg.dns.resolvers), run_dir=run_dir, threads=cfg.dns.threads, timeout=cfg.dns.timeout,
-                  retries=cfg.dns.retries, network_timeout=cfg.dns.network_timeout, binary=cfg.binaries.zdns, executor=executor)
 
     def ptr_stage() -> None:
         ips = sorted({ip for ip, _ in endpoints})
-        j, ans = run_zdns("PTR", ips, **dns_kw)
-        jobs.extend(j)
+        ans: dict[str, Any] = {}
+        missing = [ip for ip in ips if ip not in ptr_sent]
+        for done_ips, future in ptr_early:          # port order, so the job list does not depend on timing
+            try:
+                j, part = future.result()
+            except Exception as exc:
+                counts["ptr_early_failed"] = f"{type(exc).__name__}: {exc}"[:300]
+                missing += done_ips                 # asked again below; a second failure is the stage's error
+                continue
+            jobs.extend(j)
+            ans.update(part)
+        if missing:
+            j, part = run_zdns("PTR", sorted(set(missing)), **dns_kw)
+            jobs.extend(j)
+            ans.update(part)
         for ip in ips:
             a = ans.get(ip)
             ptr_by_ip[ip] = ptr_names(a)
             ptr_status[ip] = a.status if a else "NO_OUTPUT"
 
-    st.run("ptr", ptr_stage, None)
+    try:
+        st.run("ptr", ptr_stage, None)
+    finally:
+        ptr_pool.shutdown(wait=True, cancel_futures=True)
 
     # ---- Stage 5: hostname candidates = PTR U cert SAN/CN ----------------------------------
     names_by_ep: dict[tuple[str, int], cand.EndpointNames] = {}
@@ -439,9 +552,10 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         names = sorted({n for e in names_by_ep.values() for n in e.names})
         if not names:
             return
-        ja, a_ans = run_zdns("A", names, **dns_kw)
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dns") as pool:     # resolver traffic only
+            fa, fb = pool.submit(run_zdns, "A", names, **dns_kw), pool.submit(run_zdns, "AAAA", names, **dns_kw)
+            (ja, a_ans), (jb, aaaa_ans) = fa.result(), fb.result()
         jobs.extend(ja)
-        jb, aaaa_ans = run_zdns("AAAA", names, **dns_kw)
         jobs.extend(jb)
         for n in names:
             resolutions[n] = resolve(n, a_ans.get(n), aaaa_ans.get(n), max_cnames=cfg.dns.max_cnames)
@@ -483,7 +597,8 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         def one(batch):
             return tlsmod.run_tls_batches(batch, mode="hostname_aware", cfg=cfgview, policy=policy, run_dir=run_dir,
                                           binary=cfg.binaries.zgrab2, executor=executor)
-        for j, res in pacing.paced_rounds(targets, lambda t: t[0], gap, one):
+        for j, res in pacing.paced_batches(targets, lambda t: t[0], ledger, one, batch_size=m.zgrab_batch_size,
+                                           workers=m.zgrab_parallel_batches):
             jobs.extend(j)
             for r in res:
                 if r.ip and r.sni:
@@ -527,7 +642,7 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
                 for h in unverified_names(ep)[: cfg.favicon.max_unverified_names_per_endpoint]:
                     fjobs.append({"scheme": "http" if proto == "http" else "https", "ip": ep[0], "port": ep[1], "hostname": h})
                     counts["favicon_jobs_unverified_names"] = counts.get("favicon_jobs_unverified_names", 0) + 1
-        if not fjobs or not gap.wait():
+        if not fjobs or not ledger.wait({j["ip"] for j in fjobs}):
             return
         fp = fav.fetch_policy(cfg, [j["ip"] for j in fjobs])
         f = fetcher or fav.make_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
@@ -538,14 +653,19 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
 
         def stop() -> bool:
             return killed() or time.monotonic() > deadline
+        record_log = fav.RecordLog(run_dir / "raw" / "favicon_records.jsonl")
+        earlier = record_log.load()
+        if earlier:
+            counts["favicon_lookups_resumed"] = len(earlier)
         try:
             for rec in fav.run_favicon_stage(f, fjobs, workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page, killed=stop,
-                                            icon_store=store):
+                                            icon_store=store, on_record=record_log.append, done=earlier):
                 fav_res[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
             skipped = sum(1 for r in fav_res.values() if r.get("favicon_outcome") == "skipped_kill_switch")
             if time.monotonic() > deadline and skipped:
                 st.errors["favicon_deadline"] = f"stage cap of {cfg.favicon.stage_max_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"
         finally:
+            record_log.close()
             if store is not None:
                 counts["favicon_images_stored"] = len(store)
                 counts["favicon_images_indexed"] = store.write_index(list(fav_res.values()))
@@ -569,7 +689,7 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     except Exception as exc:
         st.errors["records"] = f"{type(exc).__name__}: {exc}"[:500]
         rows, ep_rows = [], []
-    rows, ep_rows = _scrub(rows), _scrub(ep_rows)
+    rows, ep_rows = _scrub_rows(rows), _scrub_rows(ep_rows)
     normalized = run_dir / "normalized"
     checksums: dict[str, str] = {}
     try:
@@ -623,6 +743,9 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
                        "zmap_sender_threads": 1,
                        "dns_network_timeout": cfg.dns.network_timeout, "dns_retries": cfg.dns.retries,
                        "zgrab_senders": cfg.measurement.zgrab_senders, "zgrab_batch_size": cfg.measurement.zgrab_batch_size,
+                       "zgrab_parallel_batches": cfg.measurement.zgrab_parallel_batches,
+                       "overlap_tls_with_zmap": cfg.measurement.overlap_tls_with_zmap,
+                       "min_seconds_between_probes_per_ip": cfg.measurement.min_seconds_between_probes_per_ip,
                        "zgrab_connect_timeout": cfg.measurement.zgrab_connect_timeout, "zgrab_target_timeout": cfg.measurement.zgrab_target_timeout,
                        "max_candidates_per_ip": cfg.max_candidates_per_ip, "sni_confirm": vars(cfg.sni_confirm),
                        "favicon": vars(cfg.favicon), "fetch": vars(cfg.fetch)},

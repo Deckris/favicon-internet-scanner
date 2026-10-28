@@ -16,6 +16,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,7 @@ class ManagedExecutor:
         self.run_dir = Path(run_dir)
         self.killed = killed
         self._seq = 0
+        self._seq_lock = threading.Lock()      # stages may run tools from several threads at once
         self._bins = {"zmap": cfg.binaries.zmap, "zgrab2": cfg.binaries.zgrab2, "zdns": cfg.binaries.zdns}
         (self.run_dir / "raw" / "stderr").mkdir(parents=True, exist_ok=True)
 
@@ -82,7 +84,9 @@ class ManagedExecutor:
             # do not start another tool just to have it killed a second later.
             return subprocess.CompletedProcess(argv, -15, "", "scanner: stopped before start")
         limit = timeout or self.timeout_for(tool, command, input)
-        self._seq += 1
+        with self._seq_lock:
+            self._seq += 1
+            seq = self._seq
         label = "-".join([tool, command[1] if len(command) > 1 and not command[1].startswith("-") else ""]).strip("-")
         # Input goes through a file, not a pipe: a pipe would block once the tool lags behind more than the
         # 64 KB pipe buffer, and CPython's communicate() cannot resume writing after a poll timeout.
@@ -129,7 +133,7 @@ class ManagedExecutor:
         if reason:
             err = f"{err}\nscanner: {reason}".strip()
         try:
-            (self.run_dir / "raw" / "stderr" / f"{self._seq:04d}-{label}.txt").write_text(
+            (self.run_dir / "raw" / "stderr" / f"{seq:04d}-{label}.txt").write_text(
                 f"$ {' '.join(argv)}\nexit={code}\n{err}\n", encoding="utf-8")
         except OSError:
             pass

@@ -231,7 +231,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     measurement_keys = {
         "ports", "zmap_rate", "zmap_max_runtime", "zmap_cooldown", "zmap_probes",
         "zgrab_connect_timeout", "zgrab_target_timeout", "zgrab_senders", "zgrab_batch_size"}
-    m = _section(raw, "measurement", measurement_keys | {"zmap_version", "min_seconds_between_probes_per_ip"}, measurement_keys)
+    m = _section(raw, "measurement", measurement_keys | {"zmap_version", "min_seconds_between_probes_per_ip", "zgrab_parallel_batches",
+                                                         "overlap_tls_with_zmap"}, measurement_keys)
     zmap_version = str(m.get("zmap_version", "2.1.1"))
     if not supported(zmap_version):
         raise ConfigError("measurement.zmap_version must be 2.1.x or the pinned 4.4.0")
@@ -256,6 +257,11 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         # Minimum pause between any two requests to the same address. `authorize` holds it to the approval's floor.
         min_seconds_between_probes_per_ip=_float(m.get("min_seconds_between_probes_per_ip", 15),
                                                  "measurement.min_seconds_between_probes_per_ip", 0, 3600),
+        # ZGrab2 processes run at once on different addresses; the per-address pause still holds.
+        zgrab_parallel_batches=_int(m.get("zgrab_parallel_batches", 1), "measurement.zgrab_parallel_batches", 1, 64),
+        # Start direct-IP TLS while ZMap sweeps the remaining ports. Outbound traffic is then the ZMap rate plus
+        # the concurrent ZGrab2 connections; the approval rate still caps ZMap alone.
+        overlap_tls_with_zmap=_bool(m.get("overlap_tls_with_zmap", False), "measurement.overlap_tls_with_zmap"),
         zmap_seed=seed,
         zmap_max_targets=None,   # set from the sample plan at run time
     )
@@ -349,7 +355,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         sni_confirm=SimpleNamespace(enabled=bool(sc["enabled"]), max_per_endpoint=_int(sc["max_per_endpoint"], "sni_confirm.max_per_endpoint", 1, 20)),
         favicon=SimpleNamespace(
             enabled=bool(fv["enabled"]), max_hostnames_per_endpoint=_int(fv["max_hostnames_per_endpoint"], "favicon.max_hostnames_per_endpoint", 0, 20),
-            workers=_int(fv["workers"], "favicon.workers", 1, 64), max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
+            workers=_int(fv["workers"], "favicon.workers", 1, 512), max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
             store_images=_bool(fv.get("store_images", True), "favicon.store_images"),
             stage_max_seconds=_int(fv.get("stage_max_seconds", 7200), "favicon.stage_max_seconds", 1, 86400),
             max_unverified_names_per_endpoint=_int(fv.get("max_unverified_names_per_endpoint", 0), "favicon.max_unverified_names_per_endpoint", 0, 10),

@@ -112,3 +112,80 @@ def test_zmap_port_runs_are_spaced_by_the_minimum_interval(tmp_path):
     pipeline.run(cfg, run_id="t1", executor=executor, fetcher=FakeFetcher(), skip_preflight=True, offline_preflight=True)
     assert len(starts) == len(cfg.measurement.ports) > 1
     assert all(b - a >= 0.4 for a, b in zip(starts, starts[1:]))
+
+
+def test_ledger_holds_each_address_back_from_its_own_last_contact_only():
+    c = Clock()
+    led = pacing.ContactLedger(15, now=c.now, sleep=c.sleep)
+    assert led.claim(["a"]) and c.sleeps == []
+    c.t += 2
+    led.release(["a"])                                      # contact with a ended at 102
+    assert led.claim(["b"]) and c.t == 102                  # another address is not held back
+    led.release(["b"])
+    assert led.claim(["a"]) and 116.9 < c.t < 117.1         # a waits until 15 s after its contact ended
+    led.release(["a"])
+    led.mark_all()                                          # a sweep touching everyone ended now
+    t_sweep = c.t
+    assert led.claim(["c"]) and c.t >= t_sweep + 15
+
+
+def test_ledger_stops_on_kill_and_respects_an_extra_check():
+    c = Clock()
+    led = pacing.ContactLedger(15, killed=lambda: c.t > 110, now=c.now, sleep=c.sleep)
+    led.mark_all()
+    assert led.claim(["a"]) is False                        # the stop fired during the wait
+    c2 = Clock()
+    led2 = pacing.ContactLedger(0, now=c2.now, sleep=c2.sleep)
+    assert led2.claim(["a"], extra=lambda now: now >= 105) and c2.t >= 105
+
+
+def test_paced_batches_keep_composition_and_order_and_match_rounds_with_one_worker():
+    items = [("a", 1), ("b", 1), ("a", 2), ("c", 1), ("b", 2), ("a", 3)]
+    c = Clock()
+    seen = []
+
+    def run(batch):
+        seen.append(list(batch))
+        c.t += 2
+        return batch
+    out = pacing.paced_batches(items, lambda t: t[0], pacing.ContactLedger(15, now=c.now, sleep=c.sleep), run, batch_size=2)
+    assert out == seen == [[("a", 1), ("b", 1)], [("c", 1)], [("a", 2), ("b", 2)], [("a", 3)]]
+
+
+def test_paced_batches_in_parallel_never_contact_an_address_within_the_pause():
+    import threading
+    import time
+    pace = 0.15
+    items = [(ip, port) for port in (1, 2, 3) for ip in ("a", "b", "c", "d", "e")]
+    log, lock = [], threading.Lock()
+
+    def run(batch):
+        start = time.monotonic()
+        time.sleep(0.03)
+        with lock:
+            log.extend((ip, start, time.monotonic()) for ip, _ in batch)
+        return batch
+    out = pacing.paced_batches(items, lambda t: t[0], pacing.ContactLedger(pace), run, batch_size=2, workers=4)
+    assert sorted(x for b in out for x in b) == sorted(items)
+    for ip in "abcde":
+        spans = sorted((s, e) for i, s, e in log if i == ip)
+        assert all(s2 - e1 >= pace - 0.005 for (_s1, e1), (s2, _e2) in zip(spans, spans[1:])), (ip, spans)
+
+
+def test_paced_batches_stop_starting_batches_after_a_kill_or_an_error():
+    stop = {"now": False}
+
+    def run(batch):
+        stop["now"] = True
+        return batch
+    led = pacing.ContactLedger(0, killed=lambda: stop["now"])
+    assert len(pacing.paced_batches([("a", 1), ("b", 1), ("c", 1)], lambda t: t[0], led, run, batch_size=1)) == 1
+    calls = []
+
+    def boom(batch):
+        calls.append(batch)
+        raise RuntimeError("tool crashed")
+    import pytest
+    with pytest.raises(RuntimeError):
+        pacing.paced_batches([("a", 1), ("b", 1), ("c", 1)], lambda t: t[0], pacing.ContactLedger(0), boom, batch_size=1, workers=1)
+    assert len(calls) == 1

@@ -35,6 +35,10 @@ measurement:
   zgrab_target_timeout: 8.0
   zgrab_senders: 50
   zgrab_batch_size: 2000
+  zgrab_parallel_batches: 4      # ZGrab2 processes at once, always on different addresses
+  # Start direct-IP TLS while ZMap still sweeps later ports. Outbound traffic is then the ZMap rate PLUS the
+  # concurrent ZGrab2 connections. Each address still gets the minimum pause, including from its SYNs.
+  overlap_tls_with_zmap: false
 
 target_policy:
   exclusions_file: REPLACE_ME    # opt-out / protected ranges, one CIDR per line

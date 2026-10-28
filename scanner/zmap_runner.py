@@ -32,6 +32,7 @@ def run_zmap(
     *,
     executor: Executor = subprocess.run,
     gateway_mac: str | None = None,
+    status_file: Path | None = None,
 ) -> tuple[ToolJob, list[L4Result]]:
     raw_dir = Path(run_dir) / "raw" / "zmap"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +78,9 @@ def run_zmap(
     command += list(getattr(measurement, "zmap_extra_args", ()))
     if gateway_mac:
         command += ["-G", gateway_mac]
+    if status_file is not None:
+        # Once-a-second progress (sent-total etc.) as CSV, for callers that follow the sweep while it runs.
+        command += ["-u", str(status_file)]
     # ZMap 2.1.1 starts a sender thread per core unless told otherwise (measured: 17 threads, ~12 cores busy,
     # which starved the network path and stalled sending). Callers that care pass an explicit thread count.
     sender_threads = getattr(measurement, "zmap_sender_threads", None)

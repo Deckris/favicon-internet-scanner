@@ -190,3 +190,13 @@ def test_anonymous_traffic_requires_an_explicit_flag_and_a_clean_user_agent(tmp_
         d["fetch"]["user_agent"] = "scan (+https://example.org)"
     with pytest.raises(ConfigError, match="anonymous"):
         load_config(_rewrite(tmp_path / "y", leaky)) if (tmp_path / "y").mkdir() is None else None
+
+
+def test_parallel_batches_and_overlap_default_to_sequential_and_are_validated(tmp_path):
+    cfg = load_config(write_config(tmp_path))
+    assert cfg.measurement.zgrab_parallel_batches == 1 and cfg.measurement.overlap_tls_with_zmap is False
+    on = load_config(_rewrite(tmp_path, lambda d: d["measurement"].update(zgrab_parallel_batches=4, overlap_tls_with_zmap=True)))
+    assert on.measurement.zgrab_parallel_batches == 4 and on.measurement.overlap_tls_with_zmap is True
+    for bad in ({"zgrab_parallel_batches": 0}, {"zgrab_parallel_batches": 65}, {"overlap_tls_with_zmap": "yes"}):
+        with pytest.raises(ConfigError):
+            load_config(_rewrite(tmp_path, lambda d, b=bad: d["measurement"].update(b)))

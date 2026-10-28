@@ -85,13 +85,16 @@ def stable_id(prefix: str, *parts: Any) -> str:
 
 def write_jsonl(path: Any, records: Iterable[Record | dict[str, Any]], *, sort_key: str | None = None) -> str:
     """Write records as canonical JSONL and return the file SHA-256."""
-    rows = [record.as_dict() if isinstance(record, Record) else record for record in records]
+    rows = (record.as_dict() if isinstance(record, Record) else record for record in records)
     if sort_key:
-        rows.sort(key=lambda row: canonical_json(row.get(sort_key)))
-    data = "".join(canonical_json(row) + "\n" for row in rows).encode("utf-8")
+        rows = sorted(rows, key=lambda row: canonical_json(row.get(sort_key)))
+    digest = hashlib.sha256()
     with open(path, "wb") as handle:
-        handle.write(data)
-    return hashlib.sha256(data).hexdigest()
+        for row in rows:
+            line = (canonical_json(row) + "\n").encode("utf-8")
+            digest.update(line)
+            handle.write(line)
+    return digest.hexdigest()
 
 
 def read_jsonl(path: Any) -> list[dict[str, Any]]:

@@ -337,24 +337,79 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
     return record
 
 
+class RecordLog:
+    """Append-only log of favicon records, one JSON line each, written the moment a lookup finishes.
+
+    The stage can run for many hours and its results otherwise exist only in memory; the log lets a killed run
+    keep every lookup it completed and lets a repeat run pick up where it stopped.
+    """
+
+    def __init__(self, path: Any) -> None:
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._fh: Any = None
+
+    def load(self) -> dict[tuple[str, int, str | None], dict[str, Any]]:
+        found: dict[tuple[str, int, str | None], dict[str, Any]] = {}
+        if not self.path.exists():
+            return found
+        with self.path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    found[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
+                except (ValueError, KeyError, TypeError):
+                    continue        # a line cut short by the kill
+        return found
+
+    def append(self, rec: dict[str, Any]) -> None:
+        line = json.dumps(rec, default=str) + "\n"
+        with self._lock:
+            if self._fh is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._fh = self.path.open("a", encoding="utf-8", newline="\n")
+            self._fh.write(line)
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._fh is not None:
+                self._fh.close()
+                self._fh = None
+
+
 def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, workers: int, max_icons: int, killed: Any = lambda: False,
-                      icon_store: Any = None) -> list[dict[str, Any]]:
-    """``jobs``: dicts with scheme/ip/port/hostname. Returns one record per job, order preserved."""
+                      icon_store: Any = None, on_record: Any = None, done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None
+                      ) -> list[dict[str, Any]]:
+    """``jobs``: dicts with scheme/ip/port/hostname. Returns one record per job, order preserved.
+
+    ``on_record`` receives each record fetched in this call as soon as it exists; ``done`` holds records from an
+    earlier attempt, which are reused instead of fetched again.
+    """
     def one(job: dict[str, Any]) -> dict[str, Any]:
+        prior = done.get((job["ip"], job["port"], job.get("hostname"))) if done else None
+        if prior is not None:
+            return prior
         if killed():
             return {"kind": "hostname" if job.get("hostname") else "direct_ip", "scheme": job["scheme"], "hostname": job.get("hostname"),
                     "favicon_outcome": "skipped_kill_switch", "ip": job["ip"], "port": job["port"]}
         rec = probe_identity(fetcher, scheme=job["scheme"], ip=job["ip"], port=job["port"], hostname=job.get("hostname"), max_icons=max_icons,
                               icon_store=icon_store)
         rec["ip"], rec["port"] = job["ip"], job["port"]
+        if on_record is not None:
+            try:
+                on_record(rec)
+            except OSError:
+                pass        # a full disk must not cost the lookup that already succeeded
         return rec
     if not jobs:
         return []
-    # One host at a time: every job for the same ip:port runs in sequence on one worker, so a scanned server never
-    # sees the bare-IP request and several name-based requests at once.
-    groups: dict[tuple[str, int], list[int]] = {}
+    # One address at a time: every job for the same ip runs in sequence on one worker, so a scanned server never
+    # sees the bare-IP request and several name-based requests at once. All ports of an address share one pacer
+    # slot, so giving them separate workers would only leave one of the workers asleep in the pacer.
+    groups: dict[str, list[int]] = {}
     for idx, job in enumerate(jobs):
-        groups.setdefault((job["ip"], job["port"]), []).append(idx)
+        groups.setdefault(job["ip"], []).append(idx)
     out: list[dict[str, Any] | None] = [None] * len(jobs)
 
     def run_group(indexes: list[int]) -> None:

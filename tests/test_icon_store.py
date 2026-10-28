@@ -112,3 +112,67 @@ def test_refetch_refuses_a_run_from_a_different_config(source, tmp_path_factory)
     other = load_config(write_config(tmp_path_factory.mktemp("other"), run_label="another"))
     with pytest.raises(ConfigError, match="different config"):
         refetch.plan(other, run_dir, all_jobs=False)
+
+
+def test_pipeline_keeps_every_favicon_lookup_on_disk(source):
+    _, run_dir = source
+    kept = fav.RecordLog(run_dir / "raw" / "favicon_records.jsonl").load()
+    rows = [json.loads(l) for l in (run_dir / "normalized" / "endpoints.jsonl").read_text().splitlines()]
+    assert kept and all(r.get("favicon_outcome") for r in kept.values())
+    assert {(r["target_ip"], r["port"]) for r in rows if r["direct_favicon_outcome"]} <= {(ip, port) for ip, port, _ in kept}
+
+
+def test_record_log_ignores_a_line_cut_short_by_a_kill(tmp_path):
+    log = fav.RecordLog(tmp_path / "records.jsonl")
+    log.append({"ip": "192.0.2.1", "port": 80, "hostname": None, "favicon_outcome": "image"})
+    log.close()
+    with (tmp_path / "records.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write('{"ip": "192.0.2.2", "po')
+    assert list(fav.RecordLog(tmp_path / "records.jsonl").load()) == [("192.0.2.1", 80, None)]
+
+
+def test_stage_reuses_earlier_records_and_reports_only_new_ones(monkeypatch):
+    fetched = []
+
+    def probe(fetcher, *, scheme, ip, port, hostname, max_icons, icon_store=None):
+        fetched.append((ip, port, hostname))
+        return {"favicon_outcome": "none_declared"}
+    monkeypatch.setattr(fav, "probe_identity", probe)
+    jobs = [{"scheme": "http", "ip": "192.0.2.1", "port": 80, "hostname": None},
+            {"scheme": "http", "ip": "192.0.2.2", "port": 80, "hostname": None}]
+    earlier = {("192.0.2.1", 80, None): {"ip": "192.0.2.1", "port": 80, "hostname": None, "favicon_outcome": "image"}}
+    reported = []
+    out = fav.run_favicon_stage(None, jobs, workers=4, max_icons=2, on_record=reported.append, done=earlier)
+    assert fetched == [("192.0.2.2", 80, None)] and [r["ip"] for r in reported] == ["192.0.2.2"]
+    assert [r["favicon_outcome"] for r in out] == ["image", "none_declared"]
+
+
+def test_refetch_resumes_from_the_records_it_already_kept(source):
+    cfg, run_dir = source
+    first = refetch.run_refetch(cfg, run_dir, run_id="again", fetcher=FakeFetcher(), executor=tools(), offline_preflight=True, skip_preflight=True)
+    (first / "manifest.json").unlink()          # as after a kill: records on disk, no manifest
+
+    class Unused(FakeFetcher):
+        calls = 0
+
+        def fetch(self, *args, **kwargs):
+            Unused.calls += 1
+            return super().fetch(*args, **kwargs)
+    out = refetch.run_refetch(cfg, run_dir, run_id="again", fetcher=Unused(), executor=tools(), offline_preflight=True, skip_preflight=True)
+    assert Unused.calls == 0
+    assert json.loads((out / "manifest.json").read_text())["complete"]
+
+
+def test_refetch_ignores_a_changed_worker_count_but_not_other_settings():
+    base = {"run_label": "a", "favicon": {"workers": 64, "stage_max_seconds": 86400, "enabled": True}}
+    faster = {"run_label": "a", "favicon": {"workers": 512, "stage_max_seconds": 3600, "enabled": True}}
+    other = {"run_label": "b", "favicon": {"workers": 64, "stage_max_seconds": 86400, "enabled": True}}
+    assert refetch._measurement_fingerprint(base) == refetch._measurement_fingerprint(faster)
+    assert refetch._measurement_fingerprint(base) != refetch._measurement_fingerprint(other)
+
+
+def test_favicon_workers_may_go_up_to_512(tmp_path):
+    favicon = {"enabled": True, "max_hostnames_per_endpoint": 3, "max_icons_per_page": 4}
+    assert load_config(write_config(tmp_path, favicon={**favicon, "workers": 512})).favicon.workers == 512
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, favicon={**favicon, "workers": 513}))

@@ -40,6 +40,28 @@ def _scheme(protocol: str | None) -> str:
     return "http" if protocol == "http" else "https"
 
 
+PACING_ONLY_KEYS = ("workers", "stage_max_seconds")
+
+
+def _measurement_fingerprint(raw: dict[str, Any]) -> str:
+    """Hash of a config without the favicon settings that only change how fast the stage runs."""
+    data = json.loads(json.dumps(raw, sort_keys=True, default=str))
+    favicon = data.get("favicon")
+    if isinstance(favicon, dict):
+        for key in PACING_ONLY_KEYS:
+            favicon.pop(key, None)
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def _same_measurement(source: Path, cfg: ScanConfig) -> bool:
+    """True when the source run used this config apart from worker count and stage time limit."""
+    try:
+        snapshot = json.loads((source / "config.snapshot.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return _measurement_fingerprint(snapshot) == _measurement_fingerprint(cfg.raw)
+
+
 def load_source(source: Path, cfg: ScanConfig) -> tuple[dict[str, Any], list[dict[str, Any]], dict[JobKey, dict[str, Any]]]:
     """Return the source manifest, every favicon job it ran, and what each job found."""
     try:
@@ -48,7 +70,7 @@ def load_source(source: Path, cfg: ScanConfig) -> tuple[dict[str, Any], list[dic
         raise ConfigError(f"source run {source} has no readable manifest: {exc}") from exc
     if manifest.get("status") != "finished":
         raise ConfigError(f"source run {source.name} did not finish (status={manifest.get('status')})")
-    if manifest.get("config_checksum") != cfg.checksum:
+    if manifest.get("config_checksum") != cfg.checksum and not _same_measurement(source, cfg):
         raise ConfigError("source run was made with a different config; re-fetch needs the config that produced it")
     jobs: dict[JobKey, dict[str, Any]] = {}
     previous: dict[JobKey, dict[str, Any]] = {}
@@ -132,6 +154,9 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
         if not report["ok"] and not skip_preflight:
             raise pre.PreflightFailed(report)
 
+        record_log = fav.RecordLog(run_dir / "raw" / "favicon_records.jsonl")
+        earlier = record_log.load()
+
         def stage() -> None:
             nonlocal fetcher
             fp = fav.fetch_policy(cfg, [j["ip"] for j in jobs])
@@ -145,11 +170,13 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
                 return st.killed() or time.monotonic() > deadline
             try:
                 records.extend(fav.run_favicon_stage(f, jobs, workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page,
-                                                     killed=stop, icon_store=store))
+                                                     killed=stop, icon_store=store,
+                                                     on_record=record_log.append, done=earlier))
                 skipped = sum(1 for r in records if r.get("favicon_outcome") == "skipped_kill_switch")
                 if skipped:
                     st.errors["favicon_incomplete"] = f"{skipped} of {len(jobs)} lookups skipped (stage cap or stop condition)"
             finally:
+                record_log.close()
                 offhost = getattr(f, "offhost", None)
                 if offhost is not None:
                     offhost.save_state()

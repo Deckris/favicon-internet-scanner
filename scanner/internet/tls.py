@@ -136,8 +136,12 @@ def run_tls_batches(
     run_dir: Path,
     binary: str = "zgrab2",
     executor: Executor = subprocess.run,
+    timeout: float | None = None,
 ) -> tuple[list[ToolJob], list[TlsResult]]:
-    """Batched ``zgrab2 tls``: one process per (port, chunk). Targets are (ip, port, hostname|None)."""
+    """Batched ``zgrab2 tls``: one process per (port, chunk). Targets are (ip, port, hostname|None).
+
+    ``timeout`` caps each process (it is killed after that many seconds) when a caller needs a hard bound.
+    """
     if mode == "hostname_aware" and any(not t[2] for t in targets):
         raise ValueError("hostname_aware targets must carry a hostname")
     if mode == "direct_ip" and any(t[2] for t in targets):
@@ -173,7 +177,8 @@ def run_tls_batches(
             started = datetime.now(UTC).isoformat()
             input_text = "".join(f"{ip},{host or ''},,{port}\n" for ip, port, host in chunk)
             try:
-                proc = executor(command, input=input_text, capture_output=True, text=True, check=False)
+                kw = {"timeout": timeout} if timeout is not None else {}
+                proc = executor(command, input=input_text, capture_output=True, text=True, check=False, **kw)
                 stdout = getattr(proc, "stdout", "") or ""
                 code = getattr(proc, "returncode", None)
                 stderr = (getattr(proc, "stderr", "") or "").strip()

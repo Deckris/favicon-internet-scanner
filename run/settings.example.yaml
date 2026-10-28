@@ -20,6 +20,7 @@ scope:
   seed: 4
   rate_pps: 100              # ZMap packets per second
   min_seconds_between_probes_per_ip: 15   # pause between any two requests to the same address
+  overlap_tls_with_zmap: false   # true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
   dns_resolver: REPLACE_ME      # resolver for PTR and name checks; it sees every scanned address
   try_unverified_names: false       # also request pages under certificate names that did not verify
   offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it)

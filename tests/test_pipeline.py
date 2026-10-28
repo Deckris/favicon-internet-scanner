@@ -87,7 +87,10 @@ def test_wildcard_never_queried_and_dns_is_batched(cfg):
     queried = set(ft.zdns_inputs["A"]) | set(ft.zdns_inputs["AAAA"])
     assert not any("wild" in n or "*" in n for n in queried)
     zdns_calls = [c for c in ft.commands if c[0] == "zdns"]
-    assert sorted(c[1] for c in zdns_calls) == ["A", "AAAA", "PTR"]                     # one process per module, not per name
+    modules = sorted(c[1] for c in zdns_calls)
+    assert modules.count("A") == modules.count("AAAA") == 1                             # one process per module, not per name
+    assert 1 <= modules.count("PTR") <= len(cfg.measurement.ports)                      # PTR: at most one per swept port
+    assert sorted(ft.zdns_inputs["PTR"]) == sorted(set(ft.zdns_inputs["PTR"]))          # and no address asked twice
     tls_calls = [c for c in ft.commands if c[0] == "zgrab2" and c[1] == "tls"]
     assert len(tls_calls) <= 4                                                          # grouped by port / mode, never per endpoint
 
@@ -279,3 +282,125 @@ def test_tarpit_address_gets_only_the_syn_and_is_flagged(cfg):
     assert tar["tarpit_suspect"] and tar["tls_status"] == "not_attempted" and tar["protocol"] == "not_attempted"
     assert next(r for r in rows if r["target_ip"] == IP_HTTP)["tls_status"] != "not_attempted"
     assert json.loads((run_dir / "report" / "summary.json").read_text())["counts"]["tarpit_ips_not_probed"] == 1
+
+
+# ------------------------------------------------------------------ TLS during the ZMap sweep (opt-in)
+
+def overlap_cfg(tmp_path, on=True, **over):
+    import yaml
+    p = write_config(tmp_path, **over)
+    d = yaml.safe_load(p.read_text())
+    d["measurement"].update(overlap_tls_with_zmap=on, zgrab_parallel_batches=2)
+    p.write_text(yaml.safe_dump(d))
+    return load_config(p)
+
+
+def timed(ft, slow_port="8080", seconds=1.5, after=None):
+    """ZMap writes its status file (every target sent) and, on ``slow_port``, keeps sweeping for ``seconds``."""
+    import time
+    events = []
+    orig_zmap, orig_call = ft._zmap, ft.__call__
+
+    def zmap(c):
+        out = orig_zmap(c)
+        if "-u" in c:
+            sent = 2 * len({ip for v in ft.l4.values() for ip in v})
+            Path(c[c.index("-u") + 1]).write_text(f"real-time,sent-total\nx,{sent}\n")
+        port = c[c.index("-p") + 1]
+        if port == slow_port:
+            if after:
+                after()
+            time.sleep(seconds)
+        events.append(("zmap_end", port, time.monotonic()))
+        return out
+    ft._zmap = zmap
+
+    class Recorder:
+        def __call__(self, command, **kw):
+            if command[0] == "zgrab2":
+                port = command[command.index("--port") + 1] if "--port" in command else None
+                events.append((f"zgrab2-{command[1]}", port, time.monotonic()))
+            return orig_call(command, **kw)
+    return Recorder(), events
+
+
+def test_overlap_runs_tls_during_the_last_sweep_and_keeps_the_same_results(tmp_path):
+    (tmp_path / "on").mkdir()
+    (tmp_path / "off").mkdir()
+    ft = tools()
+    rec, events = timed(ft)
+    on = go(overlap_cfg(tmp_path / "on"), rec)
+    sweep_end = next(t for e, p, t in events if e == "zmap_end" and p == "8080")
+    early = [p for e, p, t in events if e == "zgrab2-tls" and t < sweep_end]
+    assert "80" in early and "443" in early                     # ports already swept were handshaken during the last sweep
+    off = go(overlap_cfg(tmp_path / "off", on=False), tools())
+    for name in ("hostname_resolution.jsonl", "endpoints.jsonl"):
+        assert (on / "normalized" / name).read_text() == (off / "normalized" / name).read_text()
+    m = json.loads((on / "manifest.json").read_text())
+    assert m["stage_counts"]["overlap"]["enabled"] and m["stage_counts"]["l4_endpoints"] == 5
+    assert m["stage_counts"]["overlap"]["tls_endpoints_during_sweep"] >= 4 and m["complete"]
+    assert m["parameters"]["overlap_tls_with_zmap"] is True
+
+
+def test_overlap_never_handshakes_before_the_next_sweep_could_reach_the_address(tmp_path):
+    ft = tools()
+    rec, events = timed(ft, slow_port="443")
+    go(overlap_cfg(tmp_path), rec)
+    end_443 = next(t for e, p, t in events if e == "zmap_end" and p == "443")
+    # 8080 is still to come and a tiny sample is reached at once: nothing may be contacted while 443 sweeps
+    assert not [e for e in events if e[0] == "zgrab2-tls" and e[2] < end_443]
+
+
+def test_kill_switch_during_overlap_stops_everything_and_is_recorded(tmp_path):
+    cfg = overlap_cfg(tmp_path)
+    ft = tools()
+    rec, events = timed(ft, seconds=1.0, after=lambda: Path(cfg.kill_switch_file).write_text("stop"))
+    run_dir = go(cfg, rec)
+    m = json.loads((run_dir / "manifest.json").read_text())
+    assert m["abort_reason"] == "kill_switch" and not m["complete"]
+    killed_at = next(t for e, p, t in events if e == "zmap_end" and p == "8080") - 1.0
+    assert not [e for e in events if e[0].startswith("zgrab2") and e[2] > killed_at]
+
+
+def test_zmap_failure_while_tls_runs_is_recorded_and_the_other_ports_finish(tmp_path):
+    import time
+    cfg = overlap_cfg(tmp_path)
+    ft = tools()
+    rec, events = timed(ft)
+    inner = ft._zmap
+
+    def fail_8080(c):
+        if c[c.index("-p") + 1] == "8080" and "--dryrun" not in c:
+            Path(c[c.index("-u") + 1]).write_text("real-time,sent-total\nx,10\n")
+            time.sleep(1.0)
+            raise OSError("zmap exploded")
+        return inner(c)
+    ft._zmap = fail_8080
+    run_dir = go(cfg, rec)
+    m = json.loads((run_dir / "manifest.json").read_text())
+    assert "zmap:8080" in m["stage_errors"] and m["stage_counts"]["l4_endpoints"] == 4 and not m["complete"]
+    rows = rows_of(run_dir)
+    assert row(rows, IP_HTTP, None)["http_status"] == 200 and row(rows, IP_OK, "good.test")["final_hostname_status"] == "verified"
+
+
+def test_overlap_is_off_with_a_reason_when_the_send_order_is_not_listed(tmp_path):
+    cfg = overlap_cfg(tmp_path, output={"dir": str(tmp_path / "out"), "max_listed_targets": 0})
+    run_dir = go(cfg, tools())
+    m = json.loads((run_dir / "manifest.json").read_text())
+    assert m["stage_counts"]["overlap"]["enabled"] is False and "send order" in m["stage_counts"]["overlap"]["reason"]
+    assert m["stage_counts"]["l4_endpoints"] == 5 and not m["stage_errors"]
+
+
+def test_early_ptr_failure_is_retried_in_the_ptr_stage(cfg):
+    ft = tools()
+    orig = ft._zdns
+    seen = {"n": 0}
+
+    def flaky(c, stdin):
+        if c[1] == "PTR" and seen["n"] == 0:
+            seen["n"] += 1
+            raise RuntimeError("resolver hiccup")
+        return orig(c, stdin)
+    ft._zdns = flaky
+    run_dir = go(cfg, ft)
+    assert row(rows_of(run_dir), IP_OK, "good.test")["hostname_sources"] == ["certificate_cn", "certificate_san", "ptr"]

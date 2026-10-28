@@ -40,7 +40,8 @@ def test_apply_generates_a_loadable_config_and_approval(tmp_path):
     assert cfg.transparency.contact == "optout@uni.example"
     assert cfg.measurement.min_seconds_between_probes_per_ip == 15
     assert cfg.measurement.zmap_probes == 1
-    first = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    assert cfg.measurement.overlap_tls_with_zmap is False and cfg.measurement.zgrab_parallel_batches == 4
+    first =(tmp_path / "config.yaml").read_text(encoding="utf-8")
     assert main(["apply", "--workdir", str(tmp_path)]) == 0
     assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == first
 

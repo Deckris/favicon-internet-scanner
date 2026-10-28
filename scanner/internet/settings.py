@@ -46,6 +46,7 @@ scope:
   seed: {seed}
   rate_pps: {rate_pps}              # ZMap packets per second
   min_seconds_between_probes_per_ip: {pace}   # pause between any two requests to the same address
+  overlap_tls_with_zmap: {overlap}   # true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
   dns_resolver: {dns_resolver}      # resolver for PTR and name checks; it sees every scanned address
   try_unverified_names: false       # also request pages under certificate names that did not verify
   offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it)
@@ -69,7 +70,7 @@ DEFAULTS: dict[str, Any] = {
     "scanner_name": "research-scanner", "contact": PLACEHOLDER, "info_url": PLACEHOLDER, "incident_contact": '""',
     "public_ip": PLACEHOLDER, "source_ip": '""', "interface": "eth0", "egress_check": "auto", "gateway_mac": '""',
     "exclusions_file": "exclusions.txt", "ports": "[80, 443, 8080, 8090, 8443]", "sample_fraction": "0.000001",
-    "seed": "4", "rate_pps": "100", "pace": "15", "dns_resolver": PLACEHOLDER, "approval_status": "blocked",
+    "seed": "4", "rate_pps": "100", "pace": "15", "overlap": "false", "dns_resolver": PLACEHOLDER, "approval_status": "blocked",
     "approval_reference": PLACEHOLDER, "valid_until": PLACEHOLDER, "max_rate_pps": "100", "max_fraction": "0.000001", "approval_pace": "15",
     "data_handling": PLACEHOLDER, "label": "pilot", "output_dir": "runs", "kill_switch": "STOP",
 }
@@ -232,6 +233,9 @@ def apply(workdir: Path) -> dict[str, Any]:
         raise SettingsError(f"approval.min_seconds_between_probes_per_ip {approved_pace:g} is below the minimum of {MIN_PACE_SECONDS:g} s")
     if pace < approved_pace:
         raise SettingsError(f"scope.min_seconds_between_probes_per_ip {pace:g} is below the approved {approved_pace:g} s")
+    overlap = scope.get("overlap_tls_with_zmap", False)
+    if not isinstance(overlap, bool):
+        raise SettingsError("scope.overlap_tls_with_zmap must be true or false")
     if appr["status"] not in ("blocked", "approved"):
         raise SettingsError("approval.status must be `blocked` or `approved`")
     excl_path = _resolve(workdir, scope["exclusions_file"])
@@ -259,11 +263,11 @@ def apply(workdir: Path) -> dict[str, Any]:
     base["sample"] = {"fraction": fraction, "seed": int(scope["seed"])}
     m = base["measurement"]
     m.update(ports=[int(p) for p in scope["ports"]], zmap_rate=int(rate), zmap_probes=probes, zmap_max_runtime=runtime,
-             min_seconds_between_probes_per_ip=pace)
+             min_seconds_between_probes_per_ip=pace, overlap_tls_with_zmap=overlap)
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     f = base["favicon"]
-    f.update(workers=64, stage_max_seconds=86400,
+    f.update(workers=int(scope.get("favicon_workers", 64)), stage_max_seconds=86400,
              max_unverified_names_per_endpoint=2 if scope.get("try_unverified_names") else 0)
     f["offhost_icons"] = {**f.get("offhost_icons", {}), "enabled": offhost}
     base["fetch"]["user_agent"] = f"{s.get('scanner_name', 'research-scanner')} (+{info}; contact {contact})"
