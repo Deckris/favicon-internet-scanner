@@ -436,3 +436,34 @@ def test_zmap_gets_one_sender_thread_and_a_per_packet_rate_ceiling(tmp_path):
     for c in scans:
         assert c[c.index("-T") + 1] == "1"                                   # not one thread per core
         assert c[c.index("-r") + 1] == "50"                                  # 100 packets/s ceiling / 2 probes per target
+
+
+# ------------------------------------------------------------------ full scan in shards (ZMap 4.4.0)
+
+def _full_cfg(tmp_path, fraction=1.0, shards=4):
+    excl = write_exclusions(tmp_path)
+    d = config_dict(tmp_path, excl, write_approval(tmp_path, excl, max_sample_fraction=1.0))
+    d["sample"] = {"fraction": fraction, "seed": 4, "shards": shards}
+    d["measurement"]["zmap_version"] = "4.4.0"
+    p = tmp_path / "full.yaml"
+    p.write_text(yaml.safe_dump(d), encoding="utf-8")
+    return p
+
+
+def test_zmap_440_shards_only_a_full_scan(tmp_path):
+    assert load_config(_full_cfg(tmp_path)).shards == 4
+    with pytest.raises(ConfigError, match="fraction 1.0"):
+        load_config(_full_cfg(tmp_path, fraction=0.5))
+
+
+def test_full_scan_shard_gives_zmap_no_target_count(tmp_path):
+    cfg = __import__("dataclasses").replace(load_config(_full_cfg(tmp_path)), shard=2)
+    ft = tools()
+    _run(cfg, ft)
+    zmap_cmds = [c for c in ft.commands if c[0].endswith("zmap") and "-p" in c]
+    assert zmap_cmds and all("-n" not in c for c in zmap_cmds)              # each shard covers its whole slice
+    assert all(c[c.index("--shards") + 1] == "4" and c[c.index("--shard") + 1] == "2" for c in zmap_cmds)
+    partial = __import__("dataclasses").replace(load_config(_cfg(tmp_path / "p" if (tmp_path / "p").mkdir() is None else None)), shard=0)
+    ft2 = tools()
+    _run(partial, ft2)
+    assert all("-n" in c for c in ft2.commands if c[0].endswith("zmap") and "-p" in c)

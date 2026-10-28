@@ -274,7 +274,10 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         "shard": {"index": cfg.shard, "of": cfg.shards},
         "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
     }, indent=2), encoding="utf-8")
-    mview = SimpleNamespace(**{**vars(cfg.measurement), "zmap_max_targets": splan.targets_per_port, "zmap_output_fields": "saddr,window,ttl",
+    # A full scan gives ZMap no target count: each shard then covers its whole slice of the allowed space.
+    full = cfg.sample_fraction >= 1.0 and not cfg.target_ips
+    mview = SimpleNamespace(**{**vars(cfg.measurement), "zmap_max_targets": None if full else splan.targets_per_port,
+                                                    "zmap_output_fields": "saddr,window,ttl",
                                                     "zmap_shards": cfg.shards, "zmap_shard": cfg.shard,
                                                     # one sender thread is plenty (and ZMap's default of one per core burns ~12 cores)
                                                     "zmap_sender_threads": 1,
@@ -300,7 +303,9 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         cmd = ["zmap", "-C", "/dev/null", "-T", "1", "-p", str(cfg.measurement.ports[0]), "-w", str(allow), "-b", str(block),
                "-i", cfg.vantage.interface, "-S", cfg.vantage.source_ipv4, "-r", "100000", "--cooldown-time", "1",
                "--max-runtime", "600", "-O", "csv", "-f", "saddr", "-o", str(raw / "sample-dryrun.csv"),
-               "-P", "1", "-n", str(splan.targets_per_port), "--seed", str(cfg.measurement.zmap_seed), "--dryrun"]
+               "-P", "1", "--seed", str(cfg.measurement.zmap_seed), "--dryrun"]
+        if not full:
+            cmd += ["-n", str(splan.targets_per_port)]
         cmd += output_args(cfg.measurement.zmap_version)
         if cfg.shards > 1:
             cmd += ["--shards", str(cfg.shards), "--shard", str(cfg.shard)]
@@ -314,7 +319,9 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         found = sorted(set(listed), key=lambda x: tuple(int(o) for o in x.split(".")))
         sample_ips.extend(ip for ip in found if policy.check_ip(ip, stage="zmap", context="sample_list") is None)
         expected = splan.targets_per_port
-        if st.guards and not expected * 0.99 <= len(sample_ips) <= expected * 1.0001 + 1:
+        # Shards of a full scan are slices of ZMap's permutation, so their sizes vary a little around the even share.
+        low, high = (0.9, 1.1) if full and cfg.shards > 1 else (0.99, 1.0001)
+        if st.guards and not expected * low <= len(sample_ips) <= expected * high + 1:
             # Live runs only: a dry run that does not reproduce the plan means -n / --shards / the allowlist is not
             # doing what we think, so nothing is scanned. (The dry run sends nothing.)
             st.reason = "sample_list_mismatch"
@@ -1002,7 +1009,8 @@ def _warnings(cfg, splan, counts, st) -> list[str]:
     out: list[str] = []
     total = counts.get("l4_endpoints", 0)
     listed = counts.get("sample_listed", 0)
-    if "sample_listing" not in counts and listed != splan.targets_per_port and not st.reason:
+    uneven = cfg.sample_fraction >= 1.0 and cfg.shards > 1 and abs(listed - splan.targets_per_port) <= 0.1 * splan.targets_per_port
+    if "sample_listing" not in counts and listed != splan.targets_per_port and not st.reason and not uneven:
         out.append(f"sample list has {listed} targets but the plan expected {splan.targets_per_port}; check raw/zmap/sample-*.")
     if st.reason:
         out.append(f"run stopped early ({st.reason}); outputs are partial, see stages_skipped.")

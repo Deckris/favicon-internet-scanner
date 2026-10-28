@@ -127,7 +127,7 @@ Each run writes a folder under `runs/` in the work folder: `manifest.json` (sett
 
 - Tested offline and on loopback; it has not been run from an institutional scanner host.
 - IPv4 only.
-- ZMap 4.4.0 divides the target count across shards, so sharding is refused.
+- ZMap 4.4.0 divides the target count across shards, so with 4.4.0 sharding is allowed only for a full scan (`sample_fraction: 1.0`, plus `shards: N` under `scope` in `settings.yaml`, then `campaign`); each shard then covers a disjoint slice of the allowed space.
 - Results describe one vantage point at one time.
 
 Licensed under the MIT License (see `LICENSE`). Security reports: see `SECURITY.md`.

@@ -236,8 +236,9 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     zmap_version = str(m.get("zmap_version", "2.1.1"))
     if not supported(zmap_version):
         raise ConfigError("measurement.zmap_version must be 2.1.x or the pinned 4.4.0")
-    if zmap_version == "4.4.0" and shards != 1:
-        raise ConfigError("sample.shards is not supported with ZMap 4.4.0, which divides the target count across shards")
+    if zmap_version == "4.4.0" and shards != 1 and fraction < 1.0:
+        # 4.4.0 divides -n across shards. A full scan passes no -n, and its shards are disjoint and cover everything.
+        raise ConfigError("sample.shards with ZMap 4.4.0 needs sample.fraction 1.0 (4.4.0 divides the target count across shards)")
     ports = m["ports"]
     if not isinstance(ports, list) or not ports or len(ports) > HARD_MAX_PORTS:
         raise ConfigError("measurement.ports must be a non-empty list")

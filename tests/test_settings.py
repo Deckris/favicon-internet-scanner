@@ -41,7 +41,7 @@ def test_apply_generates_a_loadable_config_and_approval(tmp_path):
     assert cfg.measurement.min_seconds_between_probes_per_ip == 15
     assert cfg.measurement.zmap_probes == 1
     assert cfg.measurement.overlap_tls_with_zmap is False and cfg.measurement.zgrab_parallel_batches == 4
-    first =(tmp_path / "config.yaml").read_text(encoding="utf-8")
+    first = (tmp_path / "config.yaml").read_text(encoding="utf-8")
     assert main(["apply", "--workdir", str(tmp_path)]) == 0
     assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == first
 
@@ -154,7 +154,7 @@ def test_ipv6_lines_in_the_exclusion_list_are_ignored_not_fatal(tmp_path):
     pipeline.build_policy(cfg)
 
 
-def test_sharding_is_refused_with_zmap_4_4_0(tmp_path):
+def test_sharding_a_partial_sample_is_refused_with_zmap_4_4_0(tmp_path):
     path = _init(tmp_path)
     _approve(path)
     assert main(["apply", "--workdir", str(tmp_path)]) == 0
@@ -162,7 +162,7 @@ def test_sharding_is_refused_with_zmap_4_4_0(tmp_path):
     config["sample"]["shards"] = 2
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     from scanner.internet.config import ConfigError
-    with pytest.raises(ConfigError, match="not supported with ZMap 4.4.0"):
+    with pytest.raises(ConfigError, match="needs sample.fraction 1.0"):
         load_config(tmp_path / "config.yaml")
 
 
@@ -170,3 +170,14 @@ def test_settings_example_matches_what_init_writes(tmp_path):
     written = st.write_settings(tmp_path, {})
     example = Path(__file__).resolve().parent.parent / "run" / "settings.example.yaml"
     assert example.read_text(encoding="utf-8") == written.read_text(encoding="utf-8")
+
+
+def test_shards_in_settings_reach_the_config(tmp_path):
+    import yaml
+    path = _init(tmp_path)
+    _approve(path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["scope"]["shards"] = 5
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    st.apply(tmp_path)
+    assert yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))["sample"]["shards"] == 5

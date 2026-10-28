@@ -261,6 +261,8 @@ def apply(workdir: Path) -> dict[str, Any]:
     if host.get("gateway_mac"):
         base["vantage"]["gateway_mac"] = str(host["gateway_mac"])
     base["sample"] = {"fraction": fraction, "seed": int(scope["seed"])}
+    if int(scope.get("shards", 1)) > 1:
+        base["sample"]["shards"] = int(scope["shards"])     # run with `campaign`: one bounded run per shard
     m = base["measurement"]
     m.update(ports=[int(p) for p in scope["ports"]], zmap_rate=int(rate), zmap_probes=probes, zmap_max_runtime=runtime,
              min_seconds_between_probes_per_ip=pace, overlap_tls_with_zmap=overlap)
