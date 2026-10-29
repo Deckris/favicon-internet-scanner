@@ -7,7 +7,9 @@ The manifest is written even when the run ends early (kill switch, error).
 """
 from __future__ import annotations
 
+import contextlib
 import csv
+import faulthandler
 import hashlib
 import json
 import queue
@@ -30,6 +32,7 @@ from scanner.internet import candidates as cand
 from scanner.internet import enrich
 from scanner.internet import favicon as fav
 from scanner.internet import icon_store
+from scanner.internet import outputs
 from scanner.internet import overlap as ovl
 from scanner.internet import pacing
 from scanner.internet import population as pop
@@ -37,7 +40,8 @@ from scanner.internet import preflight as pre
 from scanner.internet import tls as tlsmod
 from scanner.internet.config import ConfigError, ScanConfig, read_exclusions, sha256_file
 from scanner.internet.runner import ManagedExecutor
-from scanner.models import ToolJob, write_jsonl
+from scanner.internet.shardstore import EndpointFacts, IpFacts, ShardStore
+from scanner.models import ToolJob, canonical_json, write_jsonl
 from scanner.safety import HostnamePolicyInput, ProductionPolicyInput, TargetPolicy
 from scanner.zdns_runner import ptr_names, resolve, run_zdns
 from scanner.zgrab_runner import ZGrabTarget, run_zgrab_batches
@@ -45,7 +49,8 @@ from scanner.zmap_runner import run_zmap
 
 Executor = Callable[..., Any]
 SCHEMA_VERSION = 1
-INSTRUMENT_VERSION = "scanner.2"
+INSTRUMENT_VERSION = "scanner.3"
+MONITOR_TICK = 0.5          # how often the run monitor evaluates the stop conditions
 WEB_PROTOCOLS = ("https", "http")
 # TLS outcomes after which a plain-HTTP probe is still worth sending: the port did not prove it speaks TLS.
 HTTP_FALLBACK = frozenset({tlsmod.NOT_TLS, tlsmod.CLOSED, tlsmod.RESET, tlsmod.TIMEOUT, tlsmod.OTHER})
@@ -92,11 +97,19 @@ def _scrub(value: Any) -> Any:
     return value
 
 
-def _scrub_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """``_scrub`` row by row in place: a second copy of every table would double the peak memory of the write-out."""
-    for i, row in enumerate(rows):
-        rows[i] = _scrub(row)
-    return rows
+def _earlier_attempt_records(resume_from: Path | None, have: dict, fjobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Favicon records of an earlier attempt that belong to this attempt's jobs and are not already in hand."""
+    if resume_from is None:
+        return []
+    path = Path(resume_from)
+    if path.is_dir():
+        path = path / "raw" / "favicon_records.jsonl"
+    try:
+        prior = fav.RecordLog(path).load()
+    except (OSError, UnicodeDecodeError):
+        return []
+    wanted = {(j["ip"], j["port"], j.get("hostname")) for j in fjobs}
+    return [rec for key, rec in prior.items() if key in wanted and key not in have]
 
 
 def _jsonable(value: Any) -> Any:
@@ -127,19 +140,135 @@ class _Stages:
         self.skipped: list[str] = []
         self.interrupted = False
         self.reason: str | None = None
+        self.stop = threading.Event()            # set (with ``reason``) as soon as any stop condition fires
+        self.pending: str | None = None          # a stop asked for from a signal handler; promoted to ``stop`` outside it
+        self.executor: Any = None                # for the tool count the stall check consults
+        self.stall_seconds = float(getattr(cfg, "stall_minutes", 30)) * 60
+        self._progress = 0
+        self._last_progress = (0, now)
+        self._monitor: threading.Thread | None = None
+        self._guard_thread: threading.Thread | None = None
+        self._monitor_done = threading.Event()
+        self.phase_gate: Callable[[str], Any] | None = None     # overlapped campaigns: serialises phase A and phase B across shards
+        self.phases = contextlib.ExitStack()
+
+    def progress(self) -> None:
+        """Called whenever a stage gets a result; a run that stops calling it for ``stall_minutes`` is aborted."""
+        self._progress += 1
+
+    def request_stop(self, reason: str) -> None:
+        """Set the stop reason and wake every waiting thread. Not for signal handlers: ``Event.set`` takes a lock (see ``flag_stop``)."""
+        if self.reason is None:
+            self.reason = reason
+        self.stop.set()
+
+    def flag_stop(self, reason: str) -> None:
+        """What a signal handler may do: one plain assignment. ``killed`` and the monitor turn it into ``request_stop``."""
+        if self.pending is None:
+            self.pending = reason
+
+    def guard(self, name: str, fn: Callable[[], Any], default: Any = None) -> Any:
+        """Run a step between or after the stages. A failure is recorded under ``name`` and the run goes on to its manifest."""
+        try:
+            return fn()
+        except KeyboardInterrupt as exc:
+            self.interrupted = True
+            self.errors.setdefault(name, f"interrupted: {exc}"[:200])
+        except Exception as exc:
+            self.errors.setdefault(name, f"{type(exc).__name__}: {exc}"[:500])
+        return default
 
     def killed(self) -> bool:
         if self.reason:
             return True
+        if self.pending:
+            self.request_stop(self.pending)
+            return True
         if self.interrupted:
-            self.reason = "interrupt"
-        elif Path(self.cfg.kill_switch_file).exists():
-            self.reason = "kill_switch"
-        elif self.cfg.approval is not None and datetime.now(UTC) >= self.cfg.approval.valid_until:
-            self.reason = "approval_expired"
-        else:
-            self.reason = self._guard_reason()
-        return self.reason is not None
+            self.request_stop("interrupt")
+            return True
+        if self._monitor is not None:       # the monitor evaluates the conditions; this is only a flag read
+            return False
+        reason = self._condition()
+        if reason:
+            self.request_stop(reason)
+        return reason is not None
+
+    def check_now(self) -> bool:
+        """``killed`` with the conditions evaluated here and now (stage boundaries), not at the monitor's next tick."""
+        if not self.killed() and self._monitor is not None:
+            reason = self._operator_condition()
+            if reason:
+                self.request_stop(reason)
+        return self.killed()
+
+    def _operator_condition(self) -> str | None:
+        """The conditions that are a file read or a clock read: the kill file and the approval window."""
+        if Path(self.cfg.kill_switch_file).exists():
+            return "kill_switch"
+        if self.cfg.approval is not None and datetime.now(UTC) >= self.cfg.approval.valid_until:
+            return "approval_expired"
+        return None
+
+    def _condition(self) -> str | None:
+        return self._operator_condition() or self._guard_reason()
+
+    def start_monitor(self) -> None:
+        if self._monitor is not None:
+            return
+        reason = self._condition()          # a stop condition that already holds must be seen before the first stage
+        if reason:
+            self.request_stop(reason)
+        self._monitor_done.clear()
+        self._last_progress = (self._progress, time.monotonic())
+        self._monitor = threading.Thread(target=self._watch, name="run-monitor", daemon=True)
+        self._monitor.start()
+        # The egress lookup can take seconds; it runs on its own thread so the kill file is never waiting behind it.
+        self._guard_thread = threading.Thread(target=self._watch_guards, name="run-guards", daemon=True)
+        self._guard_thread.start()
+
+    def stop_monitor(self) -> None:
+        thread, self._monitor = self._monitor, None
+        guard, self._guard_thread = self._guard_thread, None
+        self._monitor_done.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=10)
+        if guard is not None and guard is not threading.current_thread():
+            guard.join(timeout=10)
+
+    def _watch_guards(self) -> None:
+        while not self._monitor_done.wait(MONITOR_TICK):
+            if self.reason:
+                continue
+            try:
+                reason = self._guard_reason()
+            except Exception:           # a failing check must not end the monitoring
+                continue
+            if reason:
+                self.request_stop(reason)
+
+    def _watch(self) -> None:
+        while not self._monitor_done.wait(MONITOR_TICK):
+            if self.pending and not self.reason:
+                self.request_stop(self.pending)
+            if self.reason:
+                self.stop.set()
+                continue
+            try:
+                reason = "interrupt" if self.interrupted else self._operator_condition() or self._stalled()
+            except Exception:           # a failing check must not end the monitoring
+                continue
+            if reason:
+                self.request_stop(reason)
+
+    def _stalled(self) -> str | None:
+        if self.stall_seconds <= 0:
+            return None
+        now = time.monotonic()
+        if self._progress != self._last_progress[0] or getattr(self.executor, "active_tools", 0):
+            self._last_progress = (self._progress, now)       # a running tool is progress of its own
+            return None
+        return "stalled" if now - self._last_progress[1] >= self.stall_seconds else None
 
     def _guard_reason(self) -> str | None:
         """Conditions that must stop a long run: low disk, and a public IP that is no longer the approved source."""
@@ -173,32 +302,48 @@ class _Stages:
         return None
 
     def run(self, name: str, fn: Callable[[], Any], default: Any) -> Any:
-        if self.killed():
+        if name == "favicon" and self.phase_gate is not None:
+            self.phases.close()                  # phase A ends here; phase B (favicon and write-out) waits for its slot
+            try:
+                self.phases.enter_context(self.phase_gate("b"))
+            except KeyboardInterrupt as exc:
+                self.interrupted = True
+                self.errors[name] = f"interrupted: {exc}"[:200]
+        if self.check_now():
             self.skipped.append(name)
             return default
         t = time.monotonic()
+        self.progress()
         print(f"[scanner {self.label}] {name}: start", file=sys.stderr, flush=True)
         try:
             return fn()
         except KeyboardInterrupt as exc:      # Ctrl-C, SIGTERM or SIGHUP (mapped to KeyboardInterrupt)
             self.interrupted = True
             self.errors[name] = f"interrupted: {exc}"[:200]
+            self.request_stop("interrupt")        # the handler only flagged it: wake the other threads from here
             return default
         except Exception as exc:
             self.errors[name] = f"{type(exc).__name__}: {exc}"[:500] + " | " + traceback.format_exc().splitlines()[-3].strip()[:200]
             return default
         finally:
             self.timings[name] = round(time.monotonic() - t, 3)
+            self.progress()
             print(f"[scanner {self.label}] {name}: {self.timings[name]} s", file=sys.stderr, flush=True)
 
 
-def _install_signal_handlers() -> Callable[[], None]:
-    """SIGTERM/SIGHUP behave like Ctrl-C so tools are killed and the manifest is still written."""
+def _install_signal_handlers(on_signal: Callable[[], None] | None = None) -> Callable[[], None]:
+    """SIGTERM/SIGHUP behave like Ctrl-C so tools are killed and the manifest is still written.
+
+    ``on_signal`` runs first, in the handler, so it must not take a lock: it only flags the stop, and the worker
+    threads, which never see the exception, are woken by the main thread's unwinding or by the run monitor.
+    """
     if threading.current_thread() is not threading.main_thread():
         return lambda: None
     previous = {}
 
     def handler(signum, _frame):
+        if on_signal is not None:
+            on_signal()
         raise KeyboardInterrupt(f"signal {signum}")
     for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if sig is None:
@@ -219,6 +364,31 @@ def _install_signal_handlers() -> Callable[[], None]:
     return restore
 
 
+def _register_stack_dump(run_dir: Path) -> Callable[[], None]:
+    """SIGUSR1 writes every thread's stack to raw/stacks.txt (POSIX); the file is removed again if it stayed empty."""
+    if not hasattr(signal, "SIGUSR1") or not hasattr(faulthandler, "register"):
+        return lambda: None
+    path = run_dir / "raw" / "stacks.txt"
+    try:
+        fh = open(path, "w", encoding="utf-8")
+        faulthandler.register(signal.SIGUSR1, file=fh, all_threads=True)
+    except (OSError, ValueError, RuntimeError):
+        return lambda: None
+
+    def release() -> None:
+        try:
+            faulthandler.unregister(signal.SIGUSR1)
+        except (ValueError, RuntimeError):
+            pass
+        fh.close()
+        try:
+            if path.stat().st_size == 0:
+                path.unlink()
+        except OSError:
+            pass
+    return release
+
+
 def run(
     cfg: ScanConfig,
     *,
@@ -227,7 +397,11 @@ def run(
     fetcher: Any = None,
     skip_preflight: bool = False,
     offline_preflight: bool = False,
+    phase_gate: Callable[[str], Any] | None = None,
+    resume_from: Path | None = None,
 ) -> Path:
+    """``resume_from``: the run directory (or the ``favicon_records.jsonl`` itself) of an earlier unfinished attempt of
+    this shard; the favicon lookups it completed are reused instead of being sent again."""
     if cfg.approval is None:
         raise ConfigError("run requires an authorized config (approval not loaded)")
     started = datetime.now(UTC)
@@ -244,27 +418,88 @@ def run(
 
     st = _Stages(cfg, run_dir, guards=not offline_preflight)
     executor = executor or ManagedExecutor(cfg, run_dir, st.killed)
-    restore_signals = _install_signal_handlers()
+    st.executor = executor
+    restore_signals = _install_signal_handlers(lambda: st.flag_stop("interrupt"))
+    release_stacks = _register_stack_dump(run_dir)
+    st.start_monitor()
     jobs: list[ToolJob] = []
     counts: dict[str, Any] = {}
     try:
+        if phase_gate is not None:
+            st.phase_gate = phase_gate
+            st.phases.enter_context(phase_gate("a"))
         report = pre.run_preflight(cfg, splan, run_dir=run_dir, executor=executor, offline=offline_preflight)
         (run_dir / "preflight.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         if not report["ok"] and not skip_preflight:
             raise pre.PreflightFailed(report)
         return _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                           started, wall, run_id)
+                           started, wall, run_id, resume_from)
     finally:
+        st.phases.close()
+        st.stop_monitor()
+        release_stacks()
         restore_signals()
 
 
-def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id) -> Path:
+def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
+                resume_from=None) -> Path:
+    # What the stages learn about each endpoint goes to disk, not into dictionaries: memory then stays flat in the shard size.
+    try:
+        store = ShardStore(run_dir / "work" / "facts.sqlite", reset=True)
+    except Exception as exc:
+        st.errors["store"] = f"{type(exc).__name__}: {exc}"[:500]
+        return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
+    try:
+        return _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
+                                started, wall, run_id, resume_from)
+    except Exception as exc:               # whatever escaped the stages: the run still ends with a manifest
+        st.errors["run"] = f"{type(exc).__name__}: {exc}"[:500]
+        return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
+    finally:
+        st.guard("store_close", store.close)
+
+
+def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Path:
+    """The manifest of a run that could not get through its write-out: what is known, marked incomplete."""
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "instrument_version": INSTRUMENT_VERSION, "experiment": "scanner",
+        "run_id": run_id, "started_at": started.isoformat(), "finished_at": datetime.now(UTC).isoformat(),
+        "elapsed_seconds": round(time.monotonic() - wall, 3), "stage_seconds": st.timings,
+        "stage_errors": st.errors, "stages_skipped": st.skipped, "abort_reason": st.reason,
+        "status": "finished", "complete": False, "config_checksum": cfg.checksum,
+        "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
+        "shard": {"index": cfg.shard, "of": cfg.shards}, "stage_counts": counts,
+        "output_schema": outputs.OUTPUT_SCHEMA, "limitations": LIMITATIONS,
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
+    return run_dir
+
+
+def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
+                     resume_from=None) -> Path:
     from scanner.internet.zmap_compat import output_args, packet_rate_args
     killed = st.killed
     pace = cfg.measurement.min_seconds_between_probes_per_ip
-    gap = pacing.Gap(pace, killed)             # pause between ZMap port runs
-    ledger = pacing.ContactLedger(pace, killed)    # last contact per address, shared by every target-facing step
-    pacer = pacing.IpPacer(pace, killed)       # pause between HTTP requests to one address
+
+    def store_problem() -> str | None:
+        """Rows the store lost may include the SYN-ACK windows that flag tarpits: nothing more is sent on that footing."""
+        try:
+            store.flush()
+        except Exception as exc:
+            return f"{type(exc).__name__}: {exc}"[:300]
+        if store.dropped_rows or store.errors:
+            return f"{store.dropped_rows} rows could not be written: " + "; ".join(store.errors[:3])[:300]
+        return None
+
+    def target_stage(name: str, fn: Callable[[], Any]) -> Any:
+        problem = store_problem()
+        if problem:
+            st.errors.setdefault("store", problem)
+            st.skipped.append(name)
+            return None
+        return st.run(name, fn, None)
+    gap = pacing.Gap(pace, killed, stop_event=st.stop)             # pause between ZMap port runs
+    ledger = pacing.ContactLedger(pace, killed, stop_event=st.stop)    # last contact per address, shared by every target-facing step
     gateway_mac = cfg.vantage.gateway_mac or report.get("gateway_mac")
     # Stub manifest before the first probe: if the process is killed hard (OOM, WSL shutdown) the run still
     # leaves evidence of what was started and the run-once guard still sees it.
@@ -332,16 +567,24 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     counts["sample_listed"] = len(sample_ips)
 
     # ---- Stage 1: ZMap L4 discovery (same seed -> same sample on every port) ----------------
-    l4: dict[int, list[str]] = {}
-    synack: dict[tuple[str, int], dict[str, int | None]] = {}      # SYN-ACK window and TTL, free from the same probes
     m = cfg.measurement
     tiny = cfg.tarpit.tiny_window_below
     dns_kw = dict(nameservers=list(cfg.dns.resolvers), run_dir=run_dir, threads=cfg.dns.threads, timeout=cfg.dns.timeout,
                   retries=cfg.dns.retries, network_timeout=cfg.dns.network_timeout, binary=cfg.binaries.zdns, executor=executor)
     # PTR goes to the resolvers, never to the targets: each port's new addresses are looked up while ZMap sweeps the next.
     ptr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ptr")
-    ptr_early: list[tuple[list[str], Any]] = []
-    ptr_sent: set[str] = set()
+    ptr_early: list[Any] = []       # one future per port, in port order
+
+    def ptr_lookup(addresses: list[str]) -> list[ToolJob]:
+        """One PTR batch. The answers go straight to the store; if it fails the addresses count as not sent again."""
+        try:
+            wanted = set(addresses)
+            j, part = run_zdns("PTR", addresses, **dns_kw)
+            store.put_ptr_many((ip, ptr_names(a), a.status) for ip, a in part.items() if ip in wanted)
+        except BaseException:
+            store.unmark_ptr_sent(addresses)
+            raise
+        return j
 
     gate: ovl.OverlapGate | None = None
     tls_ports: queue.Queue[int | None] = queue.Queue()
@@ -376,46 +619,43 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
                 if gate:
                     gate.progress.end_sweep()
             jobs.append(job)
+            st.progress()
             if job.error:
                 st.errors[f"zmap:{port}"] = job.error[:500]
-            l4[port] = sorted({r.target_ip for r in res})
+            ips = sorted({r.target_ip for r in res})
+            store.put_endpoints((ip, port) for ip in ips)
             try:
-                for ip_, fields in enrich.parse_synack_csv((run_dir / job.raw_path).read_text(encoding="utf-8", errors="replace")).items():
-                    synack[(ip_, port)] = fields
+                store.put_synack_port(port, enrich.parse_synack_csv((run_dir / job.raw_path).read_text(encoding="utf-8", errors="replace")))
             except OSError:
                 pass
-            new = [ip for ip in l4[port] if ip not in ptr_sent]
+            new = store.mark_ptr_sent(ips)
             if new:
-                ptr_sent.update(new)
-                ptr_early.append((new, ptr_pool.submit(run_zdns, "PTR", new, **dns_kw)))
+                ptr_early.append(ptr_pool.submit(ptr_lookup, new))
             if gate:
                 tls_ports.put(port)
 
-    def tarpits() -> set[str]:
-        return {ip for (ip, _), f in list(synack.items()) if f.get("window") is not None and f["window"] < tiny}
-
     # ---- Stage 2: TLS first, direct IP (no SNI) ---------------------------------------------
-    tls_direct: dict[tuple[str, int], tlsmod.TlsResult] = {}
     tls_jobs: list[ToolJob] = []
     # With overlap a batch must end by a known time: the gate leaves room for that, and the executor enforces it.
     tls_limit = m.zgrab_connect_timeout + m.zgrab_target_timeout + 15
 
     def tls_runner(timeout: float | None = None) -> Callable[[list], Any]:
         def one(batch):
-            return tlsmod.run_tls_batches(batch, mode="direct_ip", cfg=cfgview, policy=policy, run_dir=run_dir,
-                                          binary=cfg.binaries.zgrab2, executor=executor, timeout=timeout)
+            batch_jobs, results = tlsmod.run_tls_batches(batch, mode="direct_ip", cfg=cfgview, policy=policy, run_dir=run_dir,
+                                                         binary=cfg.binaries.zgrab2, executor=executor, timeout=timeout)
+            store.put_tls_many(results)
+            st.progress()
+            return batch_jobs
         return one
 
     def collect_tls(out: list[Any]) -> None:
-        for j, res in out:
-            tls_jobs.extend(j)
-            for r in res:
-                if r.ip:
-                    tls_direct[(r.ip, r.port)] = r
+        for batch_jobs in out:
+            tls_jobs.extend(batch_jobs)
 
     def tls_stage() -> None:
-        collect_tls(pacing.paced_batches([(ip, port, None) for ip, port in probe_endpoints], lambda t: t[0], ledger,
-                                         tls_runner(), batch_size=m.zgrab_batch_size, workers=m.zgrab_parallel_batches))
+        items = [(ip, port, None) for ip, port in store.iter_endpoints() if ip not in tarpit_ips]
+        collect_tls(pacing.paced_batches(items, lambda t: t[0], ledger, tls_runner(), batch_size=m.zgrab_batch_size,
+                                         workers=m.zgrab_parallel_batches))
 
     def tls_overlap_stage() -> None:
         assert gate is not None
@@ -423,14 +663,20 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         while (port := tls_ports.get()) is not None:
             if killed():
                 continue
+            problem = store_problem()
+            if problem:
+                st.errors.setdefault("store", problem)
+                st.skipped.append(f"tls_direct:{port}")
+                continue
             # Tarpits seen on the ports swept so far are left alone; one flagged only on a later port is counted below.
-            skip = tarpits()
+            skip = store.tarpit_ips(tiny)
             # ZMap's own order: neighbours in a batch become due together
-            items = sorted(((ip, port, None) for ip in l4.get(port, []) if ip not in skip),
+            items = sorted(((ip, port, None) for ip, _ in store.iter_endpoints(port) if ip not in skip),
                            key=lambda t: (send_order.get(t[0], 1 << 62), t[0]))
             collect_tls(pacing.paced_batches(items, lambda t: t[0], ledger, tls_runner(tls_limit), batch_size=size,
                                              workers=m.zgrab_parallel_batches,
                                              extra=lambda b: gate.admit([t[0] for t in b], tls_limit + 10)))
+            del items
 
     tls_thread = None
     if gate:
@@ -439,99 +685,78 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     try:
         st.run("zmap", zmap_stage, None)
     finally:
-        ledger.mark_all()          # the sweep touched every sampled address: the pause counts from its end
         if gate:
-            gate.progress.finish()
-            counts["overlap"]["tls_endpoints_during_sweep"] = len(tls_direct)
-            tls_ports.put(None)
+            tls_ports.put(None)    # first: whatever fails below, the overlap thread must be told to finish
+        st.guard("ledger", ledger.mark_all)          # the sweep touched every sampled address: the pause counts from its end
+        if gate:
+            st.guard("overlap_progress", gate.progress.finish)
+            counts["overlap"]["tls_endpoints_during_sweep"] = st.guard("store:count_tls", store.count_tls)
     while tls_thread is not None and tls_thread.is_alive():
         try:
             tls_thread.join(0.5)
         except KeyboardInterrupt as exc:      # signals reach the main thread only; the tool is stopped via killed()
             st.interrupted = True
             st.errors.setdefault("tls_direct", f"interrupted: {exc}"[:200])
-    endpoints = sorted({(ip, port) for port, ips in l4.items() for ip in ips}, key=lambda e: (e[0], e[1]))
-    counts["l4_per_port"] = {str(p): len(l4.get(p, [])) for p in m.ports}
-    counts["l4_endpoints"] = len(endpoints)
-    counts["l4_unique_ips"] = len({ip for ip, _ in endpoints})
+    by_port = st.guard("store:count_endpoints_by_port", store.count_endpoints_by_port, {})
+    counts["l4_per_port"] = {str(p): by_port.get(p, 0) for p in m.ports}
+    counts["l4_endpoints"] = st.guard("store:count_endpoints", store.count_endpoints, 0)
+    counts["l4_unique_ips"] = st.guard("store:count_unique_ips", store.count_unique_ips, 0)
     # An address whose SYN-ACK advertises a zero or tiny TCP window is a tarpit: it holds connections open on purpose.
     # It stays in the results (flagged) but receives nothing beyond the ZMap SYN.
-    tarpit_ips = tarpits()
-    probe_endpoints = [e for e in endpoints if e[0] not in tarpit_ips]
-    counts["tarpit_ips_not_probed"] = len({ip for ip, _ in endpoints} & tarpit_ips)
+    # If the list cannot be read it stays None, and nothing more is sent to the sampled addresses on the strength of it.
+    tarpit_ips = st.guard("store:tarpit_ips", lambda: store.tarpit_ips(tiny))
+    counts["tarpit_ips_not_probed"] = 0 if tarpit_ips is None else st.guard(
+        "store:iter_ip_names", lambda: sum(1 for ip in store.iter_ip_names() if ip in tarpit_ips), 0)
     counts["sample_targets_per_port"] = splan.targets_per_port
 
     if gate:
         counts["overlap"]["zmap_status_readings"] = gate.progress.readings
         # A tarpit flagged only on a later port may already have had a handshake. Its result is dropped so no
         # later step contacts it again; the handshake stays in the raw ZGrab2 output and the tool jobs.
-        late = [ep for ep in tls_direct if ep[0] in tarpit_ips]
+        late = [] if tarpit_ips is None else st.guard("store:delete_tls_for_ips", lambda: store.delete_tls_for_ips(tarpit_ips), [])
         counts["overlap"]["tarpit_ips_probed_before_flagged"] = len({ip for ip, _ in late})
-        for ep in late:
-            del tls_direct[ep]
+    elif tarpit_ips is not None:
+        target_stage("tls_direct", tls_stage)
     else:
-        st.run("tls_direct", tls_stage, None)
+        st.skipped.append("tls_direct")
     jobs.extend(tls_jobs)
 
     # ---- Stage 3: plain HTTP only where TLS did not prove the port speaks TLS ---------------
-    http_res: dict[tuple[str, int], Any] = {}
-
     def http_stage() -> None:
-        targets = [ZGrabTarget(ip, None, port) for ip, port in endpoints
-                   if (r := tls_direct.get((ip, port))) is not None and r.outcome in HTTP_FALLBACK]
+        targets = [ZGrabTarget(ip, None, port) for ip, port in store.iter_endpoints_with_tls_outcome(HTTP_FALLBACK)]
         def one(batch):
-            return run_zgrab_batches(batch, scheme="http", mode="direct_ip", cfg=cfgview, policy=policy,
-                                     run_dir=run_dir, executor=executor)
-        for j, res in pacing.paced_batches(targets, lambda t: t.ip, ledger, one, batch_size=m.zgrab_batch_size,
-                                           workers=m.zgrab_parallel_batches):
-            jobs.extend(j)
-            for r in res:
-                if r.target_ip:
-                    http_res[(r.target_ip, r.port)] = r
+            batch_jobs, results = run_zgrab_batches(batch, scheme="http", mode="direct_ip", cfg=cfgview, policy=policy,
+                                                    run_dir=run_dir, executor=executor)
+            store.put_http_many(results)
+            st.progress()
+            return batch_jobs
+        for batch_jobs in pacing.paced_batches(targets, lambda t: t.ip, ledger, one, batch_size=m.zgrab_batch_size,
+                                               workers=m.zgrab_parallel_batches):
+            jobs.extend(batch_jobs)
 
-    st.run("http_direct", http_stage, None)
+    def tarpits_known(name: str, fn: Callable[[], Any]) -> Any:
+        if tarpit_ips is None:             # overlap mode reaches here without the late-flag cleanup having run
+            st.errors.setdefault("tarpit_ips", "the tarpit list could not be read; no further target-facing stage was run")
+            st.skipped.append(name)
+            return None
+        return target_stage(name, fn)
 
-    sni_res: dict[tuple[str, int, str], tlsmod.TlsResult] = {}
-    sni_ok_endpoints: set[tuple[str, int]] = set()
-
-    def protocol_of(ep: tuple[str, int]) -> str:
-        t = tls_direct.get(ep)
-        if t is None:
-            return "not_attempted"
-        if t.ok or ep in sni_ok_endpoints:
-            return "https"                       # a TLS session was established (bare IP, or with SNI)
-        if t.outcome in TLS_PROVEN:
-            return "tls_unestablished"           # speaks TLS but wants a name we do not (yet) have
-        h = http_res.get(ep)
-        if h is not None and h.http_status is not None:
-            return "http"
-        return "tcp_only"
+    tarpits_known("http_direct", http_stage)
 
     # ---- Stage 4: PTR via ZDNS for every responsive IP --------------------------------------
-    ptr_by_ip: dict[str, list[str]] = {}
-    ptr_status: dict[str, str] = {}
-
     def ptr_stage() -> None:
-        ips = sorted({ip for ip, _ in endpoints})
-        ans: dict[str, Any] = {}
-        missing = [ip for ip in ips if ip not in ptr_sent]
-        for done_ips, future in ptr_early:          # port order, so the job list does not depend on timing
+        for future in ptr_early:                    # port order, so the job list does not depend on timing
             try:
-                j, part = future.result()
+                jobs.extend(future.result())
             except Exception as exc:
-                counts["ptr_early_failed"] = f"{type(exc).__name__}: {exc}"[:300]
-                missing += done_ips                 # asked again below; a second failure is the stage's error
-                continue
-            jobs.extend(j)
-            ans.update(part)
+                counts["ptr_early_failed"] = f"{type(exc).__name__}: {exc}"[:300]     # its addresses are asked again below
+        missing = list(store.iter_unsent_ptr_ips())
         if missing:
-            j, part = run_zdns("PTR", sorted(set(missing)), **dns_kw)
+            j, part = run_zdns("PTR", missing, **dns_kw)
             jobs.extend(j)
-            ans.update(part)
-        for ip in ips:
-            a = ans.get(ip)
-            ptr_by_ip[ip] = ptr_names(a)
-            ptr_status[ip] = a.status if a else "NO_OUTPUT"
+            wanted = set(missing)
+            store.put_ptr_many((ip, ptr_names(a), a.status) for ip, a in part.items() if ip in wanted)
+        store.fill_missing_ptr()
 
     try:
         st.run("ptr", ptr_stage, None)
@@ -539,24 +764,18 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         ptr_pool.shutdown(wait=True, cancel_futures=True)
 
     # ---- Stage 5: hostname candidates = PTR U cert SAN/CN ----------------------------------
-    names_by_ep: dict[tuple[str, int], cand.EndpointNames] = {}
-
     def cand_stage() -> None:
-        for ep in endpoints:
-            t = tls_direct.get(ep)
-            names_by_ep[ep] = cand.build_endpoint_names(
-                ptr_by_ip.get(ep[0], []), t.certificate if t else None, policy, max_candidates=cfg.max_candidates_per_ip,
-                operator_names=cfg.target_hostnames)
+        for g in store.iter_ips():
+            for e in g.endpoints:
+                store.put_names(g.ip, e.port, cand.build_endpoint_names(
+                    g.ptr_names, e.tls.certificate if e.tls else None, policy, max_candidates=cfg.max_candidates_per_ip,
+                    operator_names=cfg.target_hostnames))
 
-    st.run("candidates", cand_stage, None)
-    for ep in endpoints:       # endpoints must always have an entry, even if the stage failed
-        names_by_ep.setdefault(ep, cand.EndpointNames())
+    st.run("candidates", cand_stage, None)      # an endpoint without an entry reads as having no names
 
     # ---- Stage 6: forward verification via ZDNS (A + AAAA, CNAME chains) -------------------
-    resolutions: dict[str, Any] = {}
-
     def dns_stage() -> None:
-        names = sorted({n for e in names_by_ep.values() for n in e.names})
+        names = list(store.iter_candidate_names())
         if not names:
             return
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dns") as pool:     # resolver traffic only
@@ -564,9 +783,8 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
             (ja, a_ans), (jb, aaaa_ans) = fa.result(), fb.result()
         jobs.extend(ja)
         jobs.extend(jb)
-        for n in names:
-            resolutions[n] = resolve(n, a_ans.get(n), aaaa_ans.get(n), max_cnames=cfg.dns.max_cnames)
-        share = enrich.dns_unknown_share([r.status for r in resolutions.values()])
+        store.put_resolutions(resolve(n, a_ans.get(n), aaaa_ans.get(n), max_cnames=cfg.dns.max_cnames) for n in names)
+        share = enrich.dns_unknown_share_of_counts(store.resolution_status_counts())
         counts["dns_unknown_share"] = round(share, 4)
         if len(names) >= 20 and share > 0.10:
             # Rate limiting or an unhealthy resolver would otherwise quietly turn real names into "unverified".
@@ -574,152 +792,174 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
 
     st.run("dns_forward", dns_stage, None)
 
-    def dns_status(ip: str, host: str) -> str:
-        return cand.judge_dns(resolutions.get(host), ip)
-
-    def verified_names(ep: tuple[str, int]) -> list[str]:
-        """Verified names for an endpoint, best-corroborated first: several sources, then PTR, then alphabetical."""
-        names = names_by_ep[ep].names
-        ok = [h for h in names if dns_status(ep[0], h) in cand.VERIFIED]
-        return sorted(ok, key=lambda h: (-len(names[h]), cand.SRC_PTR not in names[h], h))
-
     # ---- Stage 7: optional SNI confirmation (batched, verified names only) -----------------
-    sni_skipped: dict[tuple[str, int, str], str] = {}
-
     def sni_stage() -> None:
         targets: list[tuple[str, int, str | None]] = []
-        for ep in endpoints:
-            t = tls_direct.get(ep)
-            for i, h in enumerate(verified_names(ep)):
-                if not cfg.sni_confirm.enabled:
-                    sni_skipped[(ep[0], ep[1], h)] = "disabled"
-                elif t is None or t.outcome in (tlsmod.NOT_TLS, tlsmod.CONNECT_TIMEOUT):
-                    sni_skipped[(ep[0], ep[1], h)] = "port_not_tls"
-                elif i >= cfg.sni_confirm.max_per_endpoint:
-                    sni_skipped[(ep[0], ep[1], h)] = "cap"
-                else:
-                    targets.append((ep[0], ep[1], h))
+        for g in store.iter_ips():
+            skipped: list[tuple[str, int, str, str]] = []
+            for e in g.endpoints:
+                t = e.tls
+                for i, h in enumerate(_verified_names(g, e)):
+                    if not cfg.sni_confirm.enabled:
+                        skipped.append((g.ip, e.port, h, "disabled"))
+                    elif t is None or t.outcome in (tlsmod.NOT_TLS, tlsmod.CONNECT_TIMEOUT):
+                        skipped.append((g.ip, e.port, h, "port_not_tls"))
+                    elif i >= cfg.sni_confirm.max_per_endpoint:
+                        skipped.append((g.ip, e.port, h, "cap"))
+                    else:
+                        targets.append((g.ip, e.port, h))
+            store.put_sni_skipped_many(skipped)
         if not targets:
             return
         def one(batch):
-            return tlsmod.run_tls_batches(batch, mode="hostname_aware", cfg=cfgview, policy=policy, run_dir=run_dir,
-                                          binary=cfg.binaries.zgrab2, executor=executor)
-        for j, res in pacing.paced_batches(targets, lambda t: t[0], ledger, one, batch_size=m.zgrab_batch_size,
-                                           workers=m.zgrab_parallel_batches):
-            jobs.extend(j)
-            for r in res:
+            batch_jobs, results = tlsmod.run_tls_batches(batch, mode="hostname_aware", cfg=cfgview, policy=policy, run_dir=run_dir,
+                                                         binary=cfg.binaries.zgrab2, executor=executor)
+            for r in results:
                 if r.ip and r.sni:
-                    sni_res[(r.ip, r.port, r.sni)] = r
-                    if r.ok:
-                        sni_ok_endpoints.add((r.ip, r.port))
+                    store.put_sni(r)
+            st.progress()
+            return batch_jobs
+        for batch_jobs in pacing.paced_batches(targets, lambda t: t[0], ledger, one, batch_size=m.zgrab_batch_size,
+                                               workers=m.zgrab_parallel_batches):
+            jobs.extend(batch_jobs)
 
-    st.run("sni_confirm", sni_stage, None)
+    tarpits_known("sni_confirm", sni_stage)
 
     # ---- Stage 8: favicon acquisition (HTTP and HTTPS), bounded, sample-and-port-confined ---
-    fav_res: dict[tuple[str, int, str | None], dict[str, Any]] = {}
     offhost_log: list[dict[str, Any]] = []
-
-    def unverified_names(ep: tuple[str, int]) -> list[str]:
-        """Candidate names that did NOT verify, best-corroborated first. Used only as Host/SNI on the scanned IP."""
-        names = names_by_ep[ep].names
-        bad = [h for h in names if dns_status(ep[0], h) not in cand.VERIFIED]
-        return sorted(bad, key=lambda h: (-len(names[h]), cand.SRC_PTR not in names[h], h))
 
     def favicon_stage() -> None:
         if not cfg.favicon.enabled:
             return
         fjobs: list[dict[str, Any]] = []
-        for ep in endpoints:
-            proto = protocol_of(ep)
-            # A bare-IP request only makes sense where a bare-IP session works; a host that answered
-            # only with SNI would just fail (and record a misleading direct-IP failure).
-            if proto == "http" or (proto == "https" and tls_direct[ep].ok):
-                fjobs.append({"scheme": proto, "ip": ep[0], "port": ep[1], "hostname": None})
-            for h in verified_names(ep)[: cfg.favicon.max_hostnames_per_endpoint]:
-                sni = sni_res.get((ep[0], ep[1], h))
-                if proto == "http":
-                    scheme = "http"
-                elif proto == "https" and (tls_direct[ep].ok or (sni is not None and sni.ok)):
-                    scheme = "https"
-                else:
-                    continue
-                fjobs.append({"scheme": scheme, "ip": ep[0], "port": ep[1], "hostname": h})
-            # Unverified names: same scanned ip:port, just a different Host/SNI. Recorded as unverified in the rows.
-            if proto in ("http", "https", "tls_unestablished"):
-                for h in unverified_names(ep)[: cfg.favicon.max_unverified_names_per_endpoint]:
-                    fjobs.append({"scheme": "http" if proto == "http" else "https", "ip": ep[0], "port": ep[1], "hostname": h})
-                    counts["favicon_jobs_unverified_names"] = counts.get("favicon_jobs_unverified_names", 0) + 1
-        if not fjobs or not ledger.wait({j["ip"] for j in fjobs}):
+        job_ips: set[str] = set()
+        job_endpoints: set[tuple[str, int]] = set()
+        for g in store.iter_ips():
+            for e in g.endpoints:
+                proto = _protocol_of(e)
+                first = len(fjobs)
+                # A bare-IP request only makes sense where a bare-IP session works; a host that answered
+                # only with SNI would just fail (and record a misleading direct-IP failure).
+                if proto == "http" or (proto == "https" and e.tls.ok):
+                    fjobs.append({"scheme": proto, "ip": g.ip, "port": e.port, "hostname": None})
+                for h in _verified_names(g, e)[: cfg.favicon.max_hostnames_per_endpoint]:
+                    sni = e.sni.get(h)
+                    if proto == "http":
+                        scheme = "http"
+                    elif proto == "https" and (e.tls.ok or (sni is not None and sni.ok)):
+                        scheme = "https"
+                    else:
+                        continue
+                    fjobs.append({"scheme": scheme, "ip": g.ip, "port": e.port, "hostname": h})
+                # Unverified names: same scanned ip:port, just a different Host/SNI. Recorded as unverified in the rows.
+                if proto in ("http", "https", "tls_unestablished"):
+                    for h in _unverified_names(g, e)[: cfg.favicon.max_unverified_names_per_endpoint]:
+                        fjobs.append({"scheme": "http" if proto == "http" else "https", "ip": g.ip, "port": e.port, "hostname": h})
+                        counts["favicon_jobs_unverified_names"] = counts.get("favicon_jobs_unverified_names", 0) + 1
+                if len(fjobs) > first:
+                    job_ips.add(g.ip)
+                    job_endpoints.add((g.ip, e.port))
+        if not fjobs or not ledger.wait(job_ips):
             return
-        fp = fav.fetch_policy(cfg, [j["ip"] for j in fjobs])
-        f = fetcher or fav.make_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
-                                        {(j["ip"], j["port"]) for j in fjobs}, exclusions=exclusions, killed=killed,
-                                        state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json", pacer=pacer)
+        fp = fav.fetch_policy(cfg, sorted(job_ips))
         deadline = time.monotonic() + cfg.favicon.stage_max_seconds
-        store = icon_store.IconStore(run_dir / "favicons") if cfg.favicon.store_images else None
 
         def stop() -> bool:
             return killed() or time.monotonic() > deadline
+        # The fetcher and the pacer see the stage deadline too: workers left behind at the cap must not go on to
+        # the remaining icons of their page.
+        pacer = pacing.IpPacer(pace, stop, stop_event=st.stop)       # pause between HTTP requests to one address
+        f = fetcher or fav.make_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
+                                        job_endpoints, exclusions=exclusions, killed=stop,
+                                        state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json", pacer=pacer)
+        icons = icon_store.IconStore(run_dir / "favicons") if cfg.favicon.store_images else None
         record_log = fav.RecordLog(run_dir / "raw" / "favicon_records.jsonl")
         earlier = record_log.load()
+        carried = _earlier_attempt_records(resume_from, earlier, fjobs)
+        for rec in carried:                 # logged again here: a second crash must not lose them with this attempt
+            record_log.append(rec)
+            earlier[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
         if earlier:
             counts["favicon_lookups_resumed"] = len(earlier)
         try:
-            for rec in fav.run_favicon_stage(f, fjobs, workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page, killed=stop,
-                                            icon_store=store, on_record=record_log.append, done=earlier):
-                fav_res[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
-            skipped = sum(1 for r in fav_res.values() if r.get("favicon_outcome") == "skipped_kill_switch")
+            # every record, reused ones included, goes to the store with its position in the job list
+            fav.run_favicon_stage(f, fjobs, workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page, killed=stop,
+                                  icon_store=icons, on_record=lambda rec: (record_log.append(rec), st.progress()), done=earlier,
+                                  record_sink=store.put_favicon)
+            skipped = store.count_favicon_outcome("skipped_kill_switch")
             if time.monotonic() > deadline and skipped:
                 st.errors["favicon_deadline"] = f"stage cap of {cfg.favicon.stage_max_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"
         finally:
-            record_log.close()
-            if store is not None:
-                counts["favicon_images_stored"] = len(store)
-                counts["favicon_images_indexed"] = store.write_index(list(fav_res.values()))
-            getattr(getattr(f, "offhost", None), "save_state", lambda: None)()
-            third_party = getattr(getattr(f, "offhost", None), "log", None)
-            if third_party:
-                offhost_log.extend(third_party)
-                sent = [e for e in third_party if not e["cached"] and e["outcome"] != "policy_refused"]
-                counts["offhost_icon_requests"] = len(sent)
-                counts["offhost_icon_logged"] = len(third_party)
-                counts["offhost_icon_refused"] = sum(1 for e in third_party if e["outcome"] == "policy_refused")
+            # each step on its own: one failing must neither replace the error being handled nor skip the others
+            st.guard("favicon_records_close", record_log.close)
+            if record_log.dropped:
+                counts["favicon_records_dropped"] = record_log.dropped
+                st.errors.setdefault("favicon_records", f"{record_log.dropped} lookup records were not logged for resume")
+            if icons is not None:
+                def index_icons() -> None:
+                    counts["favicon_images_stored"] = len(icons)
+                    counts["favicon_images_indexed"] = icons.write_index(store.iter_favicons(), spool=run_dir / "work" / "icon-index.sqlite")
+                st.guard("favicon_icon_index", index_icons)
+            offhost = getattr(f, "offhost", None)
+            st.guard("favicon_offhost_state", getattr(offhost, "save_state", lambda: None))
 
-    st.run("favicon", favicon_stage, None)
+            def count_offhost() -> None:
+                third_party = getattr(offhost, "log", None)
+                if third_party:
+                    offhost_log.extend(third_party)
+                    sent = [e for e in third_party if not e["cached"] and e["outcome"] != "policy_refused"]
+                    counts["offhost_icon_requests"] = len(sent)
+                    counts["offhost_icon_logged"] = len(third_party)
+                    counts["offhost_icon_refused"] = sum(1 for e in third_party if e["outcome"] == "policy_refused")
+            st.guard("favicon_offhost_log", count_offhost)
+
+    tarpits_known("favicon", favicon_stage)
+    st.check_now()          # a stop that arrived after the last check still belongs in the manifest
 
     # ---- Records (never allowed to prevent the manifest from being written) ----------------
     tool_errors = [j.job_id for j in jobs if j.error]      # tools that crashed or exited non-zero
     incomplete = bool(st.errors or st.skipped or tool_errors)
-    try:
-        rows, ep_rows = _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, ptr_status,
-                                    names_by_ep, resolutions, dns_status, sni_res, sni_skipped, fav_res, incomplete, synack)
-    except Exception as exc:
-        st.errors["records"] = f"{type(exc).__name__}: {exc}"[:500]
-        rows, ep_rows = [], []
-    rows, ep_rows = _scrub_rows(rows), _scrub_rows(ep_rows)
     normalized = run_dir / "normalized"
     checksums: dict[str, str] = {}
+    tally = _SummaryTally()
+    streamed: dict[str, str] = {}
     try:
-        _write_ip_results(run_dir / "ip_results.csv", sample_ips, ep_rows, rows)
+        streamed = _write_records(cfg, store, normalized, incomplete, tally, st.progress)
     except Exception as exc:
-        st.errors["ip_results"] = f"{type(exc).__name__}: {exc}"[:500]
+        st.errors["write_outputs" if isinstance(exc, OSError) else "records"] = f"{type(exc).__name__}: {exc}"[:500]
+    if {"records", "write_outputs"} & set(st.errors):
+        # the per-address rows it reads were not all parked: every missing one would read as "responsive=no"
+        st.errors["ip_results"] = "not written: the records write-out failed"
+    else:
+        try:
+            _write_ip_results(run_dir / "ip_results.csv", sample_ips, store)
+        except Exception as exc:
+            st.errors["ip_results"] = f"{type(exc).__name__}: {exc}"[:500]
     try:
-        checksums["normalized/endpoints.jsonl"] = write_jsonl(normalized / "endpoints.jsonl", ep_rows)
-        checksums["normalized/hostname_resolution.jsonl"] = write_jsonl(normalized / "hostname_resolution.jsonl", rows)
+        if streamed:
+            checksums["normalized/endpoints.jsonl"] = streamed["endpoints"]
+            checksums["normalized/hostname_resolution.jsonl"] = streamed["hostnames"]
         checksums["normalized/tool_jobs.jsonl"] = write_jsonl(normalized / "tool_jobs.jsonl", jobs)
         if cfg.favicon.offhost.enabled:
             checksums["normalized/offhost_icon_fetches.jsonl"] = write_jsonl(normalized / "offhost_icon_fetches.jsonl", offhost_log)
-        _write_csv(normalized / "hostname_resolution.csv", rows)
-        checksums["normalized/hostname_resolution.csv"] = sha256_file(normalized / "hostname_resolution.csv")
         checksums["normalized/policy_refusals.jsonl"] = write_jsonl(normalized / "policy_refusals.jsonl", [r.as_dict() for r in policy.refusals])
     except Exception as exc:
         st.errors["write_outputs"] = f"{type(exc).__name__}: {exc}"[:500]
+    st.guard("store_close", store.close)          # the final flush; what it or any earlier write lost is counted, not hidden
+    if store.dropped_rows:
+        counts["store_dropped_rows"] = store.dropped_rows
+        st.errors.setdefault("store", f"{store.dropped_rows} rows could not be written: " + "; ".join(store.errors[:3])[:300])
+    if not {"records", "ip_results", "write_outputs"} & set(st.errors):
+        store.delete()                  # kept after a failed write-out, for diagnosis; never part of the listed outputs
+        shutil.rmtree(run_dir / "work", ignore_errors=True)
     for p in sorted(run_dir.rglob("*")):
-        if p.is_file() and p.name != "manifest.json" and "report" not in p.parts:
-            checksums[str(p.relative_to(run_dir)).replace("\\", "/")] = sha256_file(p)
+        rel = str(p.relative_to(run_dir)).replace("\\", "/")
+        if p.is_file() and p.name not in ("manifest.json", "stacks.txt") and "report" not in p.parts and rel.split("/")[0] != "work":
+            if rel not in checksums:            # the streamed outputs were hashed as they were written
+                checksums[rel] = sha256_file(p)
 
     incomplete = bool(st.errors or st.skipped or tool_errors)      # again: the writers above may just have failed
-    summary = _summarize(cfg, splan, endpoints, rows, ep_rows, counts, st, jobs)
+    summary = _summarize(cfg, splan, tally, counts, st, jobs)
     (run_dir / "report" / "summary.json").write_text(json.dumps(summary, indent=2, default=_jsonable), encoding="utf-8")
     (run_dir / "report" / "summary.md").write_text(_summary_md(summary), encoding="utf-8")
     checksums["report/summary.json"] = sha256_file(run_dir / "report" / "summary.json")
@@ -755,8 +995,11 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
                        "min_seconds_between_probes_per_ip": cfg.measurement.min_seconds_between_probes_per_ip,
                        "zgrab_connect_timeout": cfg.measurement.zgrab_connect_timeout, "zgrab_target_timeout": cfg.measurement.zgrab_target_timeout,
                        "max_candidates_per_ip": cfg.max_candidates_per_ip, "sni_confirm": vars(cfg.sni_confirm),
-                       "favicon": vars(cfg.favicon), "fetch": vars(cfg.fetch)},
+                       "favicon": vars(cfg.favicon), "fetch": vars(cfg.fetch),
+                       **({"pipeline": getattr(st.phase_gate, "depth", 2)} if st.phase_gate is not None else {})},
         "tools": report.get("tool_versions", {}), "stage_counts": counts, "tool_job_counts": _job_counts(jobs),
+        "output_schema": outputs.OUTPUT_SCHEMA, "compression": outputs.COMPRESSION,
+        **({"compression_note": outputs.COMPRESSION_NOTE} if outputs.COMPRESSION_NOTE else {}),
         "output_checksums": checksums, "limitations": LIMITATIONS,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
@@ -800,31 +1043,60 @@ def _cert_fields(t: tlsmod.TlsResult | None) -> dict[str, Any]:
     }
 
 
-def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, ptr_status, names_by_ep,
-                resolutions, dns_status, sni_res, sni_skipped, fav_res, incomplete, synack=None):
-    synack = synack or {}
-    asn = asn_context.AsnContext(cfg.asn_ipasn) if getattr(cfg, "asn_ipasn", None) else None
+def _protocol_of(e: EndpointFacts) -> str:
+    t = e.tls
+    if t is None:
+        return "not_attempted"
+    if t.ok or e.sni_ok:
+        return "https"                       # a TLS session was established (bare IP, or with SNI)
+    if t.outcome in TLS_PROVEN:
+        return "tls_unestablished"           # speaks TLS but wants a name we do not (yet) have
+    h = e.http
+    if h is not None and h.http_status is not None:
+        return "http"
+    return "tcp_only"
+
+
+def _dns_status(g: IpFacts, host: str) -> str:
+    return cand.judge_dns(g.resolutions.get(host), g.ip)
+
+
+def _verified_names(g: IpFacts, e: EndpointFacts) -> list[str]:
+    """Verified names for an endpoint, best-corroborated first: several sources, then PTR, then alphabetical."""
+    names = e.names.names
+    ok = [h for h in names if _dns_status(g, h) in cand.VERIFIED]
+    return sorted(ok, key=lambda h: (-len(names[h]), cand.SRC_PTR not in names[h], h))
+
+
+def _unverified_names(g: IpFacts, e: EndpointFacts) -> list[str]:
+    """Candidate names that did NOT verify, best-corroborated first. Used only as Host/SNI on the scanned IP."""
+    names = e.names.names
+    bad = [h for h in names if _dns_status(g, h) not in cand.VERIFIED]
+    return sorted(bad, key=lambda h: (-len(names[h]), cand.SRC_PTR not in names[h], h))
+
+
+def _ip_rows(cfg, g: IpFacts, asn, incomplete: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The endpoint rows and hostname rows of one address (ascending port), as they appear in the output files."""
     rows: list[dict[str, Any]] = []
     ep_rows: list[dict[str, Any]] = []
-    facts_by_ip: dict[str, list[dict[str, Any]]] = {}
-    for ip_, port_ in endpoints:
-        doc = fav_res.get((ip_, port_, None)) or {}
-        facts_by_ip.setdefault(ip_, []).append({
-            "protocol": protocol_of((ip_, port_)), "window": synack.get((ip_, port_), {}).get("window"),
-            "doc_sha256": doc.get("document_body_sha256"), "doc_status": doc.get("http_status")})
-    tarpit = {ip_: enrich.tarpit_assessment(f, len(cfg.measurement.ports), cfg.tarpit.min_open_ports, cfg.tarpit.tiny_window_below)
-              for ip_, f in facts_by_ip.items()}
-    for ep in endpoints:
-        ip, port = ep
-        t = tls_direct.get(ep)
-        h = http_res.get(ep)
-        names = names_by_ep[ep]
-        direct_fav = fav_res.get((ip, port, None)) or {}
+    tarpit = enrich.tarpit_assessment(
+        [{"protocol": _protocol_of(e), "window": e.synack_window,
+          "doc_sha256": (e.favicons.get(None) or {}).get("document_body_sha256"), "doc_status": (e.favicons.get(None) or {}).get("http_status")}
+         for e in g.endpoints],
+        len(cfg.measurement.ports), cfg.tarpit.min_open_ports, cfg.tarpit.tiny_window_below)
+    ip = g.ip
+    for e in g.endpoints:
+        port = e.port
+        t = e.tls
+        h = e.http
+        names = e.names
+        direct_fav = e.favicons.get(None) or {}
+        protocol = _protocol_of(e)
         base: dict[str, Any] = {
             "target_ip": ip, "port": port, "zmap_result": "synack",
             **(asn.lookup(ip) if asn else asn_context.empty_fields()),
-            "protocol": protocol_of(ep), **tarpit[ip],
-            "synack_window": synack.get(ep, {}).get("window"), "synack_ttl": synack.get(ep, {}).get("ttl"),
+            "protocol": protocol, **tarpit,
+            "synack_window": e.synack_window, "synack_ttl": e.synack_ttl,
             "tls_status": "success" if t and t.ok else ("not_tls" if t and t.outcome == tlsmod.NOT_TLS else ("failed" if t else "not_attempted")),
             "tls_outcome": t.outcome if t else None,
             "tls_failure_reason": None if (t is None or t.ok) else t.error,
@@ -833,7 +1105,7 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
             "certificate_wildcards": sorted(names.wildcards),
             "http_zgrab_status": h.status if h else None, "http_status": h.http_status if h else None,
             "http_location": h.location if h else None, "http_error": h.error if h else None,
-            "ptr_status": ptr_status.get(ip), "ptr_names": ptr_by_ip.get(ip, [])[:20], "ptr_name_count": len(ptr_by_ip.get(ip, [])),
+            "ptr_status": g.ptr_status, "ptr_names": g.ptr_names[:20], "ptr_name_count": len(g.ptr_names),
             "run_incomplete": incomplete,
             "candidate_names_total": names.source_count, "candidate_names_truncated": names.truncated,
             "dropped_names": names.dropped[:50],
@@ -857,17 +1129,17 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
                          "hostname_icon_embedded_images": None, "final_hostname_status": "no_hostname_evidence", "icon_scope": "none"})
             continue
         for host in sorted(names.names):
-            res = resolutions.get(host)
-            status = dns_status(ip, host)
+            res = g.resolutions.get(host)
+            status = _dns_status(g, host)
             sources = names.names[host]
-            sni = sni_res.get((ip, port, host))
-            hf = fav_res.get((ip, port, host)) or {}
+            sni = e.sni.get(host)
+            hf = e.favicons.get(host) or {}
             rows.append({
                 **base, "hostname": host, "hostname_sources": sorted(sources), "dns_status": status,
                 "cname_chain": list(res.cname_chain) if res else [], "a_answers": list(res.a) if res else [],
                 "aaaa_answers": list(res.aaaa) if res else [],
                 "maps_to_scanned_ip": None if status in DNS_UNKNOWN else status in cand.VERIFIED,
-                "sni_skipped_reason": sni_skipped.get((ip, port, host)),
+                "sni_skipped_reason": e.sni_skipped.get(host),
                 "sni_confirmation_attempted": sni is not None,
                 "sni_confirmation_result": _sni_result(sni),
                 "sni_confirmation_outcome": sni.outcome if sni else None,
@@ -882,7 +1154,7 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
                 # a name that does not verify describes the scanned address, never the domain
                 "icon_scope": _icon_scope(cand.final_status(status, sources) == "verified", bool(hf.get("favicon_is_image"))),
             })
-    return rows, ep_rows
+    return ep_rows, rows
 
 
 def _icon_scope(verified: bool, is_image: bool) -> str:
@@ -901,104 +1173,208 @@ def _sni_result(sni: Any) -> str | None:
     return "confirmed" if sni.certificate is not None and sni.certificate.hostname_matches else "tls_ok_cert_mismatch"
 
 
+_csv_cell = outputs.csv_cell
+_CsvSink = outputs.CsvSink
+
+
+class _HashedFile:
+    """Output file written as UTF-8 text without newline translation; keeps the SHA-256 of what it wrote."""
+
+    def __init__(self, path: Path) -> None:
+        self._fh = open(path, "wb")
+        self._digest = hashlib.sha256()
+
+    def write(self, text: str) -> int:
+        data = text.encode("utf-8")
+        self._digest.update(data)
+        self._fh.write(data)
+        return len(text)
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+    def __enter__(self) -> "_HashedFile":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._fh.close()
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    fields = list(rows[0].keys())
-    def cell(v: Any) -> Any:
-        if isinstance(v, (list, dict, bool)):
-            return json.dumps(v)
-        if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", chr(9), chr(13)):
-            return "'" + v        # neutralize spreadsheet formula injection from hostile certificate/PTR text
-        return v
-
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields)
-        w.writeheader()
+    with _HashedFile(path) as out:
+        sink = _CsvSink(out)
         for r in rows:
-            w.writerow({k: cell(v) for k, v in r.items()})
+            sink.write(r)
 
 
-def _write_ip_results(path: Path, sample_ips: list[str], ep_rows: list[dict[str, Any]], rows: list[dict[str, Any]]) -> None:
-    """One row per sampled IP: did anything answer, on which ports, and what it gave us."""
-    by_ip: dict[str, list[dict[str, Any]]] = {}
-    for e in ep_rows:
-        by_ip.setdefault(e["target_ip"], []).append(e)
-    names_by_ip: dict[str, list[dict[str, Any]]] = {}
-    for r in rows:
-        if r["hostname"]:
-            names_by_ip.setdefault(r["target_ip"], []).append(r)
+def _write_records(cfg, store: ShardStore, normalized: Path, incomplete: bool, tally: "_SummaryTally",
+                   tick: Callable[[], None]) -> dict[str, str]:
+    """endpoints.jsonl and hostname_resolution.jsonl in one pass over the store, an address at a time.
 
+    Every row is scrubbed as it is written. The summary tallies and the ip_results rows are gathered on the way, so
+    nothing is held beyond the address in hand. The hostname rows are written in their slim form (see ``outputs``).
+    Returns the SHA-256 of the two files.
+    """
+    asn = asn_context.AsnContext(cfg.asn_ipasn) if getattr(cfg, "asn_ipasn", None) else None
+    normalized.mkdir(parents=True, exist_ok=True)
+    with _HashedFile(normalized / "endpoints.jsonl") as ep_out, _HashedFile(normalized / "hostname_resolution.jsonl") as row_out:
+        for g in store.iter_ips(order="string"):
+            ep_rows, rows = _ip_rows(cfg, g, asn, incomplete)
+            ep_rows, rows = [_scrub(r) for r in ep_rows], [_scrub(r) for r in rows]
+            for r in ep_rows:
+                ep_out.write(canonical_json(r) + "\n")
+            for r in rows:
+                row_out.write(canonical_json(outputs.slim_hostname_row(r)) + "\n")
+            tally.add(ep_rows, rows)
+            store.put_ip_result(g.ip, _ip_result_row(g.ip, ep_rows, rows))
+            tick()
+    return {"endpoints": ep_out.hexdigest(), "hostnames": row_out.hexdigest()}
+
+
+IP_RESULT_HEADER = ("ip,responsive,open_ports,endpoints,ptr_names,verified_hostnames,other_hostnames,certificate_cns,tarpit_suspect,"
+                    "tarpit_confidence,tarpit_signals,tarpit_reason,document_titles,icon_offhost_hosts,favicon_sha256,unverified_name_favicon_sha256\n")
+
+
+def _ip_result_row(ip: str, eps: list[dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The ip_results row of one address from its (scrubbed) endpoint rows and hostname rows."""
+    hosts = [r for r in rows if r["hostname"]]
+    verified = sorted({h["hostname"] for h in hosts if h["final_hostname_status"] == "verified"})
+    other = sorted({f'{h["hostname"]}:{h["final_hostname_status"]}' for h in hosts if h["final_hostname_status"] != "verified"})
+    return {
+        "ip": ip,
+        "responsive": "yes" if eps else "no",
+        "open_ports": "|".join(str(e["port"]) for e in eps),
+        "endpoints": "; ".join(
+            f'{e["port"]}={e["protocol"]}' + (f'({e["tls_outcome"]})' if e["tls_outcome"] not in (None, "tls_success") else "")
+            + (f'[http {e["http_status"]}]' if e["http_status"] else "") for e in eps),
+        "ptr_names": "|".join(sorted({n for e in eps for n in e["ptr_names"]})),
+        "verified_hostnames": "|".join(verified),
+        "other_hostnames": "|".join(other),
+        "certificate_cns": "|".join(sorted({e["certificate_cn"] for e in eps if e["certificate_cn"]})),
+        "tarpit_suspect": "yes" if eps and eps[0]["tarpit_suspect"] else "no",
+        "tarpit_confidence": (eps[0]["tarpit_confidence"] or "") if eps else "",
+        "tarpit_signals": "|".join(eps[0]["tarpit_signals"]) if eps else "",
+        "tarpit_reason": (eps[0]["tarpit_reason"] or "") if eps else "",
+        "document_titles": "|".join(sorted({e["direct_document_title"] for e in eps if e["direct_document_title"]}
+                                           | {h["hostname_document_title"] for h in hosts if h["hostname_document_title"]})),
+        "icon_offhost_hosts": "|".join(sorted({x for e in eps for x in e["direct_icon_offhost_hosts"]}
+                                              | {x for h in hosts for x in h["hostname_icon_offhost_hosts"]})),
+        # only real images: the hash of an HTML error page is not a favicon
+        "favicon_sha256": "|".join(sorted({e["direct_favicon_sha256"] for e in eps if e["direct_favicon_is_image"] and e["direct_favicon_sha256"]}
+                                          | {h["hostname_favicon_sha256"] for h in hosts if h["icon_scope"] == "domain_verified" and h["hostname_favicon_sha256"]})),
+        # icons fetched under names that do not verify: they describe the address, so they stay out of favicon_sha256
+        "unverified_name_favicon_sha256": "|".join(sorted({h["hostname_favicon_sha256"] for h in hosts if h["icon_scope"] == "served_at_ip" and h["hostname_favicon_sha256"]})),
+    }
+
+
+def _write_ip_results(path: Path, sample_ips: list[str], store: ShardStore) -> None:
+    """One row per sampled IP, in address order: did anything answer, on which ports, and what it gave us.
+
+    The rows of the responsive addresses were parked in the store by ``_write_records``; the sampled addresses that
+    did not answer are merged in here.
+    """
     def key(ip: str) -> tuple[int, ...]:
         return tuple(int(o) for o in ip.split("."))
 
-    out: list[dict[str, Any]] = []
-    for ip in sorted(set(sample_ips) | set(by_ip), key=key):
-        eps = sorted(by_ip.get(ip, []), key=lambda e: e["port"])
-        hosts = names_by_ip.get(ip, [])
-        verified = sorted({h["hostname"] for h in hosts if h["final_hostname_status"] == "verified"})
-        other = sorted({f'{h["hostname"]}:{h["final_hostname_status"]}' for h in hosts if h["final_hostname_status"] != "verified"})
-        out.append({
-            "ip": ip,
-            "responsive": "yes" if eps else "no",
-            "open_ports": "|".join(str(e["port"]) for e in eps),
-            "endpoints": "; ".join(
-                f'{e["port"]}={e["protocol"]}' + (f'({e["tls_outcome"]})' if e["tls_outcome"] not in (None, "tls_success") else "")
-                + (f'[http {e["http_status"]}]' if e["http_status"] else "") for e in eps),
-            "ptr_names": "|".join(sorted({n for e in eps for n in e["ptr_names"]})),
-            "verified_hostnames": "|".join(verified),
-            "other_hostnames": "|".join(other),
-            "certificate_cns": "|".join(sorted({e["certificate_cn"] for e in eps if e["certificate_cn"]})),
-            "tarpit_suspect": "yes" if eps and eps[0]["tarpit_suspect"] else "no",
-            "tarpit_confidence": (eps[0]["tarpit_confidence"] or "") if eps else "",
-            "tarpit_signals": "|".join(eps[0]["tarpit_signals"]) if eps else "",
-            "tarpit_reason": (eps[0]["tarpit_reason"] or "") if eps else "",
-            "document_titles": "|".join(sorted({e["direct_document_title"] for e in eps if e["direct_document_title"]}
-                                               | {h["hostname_document_title"] for h in hosts if h["hostname_document_title"]})),
-            "icon_offhost_hosts": "|".join(sorted({x for e in eps for x in e["direct_icon_offhost_hosts"]}
-                                                  | {x for h in hosts for x in h["hostname_icon_offhost_hosts"]})),
-            # only real images: the hash of an HTML error page is not a favicon
-            "favicon_sha256": "|".join(sorted({e["direct_favicon_sha256"] for e in eps if e["direct_favicon_is_image"] and e["direct_favicon_sha256"]}
-                                              | {h["hostname_favicon_sha256"] for h in hosts if h["icon_scope"] == "domain_verified" and h["hostname_favicon_sha256"]})),
-            # icons fetched under names that do not verify: they describe the address, so they stay out of favicon_sha256
-            "unverified_name_favicon_sha256": "|".join(sorted({h["hostname_favicon_sha256"] for h in hosts if h["icon_scope"] == "served_at_ip" and h["hostname_favicon_sha256"]})),
-        })
-    _write_csv(path, out) if out else path.write_text("ip,responsive,open_ports,endpoints,ptr_names,verified_hostnames,other_hostnames,certificate_cns,tarpit_suspect,tarpit_confidence,tarpit_signals,tarpit_reason,document_titles,icon_offhost_hosts,favicon_sha256,unverified_name_favicon_sha256\n", encoding="utf-8")
+    silent = sorted(set(sample_ips), key=key)
+    keys = [key(ip) for ip in silent]
+    n = 0
+    with _HashedFile(path) as out:
+        sink = _CsvSink(out)
+        i = 0
+        for ip, row in store.iter_ip_results():
+            k = key(ip)
+            while i < len(silent) and keys[i] < k:
+                sink.write(_ip_result_row(silent[i], [], []))
+                n += 1
+                i += 1
+            if i < len(silent) and keys[i] == k:
+                i += 1                      # sampled and responsive: its own row is the one to write
+            sink.write(row)
+            n += 1
+        for ip in silent[i:]:
+            sink.write(_ip_result_row(ip, [], []))
+            n += 1
+    if not n:
+        path.write_text(IP_RESULT_HEADER, encoding="utf-8")
 
 
-def _tally(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for r in rows:
-        v = str(r.get(key))
-        out[v] = out.get(v, 0) + 1
-    return dict(sorted(out.items()))
+def _bump(counts: dict[str, int], value: Any) -> None:
+    key = str(value)
+    counts[key] = counts.get(key, 0) + 1
 
 
-def _summarize(cfg, splan, endpoints, rows, ep_rows, counts, st, jobs) -> dict[str, Any]:
-    named = [r for r in rows if r["hostname"]]
-    ips_verified = {r["target_ip"] for r in named if r["final_hostname_status"] == "verified"}
-    both = sum(1 for r in named if {"ptr"} < set(r["hostname_sources"]) and any(s.startswith("certificate") for s in r["hostname_sources"]))
-    sni_ok = {(x["target_ip"], x["port"]) for x in rows if x["sni_confirmation_outcome"] == tlsmod.OK}
-    sni_needed = sum(1 for r in ep_rows if r["tls_status"] == "failed" and (r["target_ip"], r["port"]) in sni_ok)
+class _SummaryTally:
+    """The figures of the run summary, accumulated one address at a time from its output rows."""
+
+    def __init__(self) -> None:
+        self.protocol: dict[str, int] = {}
+        self.tls_outcome: dict[str, int] = {}
+        self.final_status: dict[str, int] = {}
+        self.dns_status: dict[str, int] = {}
+        self.sni_result: dict[str, int] = {}
+        self.favicon_direct: dict[str, int] = {}
+        self.favicon_hostname: dict[str, int] = {}
+        self.tarpit_confidence: dict[str, int] = {}
+        self.ips_verified = 0
+        self.both = 0
+        self.sni_needed = 0
+        self.tarpit_suspect = 0
+        self.offhost = 0
+        self.wildcards = 0
+
+    def add(self, ep_rows: list[dict[str, Any]], rows: list[dict[str, Any]]) -> None:
+        named = [r for r in rows if r["hostname"]]
+        for r in ep_rows:
+            _bump(self.protocol, r["protocol"])
+            _bump(self.tls_outcome, r["tls_outcome"])
+            if r["direct_favicon_outcome"]:
+                _bump(self.favicon_direct, r["direct_favicon_outcome"])
+            if r["certificate_wildcards"]:
+                self.wildcards += 1
+        if any(r["tarpit_suspect"] for r in ep_rows):
+            self.tarpit_suspect += 1
+        confident = [r for r in ep_rows if r["tarpit_confidence"]]
+        if confident:
+            _bump(self.tarpit_confidence, confident[-1]["tarpit_confidence"])
+        for r in rows:
+            _bump(self.final_status, r["final_hostname_status"])
+        for r in named:
+            _bump(self.dns_status, r["dns_status"])
+            if r["sni_confirmation_attempted"]:
+                _bump(self.sni_result, r["sni_confirmation_result"])
+            if r["hostname_favicon_outcome"]:
+                _bump(self.favicon_hostname, r["hostname_favicon_outcome"])
+            if {"ptr"} < set(r["hostname_sources"]) and any(x.startswith("certificate") for x in r["hostname_sources"]):
+                self.both += 1
+        if any(r["final_hostname_status"] == "verified" for r in named):
+            self.ips_verified += 1
+        sni_ok = {(x["target_ip"], x["port"]) for x in rows if x["sni_confirmation_outcome"] == tlsmod.OK}
+        self.sni_needed += sum(1 for r in ep_rows if r["tls_status"] == "failed" and (r["target_ip"], r["port"]) in sni_ok)
+        self.offhost += len({(r["target_ip"], r["port"]) for r in ep_rows if r["direct_icon_offhost_hosts"]}
+                            | {(r["target_ip"], r["port"]) for r in named if r["hostname_icon_offhost_hosts"]})
+
+
+def _summarize(cfg, splan, tally: _SummaryTally, counts, st, jobs) -> dict[str, Any]:
+    def ordered(d: dict[str, int]) -> dict[str, int]:
+        return dict(sorted(d.items()))
     return {
         "counts": counts,
-        "protocol_by_endpoint": _tally(ep_rows, "protocol"),
-        "tls_outcome_by_endpoint": _tally(ep_rows, "tls_outcome"),
-        "final_hostname_status_by_row": _tally(rows, "final_hostname_status"),
-        "dns_status_by_row": _tally(named, "dns_status"),
-        "ips_with_verified_hostname": len(ips_verified),
+        "protocol_by_endpoint": ordered(tally.protocol),
+        "tls_outcome_by_endpoint": ordered(tally.tls_outcome),
+        "final_hostname_status_by_row": ordered(tally.final_status),
+        "dns_status_by_row": ordered(tally.dns_status),
+        "ips_with_verified_hostname": tally.ips_verified,
         "unique_ips": counts.get("l4_unique_ips", 0),
-        "hostname_rows_with_ptr_and_certificate": both,
-        "tls_failed_but_sni_handshake_ok": sni_needed,
-        "sni_confirmation_by_row": _tally([r for r in named if r["sni_confirmation_attempted"]], "sni_confirmation_result"),
-        "favicon_direct_by_endpoint": _tally([r for r in ep_rows if r["direct_favicon_outcome"]], "direct_favicon_outcome"),
-        "favicon_hostname_by_row": _tally([r for r in named if r["hostname_favicon_outcome"]], "hostname_favicon_outcome"),
-        "tarpit_suspect_ips": len({r["target_ip"] for r in ep_rows if r["tarpit_suspect"]}),
-        "tarpit_ips_by_confidence": _tally(list({r["target_ip"]: r for r in ep_rows if r["tarpit_confidence"]}.values()), "tarpit_confidence"),
-        "icons_declared_on_other_hosts": len({(r["target_ip"], r["port"]) for r in ep_rows if r["direct_icon_offhost_hosts"]}
-                                              | {(r["target_ip"], r["port"]) for r in named if r["hostname_icon_offhost_hosts"]}),
-        "wildcard_certificates": sum(1 for r in ep_rows if r["certificate_wildcards"]),
+        "hostname_rows_with_ptr_and_certificate": tally.both,
+        "tls_failed_but_sni_handshake_ok": tally.sni_needed,
+        "sni_confirmation_by_row": ordered(tally.sni_result),
+        "favicon_direct_by_endpoint": ordered(tally.favicon_direct),
+        "favicon_hostname_by_row": ordered(tally.favicon_hostname),
+        "tarpit_suspect_ips": tally.tarpit_suspect,
+        "tarpit_ips_by_confidence": ordered(tally.tarpit_confidence),
+        "icons_declared_on_other_hosts": tally.offhost,
+        "wildcard_certificates": tally.wildcards,
         "stage_seconds": st.timings, "stage_errors": st.errors, "stages_skipped": st.skipped,
         "tool_job_counts": _job_counts(jobs),
         "warnings": _warnings(cfg, splan, counts, st),

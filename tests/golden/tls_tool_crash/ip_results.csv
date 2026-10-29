@@ -1,0 +1,6 @@
+ip,responsive,open_ports,endpoints,ptr_names,verified_hostnames,other_hostnames,certificate_cns,tarpit_suspect,tarpit_confidence,tarpit_signals,tarpit_reason,document_titles,icon_offhost_hosts,favicon_sha256,unverified_name_favicon_sha256
+1.1.1.1,yes,443,443=tcp_only(tls_other_error),good.test,good.test,,,no,,,,,,,
+1.1.1.2,yes,443,443=tcp_only(tls_other_error),edge.shop.example,edge.shop.example,,,no,,,,,,,
+1.1.1.3,yes,80,80=http(tls_other_error)[http 200],,,,,no,,,,Shop,,659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2,
+1.1.1.4,yes,443,443=tcp_only(tls_other_error),,,,,no,,,,,,,
+1.1.1.5,yes,8080,8080=tcp_only(tls_other_error),,,,,no,,,,,,,

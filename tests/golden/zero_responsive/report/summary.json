@@ -1,0 +1,49 @@
+{
+  "counts": {
+    "l4_endpoints": 0,
+    "l4_per_port": {
+      "443": 0,
+      "80": 0,
+      "8080": 0
+    },
+    "l4_unique_ips": 0,
+    "sample_listed": 0,
+    "sample_targets_per_port": 370225,
+    "tarpit_ips_not_probed": 0
+  },
+  "dns_status_by_row": {},
+  "favicon_direct_by_endpoint": {},
+  "favicon_hostname_by_row": {},
+  "final_hostname_status_by_row": {},
+  "hostname_rows_with_ptr_and_certificate": 0,
+  "icons_declared_on_other_hosts": 0,
+  "ips_with_verified_hostname": 0,
+  "protocol_by_endpoint": {},
+  "sni_confirmation_by_row": {},
+  "stage_errors": {},
+  "stage_seconds": {
+    "candidates": 0.0,
+    "dns_forward": 0.0,
+    "favicon": 0.0,
+    "http_direct": 0.0,
+    "ptr": 0.0,
+    "sample_list": 0.0,
+    "sni_confirm": 0.0,
+    "tls_direct": 0.0,
+    "zmap": 0.0
+  },
+  "stages_skipped": [],
+  "tarpit_ips_by_confidence": {},
+  "tarpit_suspect_ips": 0,
+  "tls_failed_but_sni_handshake_ok": 0,
+  "tls_outcome_by_endpoint": {},
+  "tool_job_counts": {
+    "zmap": 3
+  },
+  "unique_ips": 0,
+  "warnings": [
+    "sample list has 0 targets but the plan expected 370225; check raw/zmap/sample-*.",
+    "ZERO responsive endpoints: check egress/NAT (WSL2), ZMap interface/gateway settings and raw/stderr/*zmap*.txt."
+  ],
+  "wildcard_certificates": 0
+}

@@ -1,0 +1,4 @@
+ip,responsive,open_ports,endpoints,ptr_names,verified_hostnames,other_hostnames,certificate_cns,tarpit_suspect,tarpit_confidence,tarpit_signals,tarpit_reason,document_titles,icon_offhost_hosts,favicon_sha256,unverified_name_favicon_sha256
+1.1.1.6,yes,80|443|8080,80=tcp_only(tls_reset); 443=tcp_only(tls_reset); 8080=tcp_only(tls_reset),,,,,yes,medium,silent_open_many,"open on 3/3 scanned ports, no TLS or HTTP answer on any",,,,
+1.1.1.7,yes,80|443|8080,80=not_attempted; 443=not_attempted; 8080=not_attempted,,,,,yes,high,zero_window,SYN-ACK advertised a zero TCP window,,,,
+1.1.1.8,yes,80,80=tcp_only(tls_reset),,,,,no,,,,,,,
