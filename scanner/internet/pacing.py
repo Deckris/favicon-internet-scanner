@@ -14,44 +14,55 @@ T = TypeVar("T")
 _SLICE = 0.5
 
 
-def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], float], sleep: Callable[[float], None]) -> bool:
-    """Sleep until ``deadline``; returns False if a stop condition fired first."""
+def _nap(seconds: float, sleep: Callable[[float], None], stop_event: threading.Event | None) -> None:
+    """Sleep, but wake at once if ``stop_event`` is set."""
+    if stop_event is None:
+        sleep(seconds)
+    else:
+        stop_event.wait(seconds)
+
+
+def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], float], sleep: Callable[[float], None],
+                 stop_event: threading.Event | None = None) -> bool:
+    """Sleep until ``deadline``; returns False if a stop condition fired first (checked before a due slot is granted)."""
     while True:
+        if killed() or (stop_event is not None and stop_event.is_set()):
+            return False
         remaining = deadline - now()
         if remaining <= 0:
             return True
-        if killed():
-            return False
-        sleep(min(_SLICE, remaining))
+        _nap(min(_SLICE, remaining), sleep, stop_event)
 
 
 class IpPacer:
     """Thread-safe: each address gets its next request slot at least ``min_interval`` after the previous one."""
 
     def __init__(self, min_interval: float, killed: Callable[[], bool] = lambda: False,
-                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 stop_event: threading.Event | None = None) -> None:
         self.min_interval = float(min_interval)
-        self._killed, self._now, self._sleep = killed, now, sleep
+        self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self._next: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def wait(self, ip: str) -> bool:
         """Block until a request to ``ip`` may start. False means a stop condition fired: do not send."""
         if self.min_interval <= 0:
-            return True
+            return not (self._killed() or (self._stop is not None and self._stop.is_set()))
         with self._lock:
             slot = max(self._now(), self._next.get(ip, 0.0))
             self._next[ip] = slot + self.min_interval
-        return _sleep_until(slot, self._killed, self._now, self._sleep)
+        return _sleep_until(slot, self._killed, self._now, self._sleep, self._stop)
 
 
 class Gap:
     """Enforces ``seconds`` between the end of one contacting step and the start of the next."""
 
     def __init__(self, seconds: float, killed: Callable[[], bool] = lambda: False,
-                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 stop_event: threading.Event | None = None) -> None:
         self.seconds = float(seconds)
-        self._killed, self._now, self._sleep = killed, now, sleep
+        self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self._last: float | None = None
 
     def mark(self) -> None:
@@ -59,8 +70,8 @@ class Gap:
 
     def wait(self) -> bool:
         if self.seconds <= 0 or self._last is None:
-            return True
-        return _sleep_until(self._last + self.seconds, self._killed, self._now, self._sleep)
+            return not (self._killed() or (self._stop is not None and self._stop.is_set()))
+        return _sleep_until(self._last + self.seconds, self._killed, self._now, self._sleep, self._stop)
 
 
 def split_rounds(items: Iterable[T], ip_of: Callable[[T], str]) -> list[list[T]]:
@@ -96,9 +107,10 @@ class ContactLedger:
     """
 
     def __init__(self, seconds: float, killed: Callable[[], bool] = lambda: False,
-                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 stop_event: threading.Event | None = None) -> None:
         self.seconds = float(seconds)
-        self._killed, self._now, self._sleep = killed, now, sleep
+        self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self._all: float | None = None
         self._last: dict[str, float] = {}
         self._busy: set[str] = set()
@@ -119,14 +131,14 @@ class ContactLedger:
     def wait(self, ips: Iterable[str]) -> bool:
         """Block until every address is due (no marking). False means a stop condition fired."""
         if self.seconds <= 0:
-            return True
+            return not (self._killed() or (self._stop is not None and self._stop.is_set()))
         deadline = self.ready_at(list(ips))
-        return deadline == float("-inf") or _sleep_until(deadline, self._killed, self._now, self._sleep)
+        return _sleep_until(deadline, self._killed, self._now, self._sleep, self._stop)
 
     def claim(self, ips: list[str], extra: Callable[[float], bool] | None = None) -> bool:
         """Block until every address is due and none is in flight, then mark them in flight. False on a stop."""
         while True:
-            if self._killed():
+            if self._killed() or (self._stop is not None and self._stop.is_set()):
                 return False
             with self._lock:
                 now = self._now()
@@ -136,7 +148,7 @@ class ContactLedger:
                     self._busy.update(ips)
                     return True
                 wait = max((self._due(ip) for ip in ips), default=now) - now if free and not due else _SLICE
-            self._sleep(min(_SLICE, max(wait, 0.01)))
+            _nap(min(_SLICE, max(wait, 0.01)), self._sleep, self._stop)
 
     def release(self, ips: list[str]) -> None:
         with self._lock:
