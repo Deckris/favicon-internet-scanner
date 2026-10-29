@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from scanner.internet import outputs
+from scanner.internet.runner import capture_stdout, iter_lines
 from scanner.models import CertificateInfo, ToolJob, ZGrabResult, stable_id
 
 # Go network errors name the local ephemeral port ("tcp 192.0.2.10:59130->");
@@ -221,7 +223,7 @@ def run_zgrab_batches(
         for chunk in _chunks(by_port[port], batch_size):
             job_id = stable_id("ZGRAB", scheme, mode, port, [(t.ip, t.hostname, t.port) for t in chunk])
             input_text = "".join(_input_line(t) + "\n" for t in chunk)
-            output_path = raw_dir / f"{job_id}.jsonl"
+            output_path = raw_dir / outputs.raw_name(job_id)
 
             command = [
                 "zgrab2", "http",
@@ -243,16 +245,13 @@ def run_zgrab_batches(
                 command.append("--use-https")
 
             started_at = datetime.now(UTC).isoformat()
-            result = executor(command, input=input_text, capture_output=True, text=True, check=False)
+            result, raw_sha256 = capture_stdout(executor, command, output_path, input=input_text,
+                                                capture_output=True, text=True, check=False)
             finished_at = datetime.now(UTC).isoformat()
-
-            stdout = getattr(result, "stdout", "") or ""
-            output_path.write_text(stdout, encoding="utf-8")
-            raw_sha256 = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
 
             chunk_results = [
                 _parse_line(line, job_id=job_id, scheme=scheme, mode=mode, port=port, observed_at=finished_at)
-                for line in stdout.split("\n")
+                for line in iter_lines(output_path)
                 if line.strip()
             ]
 

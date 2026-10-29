@@ -96,6 +96,7 @@ class ScanConfig:
     max_listed_targets: int = 1_000_000        # above this many targets per shard the full target list is not written
     egress_check_seconds: int = 120            # re-check the public IP this often during a run (0 = off)
     min_free_mib: int = 512                    # abort when free disk falls below this
+    stall_minutes: int = 30                    # abort when no stage makes progress for this long and no tool runs (0 = off)
     target_ips: tuple[str, ...] = ()           # known-targets mode: probe exactly these addresses, not a random sample
     target_hostnames: tuple[str, ...] = ()     # operator-supplied names, verified like any other candidate
     asn_ipasn: Path | None = None              # pyasn table (RouteViews snapshot); adds ASN and cloud/CDN columns to the rows
@@ -106,7 +107,13 @@ class ScanConfig:
 
 
 def sha256_file(path: Path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    with open(path, "rb") as fh:
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(fh, "sha256").hexdigest()
+        h = hashlib.sha256()
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+        return h.hexdigest()
 
 
 MIN_PACE_SECONDS = 15.0     # the pause an approval is assumed to require when it does not state one
@@ -333,7 +340,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     elif tr["contact"] not in f["user_agent"] and tr["info_url"] not in f["user_agent"]:
         raise ConfigError("fetch.user_agent must embed the transparency contact or info URL")
     out = _section(raw, "output", {"dir", "max_listed_targets"}, {"dir"})
-    ops = _section(raw, "operations", {"kill_switch_file", "egress_check_seconds", "min_free_mib"}, {"kill_switch_file"})
+    ops = _section(raw, "operations", {"kill_switch_file", "egress_check_seconds", "min_free_mib", "stall_minutes"}, {"kill_switch_file"})
     bins = _section({"binaries": raw.get("binaries") or {}}, "binaries", {"zmap", "zgrab2", "zdns"}, set())
 
     checksum = hashlib.sha256(json.dumps(raw, sort_keys=True, default=str).encode()).hexdigest()
@@ -350,6 +357,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         max_listed_targets=_int(out.get("max_listed_targets", 1_000_000), "output.max_listed_targets", 0, 10**9),
         egress_check_seconds=_int(ops.get("egress_check_seconds", 120), "operations.egress_check_seconds", 0, 3600),
         min_free_mib=_int(ops.get("min_free_mib", 512), "operations.min_free_mib", 16, 10**7),
+        stall_minutes=_int(ops.get("stall_minutes", 30), "operations.stall_minutes", 0, 10**5),
         exclusions_file=excl_file, exclusions_sha256=str(tp["exclusions_sha256"]).lower(),
         approval_file=rel(tp["approval_file"]),
         hostname_mode=hp["mode"], hostname_suffixes=suffixes, dns=dns,

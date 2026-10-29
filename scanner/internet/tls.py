@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from scanner.certificates import parse_der
+from scanner.internet import outputs
+from scanner.internet.runner import capture_stdout, iter_lines
 from scanner.models import CertificateInfo, ToolJob, stable_id
 
 Executor = Callable[..., Any]
@@ -166,7 +168,7 @@ def run_tls_batches(
     for port in sorted(by_port):
         for chunk in _chunks(by_port[port], cfg.measurement.zgrab_batch_size):
             job_id = stable_id("ZGRABTLS", mode, port, [(t[0], t[2]) for t in chunk])
-            out_path = raw_dir / f"{job_id}.jsonl"
+            out_path = raw_dir / outputs.raw_name(job_id)
             command = [
                 binary, "tls", "--port", str(port),
                 "--connect-timeout", f"{cfg.measurement.zgrab_connect_timeout}s",
@@ -178,17 +180,19 @@ def run_tls_batches(
             input_text = "".join(f"{ip},{host or ''},,{port}\n" for ip, port, host in chunk)
             try:
                 kw = {"timeout": timeout} if timeout is not None else {}
-                proc = executor(command, input=input_text, capture_output=True, text=True, check=False, **kw)
-                stdout = getattr(proc, "stdout", "") or ""
+                proc, raw_sha256 = capture_stdout(executor, command, out_path, input=input_text, capture_output=True,
+                                                  text=True, check=False, **kw)
                 code = getattr(proc, "returncode", None)
                 stderr = (getattr(proc, "stderr", "") or "").strip()
             except Exception as exc:
-                stdout, code, stderr = "", -1, f"{type(exc).__name__}: {exc}"
+                code, stderr = -1, f"{type(exc).__name__}: {exc}"
+                empty = outputs.compress_bytes(b"") if outputs.is_compressed(out_path) else b""      # a valid, empty file in either form
+                out_path.write_bytes(empty)
+                raw_sha256 = hashlib.sha256(empty).hexdigest()
             finished = datetime.now(UTC).isoformat()
-            out_path.write_text(stdout, encoding="utf-8")
             chunk_results: list[TlsResult] = []
             wanted = {(ip, host or None) for ip, _p, host in chunk}
-            for line in stdout.split("\n"):
+            for line in iter_lines(out_path):
                 if not line.strip():
                     continue
                 try:
@@ -215,7 +219,7 @@ def run_tls_batches(
             jobs.append(ToolJob(
                 job_id=job_id, tool="zgrab2", purpose=f"tls:{mode}:port={port}", command=tuple(command),
                 input_count=len(chunk), output_count=len(chunk_results), exit_code=code,
-                raw_path=str(out_path.relative_to(run_dir)), raw_sha256=hashlib.sha256(stdout.encode()).hexdigest(),
+                raw_path=str(out_path.relative_to(run_dir)), raw_sha256=raw_sha256,
                 started_at=started, finished_at=finished, error=error,
             ))
             results.extend(chunk_results)
