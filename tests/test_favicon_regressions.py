@@ -28,3 +28,15 @@ def test_large_png_is_refused_before_pixel_decode():
     Image.new("RGB", (1025, 1025)).save(buf, "PNG")
     result = fingerprint(buf.getvalue())
     assert not result.image_ok and result.decode_status == "pixel_limit"
+
+
+def test_acquire_with_parsed_declarations_matches_html():
+    from scanner.favicon_acquire import acquire_favicons
+    from scanner.favicon_discovery import parse_icon_declarations
+    page = "http://1.1.1.1:80/"
+    html = '<html><head><link rel="icon" href="/fav.png"><link rel="shortcut icon" href="/fav.png"></head></html>'
+    from_html = acquire_favicons(page, html, connect_ip="1.1.1.1", fetcher=FakeFetcher())
+    parsed = parse_icon_declarations(page, html, max_icons=4)
+    from_decls = acquire_favicons(page, None, connect_ip="1.1.1.1", fetcher=FakeFetcher(), declarations=parsed)
+    assert from_decls == from_html
+    assert from_decls[0] and from_decls[1]

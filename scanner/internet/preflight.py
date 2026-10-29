@@ -10,6 +10,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -76,6 +78,24 @@ def _zmap_has_file_cap(path: str, executor: Executor) -> bool:
     return rc == 0 and "cap_net_raw" in out
 
 
+def running_zmap_pids(names: tuple[str, ...] = ("zmap",), proc: Path = Path("/proc")) -> list[int] | None:
+    """Pids of processes whose command name is one of ``names`` (None where /proc is not available)."""
+    if not proc.is_dir():
+        return None
+    wanted = {n[:15] for n in names}            # comm is cut at 15 characters
+    me = os.getpid()
+    found: list[int] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            if (entry / "comm").read_text(encoding="utf-8", errors="replace").strip() in wanted:
+                found.append(int(entry.name))
+        except OSError:
+            continue
+    return sorted(found)
+
+
 def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = subprocess.run, offline: bool = False) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     versions: dict[str, str] = {}
@@ -99,6 +119,12 @@ def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = s
         checks.append(_check("host_resources", mem_gib >= 2 and cores >= 2, f"{cores} cores, {mem_gib:.1f} GiB RAM (want >= 2 cores and 2 GiB)", warn=True))
     except (OSError, StopIteration, ValueError):
         pass
+    others = running_zmap_pids(("zmap", Path(cfg.binaries.zmap).name))
+    if others is not None:
+        checks.append(_check("no_other_zmap", not others,
+                             "no other zmap process is running" if not others else
+                             f"zmap is already running on this host (pid {', '.join(map(str, others[:5]))}): a second sweep would exceed the approved "
+                             "packet rate and could contact an address twice within the minimum spacing. Wait for it or stop it"))
     checks.append(_check("kill_switch_clear", not Path(cfg.kill_switch_file).exists(), f"{cfg.kill_switch_file} must not exist at start"))
     checks.append(_check("sample_nonempty", splan.allowed_addresses > 0 and splan.targets_per_port >= 1,
                          f"{splan.allowed_addresses} allowed addresses, {splan.targets_per_port} targets/port"))
@@ -196,7 +222,9 @@ def current_egress(cfg: Any, executor: Executor = subprocess.run, timeout: float
     nic: the host's own interface carries the public address (no NAT, no VPN): trusted while that address is still there.
     off: the operator vouches for the address; nothing is checked.
     """
+    global _egress_max_stale
     mode = cfg.vantage.egress_check
+    _egress_max_stale = float(getattr(cfg, "egress_check_seconds", 0) or 0)
     if mode == "off":
         return cfg.vantage.public_egress_ip
     if mode == "nic":
@@ -204,29 +232,160 @@ def current_egress(cfg: Any, executor: Executor = subprocess.run, timeout: float
         owned = rc == 0 and re.search(rf"\b{re.escape(cfg.vantage.source_ipv4)}/", out) is not None
         return cfg.vantage.public_egress_ip if owned else None
     for url in cfg.vantage.egress_check_urls or DEFAULT_EGRESS_URLS:
-        seen = _public_ip(url, timeout)
+        seen = _public_ip(url, timeout, tuple(getattr(getattr(cfg, "dns", None), "resolvers", ()) or ()))
         if seen:
             return seen
     return None
 
 
-def _public_ip(url: str = "https://api.ipify.org", timeout: float = 10.0) -> str | None:
-    """The public IPv4 address this machine appears from, or None if it cannot be determined."""
+_EGRESS_DNS_TTL_MAX = 300.0
+_egress_dns: dict[str, tuple[float, list[str]]] = {}
+_egress_lock = threading.Lock()
+_egress_worker: threading.Thread | None = None
+_egress_max_stale = 0.0       # the run's egress check interval: a lookup younger than this stands in while a slow one lingers
+_egress_last: tuple[float, str] | None = None      # (monotonic time, address) of the last successful lookup
+
+
+def _split_nameserver(ns: str) -> tuple[str, int | None]:
+    """Host and optional port of a resolver entry: ``192.0.2.1``, ``192.0.2.1:53``, ``::1``, ``[::1]:53``."""
+    ns = ns.strip()
+    if ns.startswith("["):
+        host, _, rest = ns[1:].partition("]")
+        return host, int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else None
+    if ns.count(":") > 1:
+        return ns, None                      # bare IPv6 address: no port can be meant
+    host, _, port = ns.partition(":")
+    return host, int(port) if port.isdigit() else None
+
+
+def _resolve_a(host: str, resolvers: tuple[str, ...], lifetime: float) -> tuple[list[str], float]:
+    """IPv4 addresses for ``host`` and the record TTL, through dnspython with a hard lifetime (glibc getaddrinfo has no timeout)."""
+    import dns.resolver
+    r = dns.resolver.Resolver(configure=not resolvers)
+    if resolvers:
+        parsed = [_split_nameserver(ns) for ns in resolvers]
+        r.nameservers = [h for h, _p in parsed]
+        ports = {p for _h, p in parsed if p is not None}
+        if len(ports) == 1:
+            r.port = ports.pop()
+    r.timeout = min(lifetime, 3.0)
+    r.lifetime = lifetime
+    answer = r.resolve(host, "A")
+    return sorted({a.address for a in answer}), float(getattr(answer.rrset, "ttl", _EGRESS_DNS_TTL_MAX))
+
+
+def _egress_addresses(host: str, resolvers: tuple[str, ...], lifetime: float) -> list[str]:
     import ipaddress
-    import threading
-    import urllib.request
+    try:
+        return [str(ipaddress.IPv4Address(host))]
+    except ValueError:
+        pass
+    now = time.monotonic()
+    with _egress_lock:
+        hit = _egress_dns.get(host)
+    if hit and hit[0] > now:
+        return hit[1]
+    ips, ttl = _resolve_a(host, resolvers, lifetime)
+    if ips:
+        with _egress_lock:
+            _egress_dns[host] = (time.monotonic() + max(0.0, min(ttl, _EGRESS_DNS_TTL_MAX)), ips)
+    return ips
+
+
+def _fetch_text(url: str, resolvers: tuple[str, ...], timeout: float, _redirects: int = 1) -> str | None:
+    """GET ``url`` over a socket to a resolved address, every step bounded by one deadline. No proxy.
+
+    One redirect to the same host (the usual http to https upgrade) is followed; anything else is a failure.
+    """
+    import socket
+    import ssl
+    from urllib.parse import urljoin, urlsplit
+    u = urlsplit(url)
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return None
+    port = u.port or (443 if u.scheme == "https" else 80)
+    deadline = time.monotonic() + timeout
+
+    def left() -> float:
+        return max(deadline - time.monotonic(), 0.05)
+
+    addresses = _egress_addresses(u.hostname, resolvers, timeout / 2)[:3]
+    for ip in addresses:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            sock = socket.create_connection((ip, port), timeout=left())
+            try:
+                if u.scheme == "https":
+                    sock = ssl.create_default_context().wrap_socket(sock, server_hostname=u.hostname)
+                path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+                sock.settimeout(left())
+                req = (f"GET {path} HTTP/1.0\r\nHost: {u.netloc}\r\nUser-Agent: scanner-egress-check\r\n"
+                       f"Accept: text/plain\r\nConnection: close\r\n\r\n")
+                sock.sendall(req.encode("ascii"))
+                raw = b""
+                while len(raw) < 4096:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("egress lookup deadline")
+                    sock.settimeout(left())
+                    block = sock.recv(1024)
+                    if not block:
+                        break
+                    raw += block
+            finally:
+                sock.close()
+        except Exception:
+            continue
+        head, sep, body = raw.partition(b"\r\n\r\n")
+        status = head.split(b" ", 2)[1:2]
+        if sep and status == [b"200"]:
+            return body[:64].decode("ascii", "replace").strip()
+        if sep and status and status[0] in (b"301", b"302", b"307", b"308") and _redirects > 0:
+            for line in head.split(b"\r\n")[1:]:
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"location":
+                    target = urlsplit(urljoin(url, value.decode("ascii", "replace").strip()))
+                    if target.scheme in ("http", "https") and (target.hostname or "").lower() == u.hostname.lower():
+                        return _fetch_text(target.geturl(), resolvers, max(deadline - time.monotonic(), 0.05), _redirects - 1)
+                    break
+        return None
+    if addresses and u.hostname in _egress_dns:      # every cached address failed: look the name up afresh next time
+        with _egress_lock:
+            _egress_dns.pop(u.hostname, None)
+    return None
+
+
+def _public_ip(url: str = "https://api.ipify.org", timeout: float = 10.0, resolvers: tuple[str, ...] = (),
+               max_stale: float | None = None) -> str | None:
+    """The public IPv4 address this machine appears from, or None if it cannot be determined.
+
+    Names are resolved with dnspython under an explicit lifetime and the connection goes to the literal address,
+    so nothing here can block on glibc's resolver. At most one check thread exists; while an older one is still
+    running the answer is the last good one if that is younger than ``max_stale`` seconds, otherwise None.
+    """
+    import ipaddress
+    global _egress_worker, _egress_last
     found: list[str] = []
 
     def work() -> None:
+        global _egress_last
         try:
-            # No proxy: a proxy environment variable would report the proxy's address, not the scan path's.
-            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=timeout) as resp:   # noqa: S310
-                found.append(str(ipaddress.IPv4Address(resp.read(64).decode("ascii", "replace").strip())))
+            text = _fetch_text(url, resolvers, timeout)
+            if text:
+                found.append(str(ipaddress.IPv4Address(text)))
+                _egress_last = (time.monotonic(), found[0])
         except Exception:
             pass
 
-    t = threading.Thread(target=work, daemon=True)     # a hung DNS lookup must not freeze the run's stop checks
-    t.start()
+    with _egress_lock:
+        if _egress_worker is not None and _egress_worker.is_alive():
+            last = _egress_last
+            limit = _egress_max_stale if max_stale is None else max_stale
+            if last and limit > 0 and time.monotonic() - last[0] < limit:
+                return last[1]
+            return None
+        t = _egress_worker = threading.Thread(target=work, daemon=True)
+        t.start()
     t.join(timeout + 2)
     return found[0] if found else None
 

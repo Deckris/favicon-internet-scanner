@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import threading
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Iterable
@@ -96,6 +97,41 @@ def _is_ambiguous_ip_literal(candidate: str) -> bool:
     return True
 
 
+class _NetSet:
+    """Integer membership index over IPv4 networks.
+
+    All-/32 sets become a frozenset; anything else becomes sorted, merged
+    [start, end] intervals searched with bisect. IPv6 networks never contain
+    an IPv4 address and are skipped.
+    """
+
+    __slots__ = ("_hosts", "_starts", "_ends")
+
+    def __init__(self, nets: Iterable[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> None:
+        v4 = [net for net in nets if net.version == 4]
+        self._hosts: frozenset[int] | None = None
+        self._starts: list[int] = []
+        self._ends: list[int] = []
+        if all(net.prefixlen == 32 for net in v4):
+            self._hosts = frozenset(int(net.network_address) for net in v4)
+            return
+        spans = sorted((int(net.network_address), int(net.broadcast_address)) for net in v4)
+        for start, end in spans:
+            if self._ends and start <= self._ends[-1] + 1:
+                if end > self._ends[-1]:
+                    self._ends[-1] = end
+            else:
+                self._starts.append(start)
+                self._ends.append(end)
+
+    def __contains__(self, address: ipaddress.IPv4Address) -> bool:
+        value = int(address)
+        if self._hosts is not None:
+            return value in self._hosts
+        index = bisect_right(self._starts, value) - 1
+        return index >= 0 and value <= self._ends[index]
+
+
 class PolicyRefused(Exception):
     """Raised by ``require_ip`` when the central policy refuses a destination."""
 
@@ -114,6 +150,12 @@ class TargetPolicy:
     _deny_all: bool = False
     refusals: list[PolicyRefusal] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _population_index: _NetSet = field(init=False, repr=False, compare=False)
+    _exclusion_index: _NetSet = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._population_index = _NetSet(self._population)
+        self._exclusion_index = _NetSet(self._exclusions)
 
     # ---------------------------------------------------------------- factories
 
@@ -212,14 +254,13 @@ class TargetPolicy:
                 )
                 if not carved_out:
                     return self._record(stage, ip, reason, context)
-        for net in self._exclusions:
-            if v4 in net:
-                return self._record(stage, ip, "excluded_prefix", context)
+        if v4 in self._exclusion_index:
+            return self._record(stage, ip, "excluded_prefix", context)
         if not self._allow_special_use:
             for net in _LAB_TEST_NETS:
                 if v4 in net:
                     return self._record(stage, ip, "documentation_range", context)
-        if not any(v4 in net for net in self._population):
+        if v4 not in self._population_index:
             return self._record(stage, ip, "outside_population", context)
         return None
 

@@ -90,10 +90,13 @@ def acquire_favicons(
     max_icons: int = FAVICON_POLICY["max_icons"],
     fingerprint=default_fingerprint,
     on_icon=None,
+    declarations: list[FaviconDeclaration] | None = None,
 ) -> tuple[list[FaviconDeclaration], list[FaviconResource]]:
-    declarations: list[FaviconDeclaration] = (
-        parse_icon_declarations(page_url, html, max_icons=max_icons) if html is not None else []
-    )
+    """``declarations`` supplies the parsed declarations of a page, so the caller can drop its html first."""
+    if declarations is None:
+        declarations = parse_icon_declarations(page_url, html, max_icons=max_icons) if html is not None else []
+    else:
+        declarations = list(declarations)
     resources: list[FaviconResource] = []
     index_by_url: dict[str, int] = {}
     max_order = 0
