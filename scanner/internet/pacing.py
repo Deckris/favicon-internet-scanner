@@ -14,24 +14,27 @@ T = TypeVar("T")
 _SLICE = 0.5
 
 
-def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], float], sleep: Callable[[float], None]) -> bool:
-    """Sleep until ``deadline``; returns False if a stop condition fired first."""
+def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], float], sleep: Callable[[float], None],
+                 slice_seconds: float = _SLICE) -> bool:
+    """Sleep until ``deadline``; returns False if a stop condition fired first (checked every ``slice_seconds``)."""
     while True:
         remaining = deadline - now()
         if remaining <= 0:
             return True
         if killed():
             return False
-        sleep(min(_SLICE, remaining))
+        sleep(min(slice_seconds, remaining))
 
 
 class IpPacer:
     """Thread-safe: each address gets its next request slot at least ``min_interval`` after the previous one."""
 
     def __init__(self, min_interval: float, killed: Callable[[], bool] = lambda: False,
-                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+                 now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                 poll: float = _SLICE) -> None:
         self.min_interval = float(min_interval)
         self._killed, self._now, self._sleep = killed, now, sleep
+        self._poll = float(poll)       # how often a waiting caller looks at the stop condition; longer with many waiters
         self._next: dict[str, float] = {}
         self._lock = threading.Lock()
 
@@ -42,7 +45,7 @@ class IpPacer:
         with self._lock:
             slot = max(self._now(), self._next.get(ip, 0.0))
             self._next[ip] = slot + self.min_interval
-        return _sleep_until(slot, self._killed, self._now, self._sleep)
+        return _sleep_until(slot, self._killed, self._now, self._sleep, self._poll)
 
 
 class Gap:

@@ -30,6 +30,12 @@ def test_unknown_top_level_and_nested_keys_refused(tmp_path):
         load_config(_rewrite(tmp_path, lambda d: d["sample"].update(oops=1)))
 
 
+def test_favicon_workers_bound(tmp_path):
+    assert load_config(_rewrite(tmp_path, lambda d: d["favicon"].update(workers=256))).favicon.workers == 256
+    with pytest.raises(ConfigError, match="favicon.workers"):
+        load_config(_rewrite(tmp_path, lambda d: d["favicon"].update(workers=8193)))
+
+
 def test_placeholders_refused(tmp_path):
     with pytest.raises(ConfigError, match="placeholder"):
         load_config(_rewrite(tmp_path, lambda d: d["vantage"].update(id="REPLACE_ME")))

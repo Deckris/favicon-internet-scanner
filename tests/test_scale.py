@@ -395,6 +395,27 @@ def test_favicon_jobs_for_one_host_never_overlap():
     assert max(worst.values()) == 1 and len(worst) == 3                 # parallel across hosts, serial within one
 
 
+def test_favicon_jobs_for_one_address_never_overlap_across_ports():
+    import threading
+    import time
+    lock, active, worst = threading.Lock(), {}, {}
+
+    class Probe:
+        def fetch(self, url, *, connect_ip, kind, context=""):
+            with lock:
+                active[connect_ip] = active.get(connect_ip, 0) + 1
+                worst[connect_ip] = max(worst.get(connect_ip, 0), active[connect_ip])
+            time.sleep(0.02)
+            with lock:
+                active[connect_ip] -= 1
+            return FakeFetcher().fetch(url, connect_ip=connect_ip, kind=kind)
+    jobs = [{"scheme": "http" if port == 80 else "https", "ip": ip, "port": port, "hostname": h}
+            for ip in ("1.1.1.1", "1.1.1.2", "1.1.1.3") for port in (80, 443) for h in (None, "a.example")]
+    out = fav.run_favicon_stage(Probe(), jobs, workers=8, max_icons=2)
+    assert [(r["ip"], r["port"], r["hostname"]) for r in out] == [(j["ip"], j["port"], j["hostname"]) for j in jobs]
+    assert max(worst.values()) == 1 and len(worst) == 3
+
+
 def test_favicon_stage_deadline_marks_the_shard_incomplete(tmp_path):
     import time
 

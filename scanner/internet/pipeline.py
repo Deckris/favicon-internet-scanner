@@ -45,7 +45,7 @@ from scanner.zmap_runner import run_zmap
 
 Executor = Callable[..., Any]
 SCHEMA_VERSION = 1
-INSTRUMENT_VERSION = "scanner.2"
+INSTRUMENT_VERSION = "scanner.3"
 WEB_PROTOCOLS = ("https", "http")
 # TLS outcomes after which a plain-HTTP probe is still worth sending: the port did not prove it speaks TLS.
 HTTP_FALLBACK = frozenset({tlsmod.NOT_TLS, tlsmod.CLOSED, tlsmod.RESET, tlsmod.TIMEOUT, tlsmod.OTHER})
@@ -264,7 +264,7 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     pace = cfg.measurement.min_seconds_between_probes_per_ip
     gap = pacing.Gap(pace, killed)             # pause between ZMap port runs
     ledger = pacing.ContactLedger(pace, killed)    # last contact per address, shared by every target-facing step
-    pacer = pacing.IpPacer(pace, killed)       # pause between HTTP requests to one address
+    pacer = pacing.IpPacer(pace, killed, poll=2.0)       # pause between HTTP requests to one address
     gateway_mac = cfg.vantage.gateway_mac or report.get("gateway_mac")
     # Stub manifest before the first probe: if the process is killed hard (OOM, WSL shutdown) the run still
     # leaves evidence of what was started and the run-once guard still sees it.
@@ -475,13 +475,22 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
 
     # ---- Stage 3: plain HTTP only where TLS did not prove the port speaks TLS ---------------
     http_res: dict[tuple[str, int], Any] = {}
+    http_docs: dict[tuple[str, int], dict[str, Any]] = {}      # compact pages for the favicon stage (favicon.reuse_http_document)
+    http_docs_lock = threading.Lock()
+
+    def keep_document(line: str, port: int) -> None:
+        got = fav.capture_http_document(line, port=port, max_icons=cfg.favicon.max_icons_per_page)
+        if got is not None:
+            with http_docs_lock:
+                http_docs[got[0]] = got[1]
 
     def http_stage() -> None:
         targets = [ZGrabTarget(ip, None, port) for ip, port in endpoints
                    if (r := tls_direct.get((ip, port))) is not None and r.outcome in HTTP_FALLBACK]
         def one(batch):
             return run_zgrab_batches(batch, scheme="http", mode="direct_ip", cfg=cfgview, policy=policy,
-                                     run_dir=run_dir, executor=executor)
+                                     run_dir=run_dir, executor=executor,
+                                     document_sink=keep_document if cfg.favicon.enabled and cfg.favicon.reuse_http_document else None)
         for j, res in pacing.paced_batches(targets, lambda t: t.ip, ledger, one, batch_size=m.zgrab_batch_size,
                                            workers=m.zgrab_parallel_batches):
             jobs.extend(j)
@@ -666,13 +675,16 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
             counts["favicon_lookups_resumed"] = len(earlier)
         try:
             for rec in fav.run_favicon_stage(f, fjobs, workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page, killed=stop,
-                                            icon_store=store, on_record=record_log.append, done=earlier):
+                                            icon_store=store, on_record=record_log.append, done=earlier,
+                                            selection=cfg.favicon.icon_selection, fallback=cfg.favicon.fallback,
+                                            documents=http_docs, max_document_bytes=cfg.fetch.max_document_bytes):
                 fav_res[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
             skipped = sum(1 for r in fav_res.values() if r.get("favicon_outcome") == "skipped_kill_switch")
             if time.monotonic() > deadline and skipped:
                 st.errors["favicon_deadline"] = f"stage cap of {cfg.favicon.stage_max_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"
         finally:
             record_log.close()
+            counts["favicon_documents_reused"] = sum(1 for r in fav_res.values() if r.get("document_source") == "reused")
             if store is not None:
                 counts["favicon_images_stored"] = len(store)
                 counts["favicon_images_indexed"] = store.write_index(list(fav_res.values()))
@@ -707,6 +719,9 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         checksums["normalized/endpoints.jsonl"] = write_jsonl(normalized / "endpoints.jsonl", ep_rows)
         checksums["normalized/hostname_resolution.jsonl"] = write_jsonl(normalized / "hostname_resolution.jsonl", rows)
         checksums["normalized/tool_jobs.jsonl"] = write_jsonl(normalized / "tool_jobs.jsonl", jobs)
+        if http_docs:
+            checksums["normalized/http_documents.jsonl"] = write_jsonl(
+                normalized / "http_documents.jsonl", [{"ip": ip, "port": port, **doc} for (ip, port), doc in sorted(http_docs.items())])
         if cfg.favicon.offhost.enabled:
             checksums["normalized/offhost_icon_fetches.jsonl"] = write_jsonl(normalized / "offhost_icon_fetches.jsonl", offhost_log)
         _write_csv(normalized / "hostname_resolution.csv", rows)
@@ -841,6 +856,7 @@ def _build_rows(cfg, endpoints, tls_direct, http_res, protocol_of, ptr_by_ip, pt
             "direct_favicon_sha256": direct_fav.get("favicon_sha256"), "direct_favicon_file": direct_fav.get("favicon_file"),
             "direct_favicon_mmh3": direct_fav.get("favicon_mmh3"), "direct_favicon_md5": direct_fav.get("favicon_md5"), "direct_favicon_url": direct_fav.get("favicon_url"),
             "direct_document_outcome": direct_fav.get("document_outcome"), "direct_document_status": direct_fav.get("http_status"),
+            "direct_document_source": direct_fav.get("document_source"),
             "direct_document_title": direct_fav.get("document_title"), "direct_document_body_sha256": direct_fav.get("document_body_sha256"),
             "direct_icon_declared_count": direct_fav.get("icon_declared_count"), "direct_icon_offhost_hosts": direct_fav.get("icon_offhost_hosts") or [],
             "direct_icon_embedded_images": direct_fav.get("icon_embedded_images"),

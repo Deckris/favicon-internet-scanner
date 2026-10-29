@@ -11,7 +11,7 @@ from dataclasses import replace
 from urllib.parse import urlsplit
 
 from pipeline.favicon_hash import fingerprint as default_fingerprint
-from scanner.favicon_discovery import FAVICON_POLICY, decode_data_uri, parse_icon_declarations
+from scanner.favicon_discovery import FAVICON_POLICY, decode_data_uri, parse_icon_declarations, rank_icon_declarations
 from scanner.models import FaviconDeclaration, FaviconResource
 
 
@@ -81,6 +81,10 @@ def _decode_resource(data_uri: str, order: int, *, fingerprint, on_icon=None) ->
     )
 
 
+SELECTION_MODES = ("all", "first_image", "browser")
+FALLBACK_MODES = ("always_if_no_image", "only_if_undeclared")
+
+
 def acquire_favicons(
     page_url: str,
     html: str | None,
@@ -90,22 +94,35 @@ def acquire_favicons(
     max_icons: int = FAVICON_POLICY["max_icons"],
     fingerprint=default_fingerprint,
     on_icon=None,
+    selection: str = "all",
+    fallback: str = "always_if_no_image",
+    declarations: list[FaviconDeclaration] | None = None,
 ) -> tuple[list[FaviconDeclaration], list[FaviconResource]]:
-    declarations: list[FaviconDeclaration] = (
-        parse_icon_declarations(page_url, html, max_icons=max_icons) if html is not None else []
-    )
+    """``selection``: ``all`` fetches every selected declaration in page order; ``first_image`` does the same but
+    stops after the first icon that decodes to an image; ``browser`` tries the declarations in browser order
+    (see ``rank_icon_declarations``) and stops after the first image. ``fallback``: ``always_if_no_image``
+    probes ``/favicon.ico`` whenever no icon decoded; ``only_if_undeclared`` probes it only when the page declared
+    no icon to try. Every declaration is returned whichever icons were fetched. ``declarations`` supplies the
+    parsed declarations of a page that was fetched earlier; ``html`` is then not parsed again.
+    """
+    if selection not in SELECTION_MODES:
+        raise ValueError(f"unknown icon selection {selection!r}")
+    if fallback not in FALLBACK_MODES:
+        raise ValueError(f"unknown fallback mode {fallback!r}")
+    if declarations is None:
+        declarations = parse_icon_declarations(page_url, html, max_icons=max_icons) if html is not None else []
+    else:
+        declarations = list(declarations)
     resources: list[FaviconResource] = []
     index_by_url: dict[str, int] = {}
-    max_order = 0
+    max_order = max((decl.order for decl in declarations), default=0)
 
-    for decl in declarations:
-        max_order = max(max_order, decl.order)
-        if decl.policy_status == "duplicate" and decl.resolved_url in index_by_url:
-            idx = index_by_url[decl.resolved_url]
-            resources[idx] = _append_order(resources[idx], decl.order)
-            continue
-        if decl.policy_status != "selected":
-            continue
+    selected = [decl for decl in declarations if decl.policy_status == "selected"]
+    if selection == "browser":
+        selected = rank_icon_declarations(selected)
+    for decl in selected:
+        if selection != "all" and any(_resource_has_image(resource) for resource in resources):
+            break
         assert decl.resolved_url is not None
         if decl.kind == "data":
             resource = _decode_resource(decl.resolved_url, decl.order, fingerprint=fingerprint, on_icon=on_icon)
@@ -113,8 +130,15 @@ def acquire_favicons(
             resource = _fetch_resource(decl.resolved_url, decl.order, page_url=page_url, connect_ip=connect_ip, fetcher=fetcher, fingerprint=fingerprint, on_icon=on_icon)
         index_by_url[decl.resolved_url] = len(resources)
         resources.append(resource)
+    for decl in declarations:
+        if decl.policy_status == "duplicate" and decl.resolved_url in index_by_url:
+            idx = index_by_url[decl.resolved_url]
+            resources[idx] = _append_order(resources[idx], decl.order)
 
-    if not any(_resource_has_image(resource) for resource in resources):
+    needs_fallback = not any(_resource_has_image(resource) for resource in resources)
+    if fallback == "only_if_undeclared" and selected:
+        needs_fallback = False
+    if needs_fallback:
         fallback_url = _favicon_ico_url(page_url)
         order = max_order + 1
         if fallback_url in index_by_url:
@@ -139,4 +163,4 @@ def first_icon_only(resources: list[FaviconResource]) -> list[FaviconResource]:
     return resources[:1]
 
 
-__all__ = ["acquire_favicons", "first_icon_only"]
+__all__ = ["acquire_favicons", "first_icon_only", "SELECTION_MODES", "FALLBACK_MODES"]

@@ -24,6 +24,7 @@ from typing import Any
 import yaml
 
 from pipeline.config_schema import Approval, ApprovalError, load_approval, require_operation
+from scanner.favicon_acquire import FALLBACK_MODES, SELECTION_MODES
 from scanner.internet.zmap_compat import packet_rate_args, supported
 
 OP_RESOLUTION = "hostname_resolution"
@@ -148,6 +149,12 @@ def _int(value: Any, name: str, lo: int, hi: int) -> int:
 def _bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{name} must be true or false")
+    return value
+
+
+def _choice(value: Any, name: str, allowed: tuple[str, ...]) -> str:
+    if value not in allowed:
+        raise ConfigError(f"{name} must be one of: {', '.join(allowed)}")
     return value
 
 
@@ -315,7 +322,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     asn_raw = _section({"asn": raw.get("asn") or {"ipasn": ""}}, "asn", {"ipasn"}, set())
     sc = _section(raw, "sni_confirm", {"enabled", "max_per_endpoint"})
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
-                                   "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images"},
+                                   "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images",
+                                   "icon_selection", "fallback", "max_active_requests", "reuse_http_document"},
                   {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page"})
     oh = _section({"offhost_icons": fv.get("offhost_icons") or {"enabled": False}}, "offhost_icons",
                   {"enabled", "max_total_fetches", "max_per_host", "min_interval_seconds", "max_bytes"}, {"enabled"})
@@ -357,10 +365,14 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         sni_confirm=SimpleNamespace(enabled=bool(sc["enabled"]), max_per_endpoint=_int(sc["max_per_endpoint"], "sni_confirm.max_per_endpoint", 1, 20)),
         favicon=SimpleNamespace(
             enabled=bool(fv["enabled"]), max_hostnames_per_endpoint=_int(fv["max_hostnames_per_endpoint"], "favicon.max_hostnames_per_endpoint", 0, 20),
-            workers=_int(fv["workers"], "favicon.workers", 1, 512), max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
+            workers=_int(fv["workers"], "favicon.workers", 1, 8192), max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
             store_images=_bool(fv.get("store_images", True), "favicon.store_images"),
             stage_max_seconds=_int(fv.get("stage_max_seconds", 7200), "favicon.stage_max_seconds", 1, 86400),
             max_unverified_names_per_endpoint=_int(fv.get("max_unverified_names_per_endpoint", 0), "favicon.max_unverified_names_per_endpoint", 0, 10),
+            icon_selection=_choice(fv.get("icon_selection", "first_image"), "favicon.icon_selection", SELECTION_MODES),
+            fallback=_choice(fv.get("fallback", "always_if_no_image"), "favicon.fallback", FALLBACK_MODES),
+            max_active_requests=_int(fv.get("max_active_requests", 512), "favicon.max_active_requests", 1, 8192),
+            reuse_http_document=_bool(fv.get("reuse_http_document", False), "favicon.reuse_http_document"),
             offhost=SimpleNamespace(
                 enabled=oh["enabled"],
                 max_total_fetches=_int(oh.get("max_total_fetches", 500), "favicon.offhost_icons.max_total_fetches", 1, 100000),

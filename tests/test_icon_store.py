@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scanner.internet import favicon as fav
 from scanner.internet import icon_store, pipeline, refetch
@@ -107,6 +108,27 @@ def test_refetch_saves_images_and_matches_the_first_run(source):
     assert index and all((out / e["file"]).is_file() for e in index)
 
 
+def _with_favicon(tmp_path, **changes):
+    data = yaml.safe_load((tmp_path / "scanner.yaml").read_text(encoding="utf-8"))
+    data["favicon"].update(changes)
+    out = tmp_path / "variant.yaml"
+    out.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return load_config(out)
+
+
+def test_refetch_accepts_a_run_that_differs_only_in_workers_and_stage_limit(source, tmp_path):
+    _, run_dir = source
+    faster = _with_favicon(tmp_path, workers=128, stage_max_seconds=600)
+    assert refetch.plan(faster, run_dir, all_jobs=True)["jobs_to_run"] >= 1
+
+
+def test_refetch_still_refuses_when_another_favicon_setting_differs(source, tmp_path):
+    _, run_dir = source
+    other = _with_favicon(tmp_path, max_icons_per_page=3)
+    with pytest.raises(ConfigError, match="different config"):
+        refetch.plan(other, run_dir, all_jobs=False)
+
+
 def test_refetch_refuses_a_run_from_a_different_config(source, tmp_path_factory):
     _, run_dir = source
     other = load_config(write_config(tmp_path_factory.mktemp("other"), run_label="another"))
@@ -134,7 +156,7 @@ def test_record_log_ignores_a_line_cut_short_by_a_kill(tmp_path):
 def test_stage_reuses_earlier_records_and_reports_only_new_ones(monkeypatch):
     fetched = []
 
-    def probe(fetcher, *, scheme, ip, port, hostname, max_icons, icon_store=None):
+    def probe(fetcher, *, scheme, ip, port, hostname, max_icons, icon_store=None, **_):
         fetched.append((ip, port, hostname))
         return {"favicon_outcome": "none_declared"}
     monkeypatch.setattr(fav, "probe_identity", probe)
@@ -171,8 +193,8 @@ def test_refetch_ignores_a_changed_worker_count_but_not_other_settings():
     assert refetch._measurement_fingerprint(base) != refetch._measurement_fingerprint(other)
 
 
-def test_favicon_workers_may_go_up_to_512(tmp_path):
+def test_favicon_workers_may_go_up_to_8192(tmp_path):
     favicon = {"enabled": True, "max_hostnames_per_endpoint": 3, "max_icons_per_page": 4}
-    assert load_config(write_config(tmp_path, favicon={**favicon, "workers": 512})).favicon.workers == 512
+    assert load_config(write_config(tmp_path, favicon={**favicon, "workers": 8192})).favicon.workers == 8192
     with pytest.raises(ConfigError):
-        load_config(write_config(tmp_path, favicon={**favicon, "workers": 513}))
+        load_config(write_config(tmp_path, favicon={**favicon, "workers": 8193}))

@@ -171,4 +171,40 @@ def parse_icon_declarations(page_url: str, html: str, *, max_icons: int = FAVICO
     return declarations
 
 
-__all__ = ["FAVICON_POLICY", "parse_icon_declarations", "decode_data_uri"]
+_PREFERRED_SIZE = 32
+_UNDECLARED_SIZE_DISTANCE = 16
+
+
+def _size_distance(sizes: str | None) -> int:
+    """Distance of the declared sizes from the preferred tab-icon size; ``any`` (scalable) counts as a perfect fit."""
+    if not sizes:
+        return _UNDECLARED_SIZE_DISTANCE
+    best: int | None = None
+    for token in sizes.lower().split():
+        if token == "any":
+            return 0
+        width, _, height = token.partition("x")
+        if width.isdigit() and height.isdigit():
+            distance = abs(int(width) - _PREFERRED_SIZE)
+            best = distance if best is None else min(best, distance)
+    return _UNDECLARED_SIZE_DISTANCE if best is None else best
+
+
+def _type_penalty(decl: FaviconDeclaration) -> int:
+    declared = (decl.type or "").strip().lower()
+    return 1 if declared and not declared.startswith("image/") else 0
+
+
+def rank_icon_declarations(declarations: list[FaviconDeclaration]) -> list[FaviconDeclaration]:
+    """Selected declarations in the order a browser would try them for the tab icon.
+
+    Plain ``icon`` links come before ``apple-touch-icon`` links. Within a group an image type comes before a
+    non-image type, then the declared size closest to 32 px (``any`` is a perfect fit, undeclared sizes sit in
+    between), and between equals the later declaration in document order wins, as in the HTML Living Standard.
+    ``media`` is not evaluated. Declarations that are not ``selected`` are dropped.
+    """
+    chosen = [d for d in declarations if d.policy_status == "selected"]
+    return sorted(chosen, key=lambda d: ("apple-touch" in (d.rel or ""), _type_penalty(d), _size_distance(d.sizes), -d.order))
+
+
+__all__ = ["FAVICON_POLICY", "parse_icon_declarations", "decode_data_uri", "rank_icon_declarations"]

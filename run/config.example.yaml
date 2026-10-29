@@ -74,6 +74,18 @@ favicon:
   max_hostnames_per_endpoint: 3
   workers: 64
   max_icons_per_page: 4
+  # Which declared icons to fetch. first_image: in page order, stop after the first one that decodes as an image
+  # (the stored icon is the same as with all, with fewer requests). all: fetch every declared icon.
+  # browser: try the icons in browser order (plain icon links first, size nearest 32 px) and stop after the first image.
+  # icon_selection: first_image
+  # When to request /favicon.ico. always_if_no_image: whenever no declared icon decoded.
+  # only_if_undeclared: only when the page declares no icon (or the page itself could not be fetched).
+  # fallback: always_if_no_image
+  # Requests the favicon stage may have on the wire at once. Workers waiting out the pause hold no connection.
+  # max_active_requests: 512
+  # Use the page the HTTP stage already fetched for a plain-HTTP bare-IP address instead of requesting it again.
+  # Pages that redirected, were compressed, were not 200 HTML, or are close to the read limit are fetched as before.
+  # reuse_http_document: false
   # Keep every icon that decodes as an image under <run>/favicons/ (named by sha256) with an index.jsonl.
   # store_images: true
   # Also request the page under candidate names that did NOT verify (Host/SNI only, same scanned ip:port). 0 = off.

@@ -190,7 +190,10 @@ def run_zgrab_batches(
     policy: Any,
     run_dir: Path,
     executor: Executor = subprocess.run,
+    document_sink: Callable[[str, int], None] | None = None,
 ) -> tuple[list[ToolJob], list[ZGrabResult]]:
+    """``document_sink(line, port)`` is called for every output line, so a caller can keep what it needs from the
+    response body without the body being held in the results."""
     if mode == "hostname_aware":
         for target in targets:
             if not target.hostname:
@@ -255,6 +258,10 @@ def run_zgrab_batches(
                 for line in stdout.split("\n")
                 if line.strip()
             ]
+            if document_sink is not None:
+                for line in stdout.split("\n"):
+                    if line.strip():
+                        document_sink(line, port)
 
             exit_code = getattr(result, "returncode", None)
             error = None

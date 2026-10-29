@@ -163,7 +163,7 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
             f = fetcher or fav.make_fetcher(
                 cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), {(j["ip"], j["port"]) for j in jobs},
                 exclusions=exclusions, killed=st.killed, state_path=run_dir / "offhost_state.json",
-                pacer=pacing.IpPacer(cfg.measurement.min_seconds_between_probes_per_ip, st.killed))
+                pacer=pacing.IpPacer(cfg.measurement.min_seconds_between_probes_per_ip, st.killed, poll=2.0))
             deadline = time.monotonic() + cfg.favicon.stage_max_seconds
 
             def stop() -> bool:
@@ -171,7 +171,9 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
             try:
                 records.extend(fav.run_favicon_stage(f, jobs, workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page,
                                                      killed=stop, icon_store=store,
-                                                     on_record=record_log.append, done=earlier))
+                                                     on_record=record_log.append, done=earlier,
+                                                     selection=cfg.favicon.icon_selection, fallback=cfg.favicon.fallback,
+                                                     max_document_bytes=cfg.fetch.max_document_bytes))
                 skipped = sum(1 for r in records if r.get("favicon_outcome") == "skipped_kill_switch")
                 if skipped:
                     st.errors["favicon_incomplete"] = f"{skipped} of {len(jobs)} lookups skipped (stage cap or stop condition)"

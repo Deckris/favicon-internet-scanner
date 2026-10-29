@@ -6,9 +6,11 @@ redirect can never lead the run to a host outside the sample.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
@@ -17,9 +19,47 @@ from typing import Any
 import dns.resolver
 
 from scanner.internet.enrich import document_facts, icon_declaration_facts
+from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
+from scanner.favicon_discovery import parse_icon_declarations
+from scanner.models import FaviconDeclaration
 from scanner.safety import HostnamePolicyInput, ProductionPolicyInput, TargetPolicy
 from scanner.web_fetch import FetchLimits, WebFetcher, _is_ip_literal, _RequestOutcome
+
+
+class FingerprintCache:
+    """Remembers the fingerprint of icon bodies already decoded, keyed by content digest.
+
+    The same few icons (hosting defaults, device logos, CMS marks) turn up on a large share of the addresses of a
+    shard, and decoding plus hashing one costs several milliseconds of CPU that all workers share. The fingerprint
+    is a pure function of the bytes, so reusing it changes nothing in the records.
+    """
+
+    def __init__(self, capacity: int = 2048) -> None:
+        self._capacity = max(1, capacity)
+        self._items: OrderedDict[tuple[int, bytes], Any] = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = self.misses = 0
+
+    def __call__(self, data: bytes) -> Any:
+        key = (len(data), hashlib.sha256(data).digest())
+        with self._lock:
+            found = self._items.get(key)
+            if found is not None:
+                self._items.move_to_end(key)
+                self.hits += 1
+                return found
+            self.misses += 1
+        result = compute_fingerprint(data)
+        with self._lock:
+            self._items[key] = result
+            self._items.move_to_end(key)
+            while len(self._items) > self._capacity:
+                self._items.popitem(last=False)
+        return result
+
+
+_FINGERPRINTS = FingerprintCache()
 
 
 def fetch_policy(cfg: Any, sampled_ips: list[str]) -> TargetPolicy:
@@ -79,10 +119,13 @@ class GuardedFetcher(WebFetcher):
     port the approval does not cover. Decode errors from hostile bodies become a recorded outcome.
     """
 
-    def __init__(self, *args: Any, allowed_endpoints: set[tuple[str, int]], pacer: Any = None, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, allowed_endpoints: set[tuple[str, int]], pacer: Any = None,
+                 max_active_requests: int | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.allowed_endpoints = frozenset(allowed_endpoints)
         self.pacer = pacer
+        # Workers that wait out the pause hold no socket; this bounds the requests actually on the wire.
+        self._active = threading.BoundedSemaphore(max_active_requests) if max_active_requests else None
 
     @staticmethod
     def _outcome(outcome: str, connect_ip: str, hostname: str, port: int, scheme: str) -> _RequestOutcome:
@@ -98,7 +141,10 @@ class GuardedFetcher(WebFetcher):
         if self.pacer is not None and not self.pacer.wait(connect_ip):
             return self._outcome("skipped_kill_switch", connect_ip, hostname, port, parts.scheme)
         try:
-            return super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+            if self._active is None:
+                return super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+            with self._active:
+                return super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
         except Exception as exc:       # zlib.error / brotli.error / anything a hostile body provokes
             return self._outcome("decode_error" if "error" in type(exc).__name__.lower() else "fetch_error",
                                  connect_ip, hostname, port, parts.scheme)
@@ -260,12 +306,58 @@ def _make_local_fetcher(cfg: Any, policy: TargetPolicy, resolver: Any, allowed_e
         document_limits=_limits(cfg, cfg.fetch.max_document_bytes),
         favicon_limits=_limits(cfg, cfg.fetch.max_favicon_bytes),
         retry_statuses=cfg.fetch.retry_statuses, max_retries=cfg.fetch.max_retries,
-        retry_after_cap=cfg.fetch.retry_after_cap,
+        retry_after_cap=cfg.fetch.retry_after_cap, max_active_requests=getattr(cfg.favicon, "max_active_requests", None),
     )
 
 
 def _is_html(content_type: str | None) -> bool:
     return bool(content_type) and "html" in content_type.lower()
+
+
+# The HTTP stage reads at most 256 KB of a body, so a page near that size may have been cut off and is fetched again.
+MAX_REUSED_BODY_BYTES = 200_000
+
+
+def _header(headers: Any, name: str) -> str | None:
+    value = (headers or {}).get(name)
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value if isinstance(value, str) and value else None
+
+
+def capture_http_document(line: str, *, port: int, max_icons: int) -> tuple[tuple[str, int], dict[str, Any]] | None:
+    """Compact record of a plain-HTTP bare-IP page from one output line of the HTTP stage, or None.
+
+    Keeps what the favicon stage needs (status, headers it checks, title, body hash, parsed icon declarations) and
+    none of the body, so a shard does not hold its pages in memory.
+    """
+    try:
+        obj = json.loads(line)
+        http = (obj.get("data") or {}).get("http") or {}
+        response = (http.get("result") or {}).get("response") or {}
+        body, ip = response.get("body"), obj.get("ip")
+        if http.get("status") != "success" or obj.get("domain") or not ip or not isinstance(body, str):
+            return None
+        raw = body.encode("utf-8")
+        headers = response.get("headers")
+        url = f"http://{ip}:{port}/"
+        return (ip, port), {
+            "http_status": response.get("status_code"), "content_type": _header(headers, "content_type"),
+            "content_encoding": _header(headers, "content_encoding"), "location": _header(headers, "location"),
+            "body_bytes": len(raw), "document_title": document_facts(body, raw)["document_title"],
+            "document_body_sha256": hashlib.sha256(raw).hexdigest() if raw else None,
+            "declarations": [d.as_dict() for d in parse_icon_declarations(url, body, max_icons=max_icons)],
+        }
+    except Exception:
+        return None
+
+
+def reusable_document(doc: dict[str, Any] | None, max_document_bytes: int) -> bool:
+    """A stored page stands in for the page fetch only when that fetch would have returned the same document."""
+    return bool(
+        doc and doc.get("http_status") == 200 and not doc.get("location") and not doc.get("content_encoding")
+        and _is_html(doc.get("content_type")) and 0 < (doc.get("body_bytes") or 0) <= min(MAX_REUSED_BODY_BYTES, max_document_bytes)
+    )
 
 
 def _favicon_outcome(first: Any, image: Any) -> str:
@@ -288,13 +380,18 @@ def _display_url(url: str) -> str:
 
 
 def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, hostname: str | None, max_icons: int,
-                   icon_store: Any = None) -> dict[str, Any]:
-    """Fetch ``scheme://host:port/`` through ``ip`` and acquire its favicon. Never raises."""
+                   icon_store: Any = None, selection: str = "all", fallback: str = "always_if_no_image",
+                   stored_document: dict[str, Any] | None = None, max_document_bytes: int = 0) -> dict[str, Any]:
+    """Fetch ``scheme://host:port/`` through ``ip`` and acquire its favicon. Never raises.
+
+    ``stored_document`` (see ``capture_http_document``) replaces the page fetch for a plain-HTTP bare-IP job when
+    ``reusable_document`` accepts it; the record then says ``document_source: reused``.
+    """
     host = hostname or ip
     url = f"{scheme}://{host}:{port}/"
     record: dict[str, Any] = {
         "kind": "hostname" if hostname else "direct_ip", "url": url, "scheme": scheme, "hostname": hostname,
-        "document_outcome": None, "http_status": None, "final_url": None, "content_type": None,
+        "document_outcome": None, "document_source": "fetched", "http_status": None, "final_url": None, "content_type": None,
         "favicon_url": None, "favicon_file": None, "favicon_sha256": None, "favicon_bytes": None, "favicon_content_type": None,
         "favicon_decode_status": None, "favicon_mmh3": None, "favicon_md5": None, "favicon_outcome": "not_attempted",
         "favicon_is_image": False,
@@ -303,18 +400,26 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
         "favicon_candidates": 0, "error": None,
     }
     try:
-        result, body = fetcher.fetch(url, connect_ip=ip, kind="document", context=f"scanner:{ip}:{port}")
-        record.update(document_outcome=result.outcome, http_status=result.http_status,
-                      final_url=result.final_url, content_type=result.content_type)
+        declared = None
         html = None
-        if body and _is_html(result.content_type):
-            html = body.decode("utf-8", errors="replace")
-        record.update(document_facts(html, body))
-        if result.outcome not in ("ok", "http_status") and result.http_status is None:
-            record["favicon_outcome"] = "document_failed"
-            return record
-        decls, resources = acquire_favicons(url, html, connect_ip=ip, fetcher=fetcher, max_icons=max_icons,
-                                            on_icon=icon_store.save if icon_store is not None else None)
+        if scheme == "http" and hostname is None and reusable_document(stored_document, max_document_bytes):
+            declared = [FaviconDeclaration(**d) for d in stored_document["declarations"]]
+            record.update(document_outcome="ok", document_source="reused", http_status=200, final_url=url,
+                          content_type=stored_document["content_type"], document_title=stored_document["document_title"],
+                          document_body_sha256=stored_document["document_body_sha256"])
+        else:
+            result, body = fetcher.fetch(url, connect_ip=ip, kind="document", context=f"scanner:{ip}:{port}")
+            record.update(document_outcome=result.outcome, http_status=result.http_status,
+                          final_url=result.final_url, content_type=result.content_type)
+            if body and _is_html(result.content_type):
+                html = body.decode("utf-8", errors="replace")
+            record.update(document_facts(html, body))
+            if result.outcome not in ("ok", "http_status") and result.http_status is None:
+                record["favicon_outcome"] = "document_failed"
+                return record
+        decls, resources = acquire_favicons(url, html, connect_ip=ip, fetcher=fetcher, max_icons=max_icons, declarations=declared,
+                                            on_icon=icon_store.save if icon_store is not None else None,
+                                            selection=selection, fallback=fallback, fingerprint=_FINGERPRINTS)
         record.update(icon_declaration_facts(url, decls, resources))
         record["favicon_candidates"] = len(resources)
         image = next((r for r in resources if r.fingerprint and r.fingerprint.get("image_ok")), None)
@@ -379,12 +484,14 @@ class RecordLog:
 
 
 def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, workers: int, max_icons: int, killed: Any = lambda: False,
-                      icon_store: Any = None, on_record: Any = None, done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None
-                      ) -> list[dict[str, Any]]:
+                      icon_store: Any = None, on_record: Any = None, done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None,
+                      selection: str = "all", fallback: str = "always_if_no_image",
+                      documents: dict[tuple[str, int], dict[str, Any]] | None = None, max_document_bytes: int = 0) -> list[dict[str, Any]]:
     """``jobs``: dicts with scheme/ip/port/hostname. Returns one record per job, order preserved.
 
     ``on_record`` receives each record fetched in this call as soon as it exists; ``done`` holds records from an
-    earlier attempt, which are reused instead of fetched again.
+    earlier attempt, which are reused instead of fetched again. ``documents`` maps (ip, port) to the stored page of
+    the HTTP stage (see ``capture_http_document``).
     """
     def one(job: dict[str, Any]) -> dict[str, Any]:
         prior = done.get((job["ip"], job["port"], job.get("hostname"))) if done else None
@@ -394,7 +501,8 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
             return {"kind": "hostname" if job.get("hostname") else "direct_ip", "scheme": job["scheme"], "hostname": job.get("hostname"),
                     "favicon_outcome": "skipped_kill_switch", "ip": job["ip"], "port": job["port"]}
         rec = probe_identity(fetcher, scheme=job["scheme"], ip=job["ip"], port=job["port"], hostname=job.get("hostname"), max_icons=max_icons,
-                              icon_store=icon_store)
+                              icon_store=icon_store, selection=selection, fallback=fallback,
+                              stored_document=(documents or {}).get((job["ip"], job["port"])), max_document_bytes=max_document_bytes)
         rec["ip"], rec["port"] = job["ip"], job["port"]
         if on_record is not None:
             try:
@@ -415,6 +523,31 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
     def run_group(indexes: list[int]) -> None:
         for i in indexes:
             out[i] = one(jobs[i])
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        list(pool.map(run_group, groups.values()))
+    # Longest chains first, so the few addresses with many names do not set the tail of the stage. Most workers
+    # spend their time asleep in the pacer, so with many workers they get a small thread stack (threads are created
+    # as the work is submitted; the setting is process wide, so it is put back as soon as everything is submitted).
+    ordered = sorted(groups.values(), key=len, reverse=True)
+    previous_stack = _set_worker_stack(_WORKER_STACK_BYTES) if workers > _SMALL_STACK_FROM else None
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            pending = pool.map(run_group, ordered)
+            if previous_stack is not None:
+                _set_worker_stack(previous_stack)
+                previous_stack = None
+            list(pending)
+    finally:
+        if previous_stack is not None:
+            _set_worker_stack(previous_stack)
     return [r for r in out if r is not None]
+
+
+_WORKER_STACK_BYTES = 256 * 1024
+_SMALL_STACK_FROM = 64
+
+
+def _set_worker_stack(size: int) -> int | None:
+    """Set the stack size of threads created from now on; returns the previous size, or None if it cannot be set."""
+    try:
+        return threading.stack_size(size)
+    except (ValueError, RuntimeError):
+        return None
