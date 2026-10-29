@@ -7,11 +7,15 @@ repeats the one that was interrupted (as a new attempt, in a new run directory).
 
 The campaign stops at the first shard that does not finish cleanly: the kill switch, a changed public IP, low
 disk, an expired approval and tool errors all end it, and nothing further is sent until the operator looks.
+A file named ``DRAIN`` in the campaign directory ends it more gently: the shard in progress finishes, no further shard starts.
+With ``pipeline_depth=2`` the shards run as child processes that overlap (see ``supervisor``); the state file and the stop rules stay the same.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -132,12 +136,129 @@ def _finish(cfg: Any, state: dict[str, Any], run_dirs: dict[int, Path]) -> None:
                  "shard_states": state["shard_states"], "merged": merge_summaries(summaries)})
 
 
-def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: Callable[[str], None] = print, **run_kwargs: Any) -> dict[str, Any]:
+def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: Callable[[str], None] = print,
+                 pipeline_depth: int = 1, config_path: Path | None = None, **run_kwargs: Any) -> dict[str, Any]:
     lock = _acquire_lock(cfg)
     try:
+        if pipeline_depth > 1:
+            from scanner.internet import supervisor
+            supervisor.check_overlap_safe(cfg)
+            if not supervisor.available():
+                log("[campaign] --pipeline 2 needs POSIX file locks; running the shards one after another")
+                pipeline_depth = 1
+        if pipeline_depth > 1:
+            from scanner.internet import supervisor
+            return supervisor.run_overlapped(cfg, log=log, config_path=config_path, **run_kwargs)
         return _run_campaign(cfg, run_fn, log, run_kwargs)
     finally:
         lock.unlink(missing_ok=True)
+
+
+def _run_id(cfg: Any, i: int, attempt: int) -> str:
+    return f"scanner-{cfg.run_label}-{cfg.checksum[:8]}-s{i:03d}of{cfg.shards:03d}-a{attempt}"
+
+
+def _earlier_attempts(cfg: Any, i: int, attempt: int) -> list[Path]:
+    """Run directories of attempts 1..attempt-1 of shard ``i`` that exist, newest first."""
+    root = Path(cfg.output_dir)
+    found = [root / _run_id(cfg, i, a) for a in range(attempt - 1, 0, -1)]
+    return [d for d in found if d.is_dir()]
+
+
+def _finished_cleanly(run_dir: Path) -> bool:
+    try:
+        data = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(data.get("complete")) and not data.get("zero_responsive")
+
+
+def discard_stale_work(cfg: Any, i: int, attempt: int, log: Callable[[str], None] = lambda *_: None) -> None:
+    """Remove ``work/`` (the fact store and its journal, up to a GB at scale) of earlier attempts that did not finish.
+
+    Manifests, logs and ``raw/`` stay: a later attempt reuses the favicon lookup records from there.
+    """
+    for d in _earlier_attempts(cfg, i, attempt):
+        work = d / "work"
+        if work.is_dir() and not _finished_cleanly(d):
+            shutil.rmtree(work, ignore_errors=True)
+            log(f"[campaign] shard {i + 1}/{cfg.shards}: removed the working files of {d.name}")
+
+
+def resume_source(cfg: Any, i: int, run_id: str) -> Path | None:
+    """The newest earlier attempt of this shard, same configuration, whose favicon lookup records a new attempt can start from."""
+    m = re.search(r"-a(\d+)$", run_id)
+    if m is None:
+        return None
+    for d in _earlier_attempts(cfg, i, int(m.group(1))):
+        if _finished_cleanly(d) or not (d / "raw" / "favicon_records.jsonl").is_file():
+            continue
+        try:
+            manifest = json.loads((d / "manifest.json").read_text(encoding="utf-8")) if (d / "manifest.json").exists() else {}
+        except (OSError, ValueError):
+            continue
+        if manifest.get("config_checksum", cfg.checksum) == cfg.checksum:
+            return d
+    return None
+
+
+def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], None]) -> tuple[str, str | None]:
+    """Decide what to do with shard ``i``: ``("complete", None)``, ``("drain", None)`` or ``("run", run_id)`` (attempt counted)."""
+    path = campaign_dir(cfg) / "campaign.json"
+    entry = state["shard_states"].setdefault(str(i), {"status": "pending", "attempts": 0})
+    if entry["status"] != "complete":
+        prior = _prior_complete(cfg, i) if entry["attempts"] == 0 else None
+        if prior is not None:                      # never probe a shard twice just because the state file did not know
+            entry.update(status="complete", run_dir=str(prior), adopted=True)
+            log(f"[campaign] shard {i + 1}/{cfg.shards}: adopting the finished run {prior.name}")
+    if entry["status"] == "complete":
+        return "complete", None
+    if (campaign_dir(cfg) / "DRAIN").exists():
+        log(f"[campaign] {campaign_dir(cfg) / 'DRAIN'} exists: stopping before shard {i + 1}/{cfg.shards}")
+        return "drain", None
+    entry["attempts"] += 1
+    for stale in ("run_dir", "error", "finished_at", "abort_reason", "elapsed_seconds"):
+        entry.pop(stale, None)
+    entry.update(status="running", started_at=datetime.now(UTC).isoformat())
+    run_id = _run_id(cfg, i, entry["attempts"])
+    discard_stale_work(cfg, i, entry["attempts"], log)
+    entry["run_id"] = run_id
+    _write_json(path, state)
+    log(f"[campaign] shard {i + 1}/{cfg.shards} (attempt {entry['attempts']}) -> {run_id}")
+    return "run", run_id
+
+
+def record_failure(entry: dict[str, Any], i: int, exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, PreflightFailed):
+        entry.update(status="refused", error=str(exc)[:500])
+        return {"shard": i, "reason": "preflight_failed", "detail": str(exc)[:300]}
+    entry.update(status="crashed", error=f"{type(exc).__name__}: {exc}"[:500])
+    return {"shard": i, "reason": "crashed", "detail": entry["error"]}
+
+
+def record_finished(entry: dict[str, Any], i: int, run_dir: Path) -> dict[str, Any] | None:
+    """Copy the outcome of a finished shard run from its manifest into the state entry; returns why the campaign must stop, if it must."""
+    manifest = json.loads((Path(run_dir) / "manifest.json").read_text(encoding="utf-8"))
+    entry.update(run_dir=str(run_dir), finished_at=datetime.now(UTC).isoformat(), abort_reason=manifest.get("abort_reason"),
+                 elapsed_seconds=manifest.get("elapsed_seconds"))
+    if manifest.get("complete") and manifest.get("zero_responsive"):
+        # a shard of thousands of targets with no answer at all is an egress/NAT fault, not an empty Internet
+        entry["status"] = "zero_responsive"
+        return {"shard": i, "reason": "zero_responsive", "detail": "no endpoint answered although every tool ran cleanly"}
+    if manifest.get("complete"):
+        entry["status"] = "complete"
+        return None
+    entry["status"] = "incomplete"
+    return {"shard": i, "reason": manifest.get("abort_reason") or "stage_errors", "detail": manifest.get("stage_errors")}
+
+
+def end_campaign(cfg: Any, state: dict[str, Any], run_dirs: dict[int, Path], stopped: dict[str, Any] | None) -> dict[str, Any]:
+    path = campaign_dir(cfg) / "campaign.json"
+    _write_json(path, state)
+    _finish(cfg, state, run_dirs)
+    done = sum(1 for e in state["shard_states"].values() if e["status"] == "complete")
+    return {"complete": done == cfg.shards, "shards_complete": done, "shards": cfg.shards, "stopped": stopped,
+            "state_file": str(path), "summary_file": str(campaign_dir(cfg) / "campaign_summary.json"), "finished_at": time.time()}
 
 
 def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], None], run_kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -146,51 +267,28 @@ def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], No
     stopped: dict[str, Any] | None = None
     path = campaign_dir(cfg) / "campaign.json"
     for i in range(cfg.shards):
-        entry = state["shard_states"].setdefault(str(i), {"status": "pending", "attempts": 0})
-        if entry["status"] != "complete":
-            prior = _prior_complete(cfg, i) if entry["attempts"] == 0 else None
-            if prior is not None:                      # never probe a shard twice just because the state file did not know
-                entry.update(status="complete", run_dir=str(prior), adopted=True)
-                log(f"[campaign] shard {i + 1}/{cfg.shards}: adopting the finished run {prior.name}")
-        if entry["status"] == "complete":
+        action, run_id = begin_shard(cfg, state, i, log)
+        entry = state["shard_states"][str(i)]
+        if action == "complete":
             run_dirs[i] = Path(entry["run_dir"])
             continue
-        entry["attempts"] += 1
-        for stale in ("run_dir", "error", "finished_at", "abort_reason", "elapsed_seconds"):
-            entry.pop(stale, None)
-        entry.update(status="running", started_at=datetime.now(UTC).isoformat())
-        run_id = f"scanner-{cfg.run_label}-{cfg.checksum[:8]}-s{i:03d}of{cfg.shards:03d}-a{entry['attempts']}"
-        entry["run_id"] = run_id
-        _write_json(path, state)
-        log(f"[campaign] shard {i + 1}/{cfg.shards} (attempt {entry['attempts']}) -> {run_id}")
+        if action == "drain":
+            stopped = {"shard": i, "reason": "drain", "detail": "stopped between shards on request"}
+            break
         try:
-            run_dir = run_fn(replace(cfg, shard=i), run_id=run_id, **run_kwargs)
+            resume = resume_source(cfg, i, run_id)
+            extra = {"resume_from": resume} if resume is not None else {}
+            run_dir = run_fn(replace(cfg, shard=i), run_id=run_id, **extra, **run_kwargs)
         except PreflightFailed as exc:
-            entry.update(status="refused", error=str(exc)[:500])
-            stopped = {"shard": i, "reason": "preflight_failed", "detail": str(exc)[:300]}
+            stopped = record_failure(entry, i, exc)
             break
         except Exception as exc:                       # a crash must not lose the record of how far we got
-            entry.update(status="crashed", error=f"{type(exc).__name__}: {exc}"[:500])
-            stopped = {"shard": i, "reason": "crashed", "detail": entry["error"]}
+            stopped = record_failure(entry, i, exc)
             break
         run_dirs[i] = Path(run_dir)
-        manifest = json.loads((Path(run_dir) / "manifest.json").read_text(encoding="utf-8"))
-        entry.update(run_dir=str(run_dir), finished_at=datetime.now(UTC).isoformat(), abort_reason=manifest.get("abort_reason"),
-                     elapsed_seconds=manifest.get("elapsed_seconds"))
-        if manifest.get("complete") and manifest.get("zero_responsive"):
-            # a shard of thousands of targets with no answer at all is an egress/NAT fault, not an empty Internet
-            entry["status"] = "zero_responsive"
-            stopped = {"shard": i, "reason": "zero_responsive", "detail": "no endpoint answered although every tool ran cleanly"}
-            break
-        if manifest.get("complete"):
-            entry["status"] = "complete"
+        stopped = record_finished(entry, i, run_dir)
+        if entry["status"] == "complete":
             _write_json(path, state)
-            continue
-        entry["status"] = "incomplete"
-        stopped = {"shard": i, "reason": manifest.get("abort_reason") or "stage_errors", "detail": manifest.get("stage_errors")}
-        break
-    _write_json(path, state)
-    _finish(cfg, state, run_dirs)
-    done = sum(1 for e in state["shard_states"].values() if e["status"] == "complete")
-    return {"complete": done == cfg.shards, "shards_complete": done, "shards": cfg.shards, "stopped": stopped,
-            "state_file": str(path), "summary_file": str(campaign_dir(cfg) / "campaign_summary.json"), "finished_at": time.time()}
+        if stopped:
+            break
+    return end_campaign(cfg, state, run_dirs, stopped)
