@@ -29,7 +29,7 @@
     "favicons/659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2.png": "659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2",
     "favicons/index.jsonl": "aa9014c46977a2e3752455dda4eaf04d669286b3afb8cada7b6ab437957c5173",
     "ip_results.csv": "c2a6792ed37a8612c1ddb942e0f558702cc1b0ac4cb6af9ed3ef4a91a0ca1f72",
-    "normalized/endpoints.jsonl": "00820f8278e468492fa18064504da8121562616778683a41c124031096f6e5a9",
+    "normalized/endpoints.jsonl": "6a286bb72bc94bc283822b7a5fba96552c24c0b819ed9e1acdd378687ef8b2b8",
     "normalized/hostname_resolution.jsonl": "9f636f2e499a47e7167ebf4aab841317d4b237ae1fe1395c27a3e1aaf31ecb3e",
     "normalized/policy_refusals.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "raw/zdns/ZDNS-415c61aa2997695d.jsonl.zst": "25d21d88813b75dcf70d0112b6ffa06ceaf94c69a01c67ccaee13f4d18044773",
@@ -75,6 +75,9 @@
     "dns_timeout": 5.0,
     "favicon": {
       "enabled": true,
+      "fallback": "always_if_no_image",
+      "icon_selection": "first_image",
+      "max_active_requests": 512,
       "max_hostnames_per_endpoint": 3,
       "max_icons_per_page": 4,
       "max_unverified_names_per_endpoint": 0,
@@ -85,6 +88,7 @@
         "max_total_fetches": 500,
         "min_interval_seconds": 1.0
       },
+      "reuse_http_document": false,
       "stage_max_seconds": 7200,
       "store_images": true,
       "workers": 2
@@ -146,6 +150,7 @@
   },
   "stage_counts": {
     "dns_unknown_share": 0.0,
+    "favicon_documents_reused": 0,
     "favicon_images_indexed": 2,
     "favicon_images_stored": 2,
     "l4_endpoints": 9,

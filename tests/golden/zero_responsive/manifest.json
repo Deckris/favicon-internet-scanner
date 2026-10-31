@@ -54,6 +54,9 @@
     "dns_timeout": 5.0,
     "favicon": {
       "enabled": true,
+      "fallback": "always_if_no_image",
+      "icon_selection": "first_image",
+      "max_active_requests": 512,
       "max_hostnames_per_endpoint": 3,
       "max_icons_per_page": 4,
       "max_unverified_names_per_endpoint": 0,
@@ -64,6 +67,7 @@
         "max_total_fetches": 500,
         "min_interval_seconds": 1.0
       },
+      "reuse_http_document": false,
       "stage_max_seconds": 7200,
       "store_images": true,
       "workers": 2

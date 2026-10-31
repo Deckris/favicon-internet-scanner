@@ -84,7 +84,7 @@ def test_spooled_icon_index_equals_the_in_memory_index(tmp_path):
 
 
 def test_favicon_stage_hands_every_record_to_the_sink(monkeypatch):
-    def probe(fetcher, *, scheme, ip, port, hostname, max_icons, icon_store=None):
+    def probe(fetcher, *, scheme, ip, port, hostname, max_icons, icon_store=None, **options):
         return {"favicon_outcome": "none_declared"}
     monkeypatch.setattr(fav, "probe_identity", probe)
     jobs = [{"scheme": "http", "ip": f"192.0.2.{i}", "port": 80, "hostname": None} for i in range(1, 6)]

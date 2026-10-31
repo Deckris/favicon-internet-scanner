@@ -14,6 +14,7 @@
   "tarpit_ips_not_probed": 0,
   "sample_targets_per_port": 370225,
   "dns_unknown_share": 0.0,
+  "favicon_documents_reused": 0,
   "favicon_images_stored": 2,
   "favicon_images_indexed": 2
 }

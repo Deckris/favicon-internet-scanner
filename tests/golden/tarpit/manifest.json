@@ -26,7 +26,7 @@
   ],
   "output_checksums": {
     "ip_results.csv": "f66e90d276dba73f782520622c3dabb8907891a7fa6394629b06c913b9239575",
-    "normalized/endpoints.jsonl": "4c8345184d878ccd2030d981492d453cd55d5fef5cc3ba573d7229ffa52f0801",
+    "normalized/endpoints.jsonl": "01544b5fd0315f42402ee0397f1109b103b68e38a4e6503b08f151447cf52f90",
     "normalized/hostname_resolution.jsonl": "eeb0a10c84be1ef71cd59826ef8e4e0d6af48047936463450a749547c86a3c68",
     "normalized/policy_refusals.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "raw/zdns/ZDNS-dd2f0c13a4b08dce.jsonl.zst": "b16428c43f6771f571eb9d27dffdef808f59057899569c992c96876bf33d65fe",
@@ -61,6 +61,9 @@
     "dns_timeout": 5.0,
     "favicon": {
       "enabled": true,
+      "fallback": "always_if_no_image",
+      "icon_selection": "first_image",
+      "max_active_requests": 512,
       "max_hostnames_per_endpoint": 3,
       "max_icons_per_page": 4,
       "max_unverified_names_per_endpoint": 0,
@@ -71,6 +74,7 @@
         "max_total_fetches": 500,
         "min_interval_seconds": 1.0
       },
+      "reuse_http_document": false,
       "stage_max_seconds": 7200,
       "store_images": true,
       "workers": 2
