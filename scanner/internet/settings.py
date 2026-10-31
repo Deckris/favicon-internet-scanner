@@ -19,7 +19,7 @@ import yaml
 
 PLACEHOLDER = "REPLACE_ME"
 SETTINGS_NAME, CONFIG_NAME, APPROVAL_NAME = "settings.yaml", "config.yaml", "approval.yaml"
-MIN_PACE_SECONDS = 15.0                    # the shortest pause between two requests to one address that any approval may allow
+MIN_PACE_SECONDS = 5.0                     # the shortest pause between two requests to one address that any approval may allow
 ALLOWED_ADDRESSES = 3_702_258_432          # routable IPv4 after reserved space; the run recomputes the exact figure
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -57,7 +57,7 @@ approval:                           # copy these from the real approval; they ca
   valid_until: "{valid_until}"      # ISO 8601 with timezone, e.g. 2026-12-31T23:59:59+00:00
   max_rate_pps: {max_rate_pps}
   max_sample_fraction: {max_fraction}
-  min_seconds_between_probes_per_ip: {approval_pace}   # the approved pause between requests to one address; never below 15
+  min_seconds_between_probes_per_ip: {approval_pace}   # the approved pause between requests to one address; never below 5
   data_handling: {data_handling}    # where raw output is kept, who may read it, when it is deleted
 
 run:
@@ -70,8 +70,8 @@ DEFAULTS: dict[str, Any] = {
     "scanner_name": "research-scanner", "contact": PLACEHOLDER, "info_url": PLACEHOLDER, "incident_contact": '""',
     "public_ip": PLACEHOLDER, "source_ip": '""', "interface": "eth0", "egress_check": "auto", "gateway_mac": '""',
     "exclusions_file": "exclusions.txt", "ports": "[80, 443, 8080, 8090, 8443]", "sample_fraction": "0.000001",
-    "seed": "4", "rate_pps": "100", "pace": "15", "overlap": "false", "dns_resolver": PLACEHOLDER, "approval_status": "blocked",
-    "approval_reference": PLACEHOLDER, "valid_until": PLACEHOLDER, "max_rate_pps": "100", "max_fraction": "0.000001", "approval_pace": "15",
+    "seed": "4", "rate_pps": "100", "pace": "5", "overlap": "false", "dns_resolver": PLACEHOLDER, "approval_status": "blocked",
+    "approval_reference": PLACEHOLDER, "valid_until": PLACEHOLDER, "max_rate_pps": "100", "max_fraction": "0.000001", "approval_pace": "5",
     "data_handling": PLACEHOLDER, "label": "pilot", "output_dir": "runs", "kill_switch": "STOP",
 }
 

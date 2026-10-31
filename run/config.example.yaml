@@ -30,7 +30,7 @@ measurement:
   zmap_max_runtime: 3600         # seconds per port; preflight refuses if too short for the sample
   zmap_cooldown: 8
   zmap_probes: 1
-  min_seconds_between_probes_per_ip: 15   # pause between any two requests to the same address
+  min_seconds_between_probes_per_ip: 5   # pause between any two requests to the same address
   zgrab_connect_timeout: 4.0
   zgrab_target_timeout: 8.0
   zgrab_senders: 50

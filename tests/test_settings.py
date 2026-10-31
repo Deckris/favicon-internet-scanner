@@ -38,7 +38,7 @@ def test_apply_generates_a_loadable_config_and_approval(tmp_path):
     assert main(["apply", "--workdir", str(tmp_path)]) == 0
     cfg = load_config(tmp_path / "config.yaml")
     assert cfg.transparency.contact == "optout@uni.example"
-    assert cfg.measurement.min_seconds_between_probes_per_ip == 15
+    assert cfg.measurement.min_seconds_between_probes_per_ip == 5
     assert cfg.measurement.zmap_probes == 1
     assert cfg.measurement.overlap_tls_with_zmap is False and cfg.measurement.zgrab_parallel_batches == 4
     first = (tmp_path / "config.yaml").read_text(encoding="utf-8")
@@ -114,8 +114,8 @@ def _edit(path: Path, **changes) -> None:
 
 
 @pytest.mark.parametrize("change, message", [
-    ({"scope.min_seconds_between_probes_per_ip": 5}, "below the approved 15"),
-    ({"approval.min_seconds_between_probes_per_ip": 5, "scope.min_seconds_between_probes_per_ip": 5}, "below the minimum of 15"),
+    ({"scope.min_seconds_between_probes_per_ip": 4}, "below the approved 5"),
+    ({"approval.min_seconds_between_probes_per_ip": 4, "scope.min_seconds_between_probes_per_ip": 4}, "below the minimum of 5"),
     ({"host.public_ip": "10.1.2.3"}, "not a public address"),
     ({"scope.ports": ["80", "443"]}, "scope.ports must be a list of port numbers"),
     ({"approval.valid_until": "2020-01-01T00:00:00+00:00"}, "has passed"),
@@ -134,12 +134,12 @@ def test_the_approval_carries_the_pause_and_a_config_below_it_is_not_authorized(
     _approve(path)
     assert main(["apply", "--workdir", str(tmp_path)]) == 0
     approval = yaml.safe_load((tmp_path / "approval.yaml").read_text(encoding="utf-8"))
-    assert approval["min_seconds_between_probes_per_ip"] == 15
+    assert approval["min_seconds_between_probes_per_ip"] == 5
     config = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     config["measurement"]["min_seconds_between_probes_per_ip"] = 0
     (tmp_path / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
     from scanner.internet.config import ConfigError
-    with pytest.raises(ConfigError, match="below the approved 15"):
+    with pytest.raises(ConfigError, match="below the approved 5"):
         load_config(tmp_path / "config.yaml")
 
 

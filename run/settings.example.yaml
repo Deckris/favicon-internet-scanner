@@ -19,7 +19,7 @@ scope:
   sample_fraction: 0.000001   # share of routable IPv4; 0.000001 is a pilot of about 3,700 targets per port
   seed: 4
   rate_pps: 100              # ZMap packets per second
-  min_seconds_between_probes_per_ip: 15   # pause between any two requests to the same address
+  min_seconds_between_probes_per_ip: 5   # pause between any two requests to the same address
   overlap_tls_with_zmap: false   # true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
   dns_resolver: REPLACE_ME      # resolver for PTR and name checks; it sees every scanned address
   try_unverified_names: false       # also request pages under certificate names that did not verify
@@ -31,7 +31,7 @@ approval:                           # copy these from the real approval; they ca
   valid_until: "REPLACE_ME"      # ISO 8601 with timezone, e.g. 2026-12-31T23:59:59+00:00
   max_rate_pps: 100
   max_sample_fraction: 0.000001
-  min_seconds_between_probes_per_ip: 15   # the approved pause between requests to one address; never below 15
+  min_seconds_between_probes_per_ip: 5   # the approved pause between requests to one address; never below 5
   data_handling: REPLACE_ME    # where raw output is kept, who may read it, when it is deleted
 
 run:

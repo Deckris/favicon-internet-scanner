@@ -45,7 +45,7 @@ $E init --contact scan-optout@example.org --info-url https://example.org/scan \
         --exclusions <list from the network owner>
 ```
 
-`init` writes `settings.yaml` in the work folder. That is the one file to edit: the opt-out contact, the information page, the scanner's address, the exclusion list, ports, sample size, rate, the pause between requests to one address (default and minimum 15 s), and the approval details (reference, expiry, caps, data handling). Replace every `REPLACE_ME`. `$E apply` checks the file and lists what is still missing; it is the way to validate your settings before you have approval.
+`init` writes `settings.yaml` in the work folder. That is the one file to edit: the opt-out contact, the information page, the scanner's address, the exclusion list, ports, sample size, rate, the pause between requests to one address (default and minimum 5 s: at least 5 s between any two requests to one address, across ports and stages), and the approval details (reference, expiry, caps, data handling). Replace every `REPLACE_ME`. `$E apply` checks the file and lists what is still missing; it is the way to validate your settings before you have approval.
 
 `config.yaml` and `approval.yaml` are generated from `settings.yaml` before each `doctor`, `plan` and `run`; do not edit them, changes are overwritten.
 

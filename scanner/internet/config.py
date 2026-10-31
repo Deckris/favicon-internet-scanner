@@ -117,7 +117,7 @@ def sha256_file(path: Path) -> str:
         return h.hexdigest()
 
 
-MIN_PACE_SECONDS = 15.0     # the pause an approval is assumed to require when it does not state one
+MIN_PACE_SECONDS = 5.0      # the pause an approval is assumed to require when it does not state one
 
 
 def read_exclusions(path: Path) -> list[str]:
@@ -271,7 +271,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         zgrab_senders=_int(m["zgrab_senders"], "measurement.zgrab_senders", 1, 1000),
         zgrab_batch_size=_int(m["zgrab_batch_size"], "measurement.zgrab_batch_size", 1, 100_000),
         # Minimum pause between any two requests to the same address. `authorize` holds it to the approval's floor.
-        min_seconds_between_probes_per_ip=_float(m.get("min_seconds_between_probes_per_ip", 15),
+        min_seconds_between_probes_per_ip=_float(m.get("min_seconds_between_probes_per_ip", 5),
                                                  "measurement.min_seconds_between_probes_per_ip", 0, 3600),
         # ZGrab2 processes run at once on different addresses; the per-address pause still holds.
         zgrab_parallel_batches=_int(m.get("zgrab_parallel_batches", 1), "measurement.zgrab_parallel_batches", 1, 64),

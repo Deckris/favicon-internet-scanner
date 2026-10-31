@@ -103,7 +103,7 @@ scanner run --confirm TOKEN [--allow-rerun] [--skip-pilot-check]
 
 Runs the pipeline. Refused without a contact and information page, past the approved rate or size, outside the
 approval's validity, and for a large sample until a small pilot has completed (--skip-pilot-check overrides the
-last). Requests to one address are spaced by min_seconds_between_probes_per_ip (15 s or more). `scanner stop` ends it.
+last). Requests to one address are spaced by min_seconds_between_probes_per_ip (5 s or more). `scanner stop` ends it.
 EOF
     ;;
     stop|summary|pack|export-csv|build|verify|favicons) usage ;;
