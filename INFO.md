@@ -4,7 +4,7 @@ If you are reading this, a connection to one of your servers probably carried a 
 
 ## What this is
 
-A small research measurement of how web servers on the public Internet identify themselves and which favicon they serve. It is run by a student for a university thesis, with the approval of the supervising professor. The software is open source: https://github.com/Deckris/favicon-internet-scanner
+A small research measurement of how web servers on the public Internet identify themselves and which favicon they serve. It is part of an academic Internet measurement project. The software is open source: https://github.com/Deckris/favicon-internet-scanner
 
 ## What it sends
 
