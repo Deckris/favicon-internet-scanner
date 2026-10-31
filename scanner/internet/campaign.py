@@ -46,6 +46,32 @@ class CampaignLocked(RuntimeError):
     """Another campaign process is working on this configuration."""
 
 
+def _check_alive(pid: int) -> None:
+    """Raise ProcessLookupError when ``pid`` is gone. On Windows ``os.kill(pid, 0)`` would send CTRL_C_EVENT to the
+    whole console instead of probing, so the process is opened and its exit code read."""
+    if os.name != "nt":
+        os.kill(pid, 0)
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        if ctypes.get_last_error() == 5:                       # ERROR_ACCESS_DENIED: alive, owned by someone else
+            raise PermissionError(pid)
+        raise ProcessLookupError(pid)
+    try:
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:   # STILL_ACTIVE
+            raise ProcessLookupError(pid)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _acquire_lock(cfg: Any) -> Path:
     """One campaign process per configuration: two would write the same run directory and the same caps file."""
     path = campaign_dir(cfg) / "campaign.lock"
@@ -56,7 +82,9 @@ def _acquire_lock(cfg: Any) -> Path:
         except FileExistsError:
             try:
                 pid = int(path.read_text(encoding="utf-8").strip() or 0)
-                os.kill(pid, 0)                        # raises if that process is gone
+                if pid <= 0:
+                    raise ProcessLookupError(pid)      # kill(0) would signal our own process group
+                _check_alive(pid)                      # raises if that process is gone
             except (ValueError, ProcessLookupError, PermissionError, OSError) as exc:
                 if isinstance(exc, PermissionError):   # exists but belongs to someone else: treat as alive
                     raise CampaignLocked(f"{path} is held by another process") from exc
