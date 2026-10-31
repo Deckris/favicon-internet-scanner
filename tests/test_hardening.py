@@ -35,6 +35,13 @@ def test_fetcher_refuses_ports_that_did_not_answer_the_scan(cfg):
         assert result.outcome == "policy_refused" and body is None, url
 
 
+def test_favicon_fetcher_receives_the_kill_switch(cfg):
+    """The watchdog can only end requests on the wire if the fetcher the pipeline builds is given the stop check."""
+    stop = lambda: True  # noqa: E731
+    f = fav.make_fetcher(cfg, fav.fetch_policy(cfg, [IP_OK]), SimpleNamespace(resolve_a=lambda h: []), {(IP_OK, 443)}, killed=stop)
+    assert getattr(f, "local", f).killed is stop
+
+
 def test_fetcher_decode_errors_become_an_outcome(cfg, monkeypatch):
     policy = fav.fetch_policy(cfg, [IP_OK])
     f = fav.make_fetcher(cfg, policy, SimpleNamespace(resolve_a=lambda h: []), {(IP_OK, 443)})
