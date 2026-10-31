@@ -67,7 +67,7 @@
         "max_total_fetches": 500,
         "min_interval_seconds": 1.0
       },
-      "reuse_http_document": false,
+      "reuse_http_document": true,
       "stage_max_seconds": 7200,
       "store_images": true,
       "workers": 2

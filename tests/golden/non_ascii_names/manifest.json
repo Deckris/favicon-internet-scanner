@@ -27,10 +27,11 @@
   "output_checksums": {
     "favicons/004d763c4422955702006322e3669031463cbb1595c2c37a0a4b35b61b3bb510.png": "004d763c4422955702006322e3669031463cbb1595c2c37a0a4b35b61b3bb510",
     "favicons/659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2.png": "659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2",
-    "favicons/index.jsonl": "275d93bc94e74a55fe2f3b9d5e1ebb8f21e564bd29dc37a3f5e812eaeec12ddb",
-    "ip_results.csv": "54857091402fac27dfaf1089d93c569f67c5917cc2a67266bc78087bd846133a",
-    "normalized/endpoints.jsonl": "b18051559a35473b2f55aa295415888da9234f2d2ad373c68b6e81413cf1e08f",
+    "favicons/index.jsonl": "ea2c9c215d05250e54b29c410616d630fff9e651de6cfe1430ea2d10b360ffc9",
+    "ip_results.csv": "b3b6fadd79bd571546ee1296a22c7312dc9048911500dadb8f56877dd0ad5fc8",
+    "normalized/endpoints.jsonl": "ed719392eb47a06df8e9b5ac839f3a8ee99f610ea463fe76ecfad6d44581657e",
     "normalized/hostname_resolution.jsonl": "5f1390f23484286471ec1e5f6894b3be5041599292f9f8f7a2ae68045ed09112",
+    "normalized/http_documents.jsonl": "369dc29e6d7d9af61385c0feece0533cf521f69c302f492b249b3ef7df42a622",
     "normalized/policy_refusals.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "raw/zdns/ZDNS-415c61aa2997695d.jsonl.zst": "9d2cfce99da39b7b6a5794009d963983219960a145782d35b22f94f8059ef9b8",
     "raw/zdns/ZDNS-846a4bebdf1f043d.jsonl.zst": "fabb108af7e17811cdde6cab6b0278a36dd1c0b93d4e9ebfe5e4304ed6e643e4",
@@ -38,7 +39,7 @@
     "raw/zdns/ZDNS-d10bcf770e8125a9.jsonl.zst": "8068a26b82b63e1e80797960e297cac127e441a6e4e9a7deeeed58e751474bcb",
     "raw/zdns/ZDNS-d47822253d62e48c.jsonl.zst": "39673cc5045ad08d5c45a3da54da4961791cc2e84a33c6965adfde583beb076a",
     "raw/zgrab/ZGRAB-0b5a65c5427d4715.jsonl.zst": "8db4cbaa1fdcf3611b8d5cdc6499547d711b1bba5910124df7e532b9883e8999",
-    "raw/zgrab/ZGRAB-56e9437ab7b32bc1.jsonl.zst": "adec5fc43ff916d95c3f9824fca016b60efecc626295c3787a0ee93dd63e1688",
+    "raw/zgrab/ZGRAB-56e9437ab7b32bc1.jsonl.zst": "d6c770e1d2851336679f35f34d242d97f0908833d86e5dbe2ffbd33b970ce5fb",
     "raw/zgrab/ZGRABTLS-45731e5c70771bbf.jsonl.zst": "edab7148030a24821be43a473ad1dddf0711a65564dee96acd6f07bb8e340591",
     "raw/zgrab/ZGRABTLS-7c6ac9fb53ade07f.jsonl.zst": "81cf5dc8018c0c8fffcf8a6d67b8743549048d20e4ccbc4c613c0caad8a3cb63",
     "raw/zgrab/ZGRABTLS-8baf34883b5eee7f.jsonl.zst": "c3bc0751251a69434bc4635e161ab75575d49ac0c9858656e29fff9a70ac4079",
@@ -82,7 +83,7 @@
         "max_total_fetches": 500,
         "min_interval_seconds": 1.0
       },
-      "reuse_http_document": false,
+      "reuse_http_document": true,
       "stage_max_seconds": 7200,
       "store_images": true,
       "workers": 2
@@ -144,7 +145,7 @@
   },
   "stage_counts": {
     "dns_unknown_share": 0.0,
-    "favicon_documents_reused": 0,
+    "favicon_documents_reused": 1,
     "favicon_images_indexed": 2,
     "favicon_images_stored": 2,
     "l4_endpoints": 5,

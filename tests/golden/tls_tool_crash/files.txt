@@ -5,6 +5,7 @@ ip_results.csv
 manifest.json
 normalized/endpoints.jsonl
 normalized/hostname_resolution.jsonl
+normalized/http_documents.jsonl
 normalized/policy_refusals.jsonl
 normalized/tool_jobs.jsonl
 preflight.json

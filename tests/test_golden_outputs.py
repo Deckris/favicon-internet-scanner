@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scanner.internet import outputs, pipeline
+from scanner.internet import favicon as fav, outputs, pipeline
 from scanner.internet.config import load_config
 from tests.helpers import FakeFetcher, write_config
 from tests.test_enrich import MIXED, ONE, TARPIT, _tarpit_config
@@ -201,6 +201,13 @@ def _collect(run_dir: Path, tmp: Path) -> dict[str, bytes]:
         md = md.replace(r, "<tmp>")
     out["report/summary.md"] = _lf(md.encode("utf-8"))
     return out
+
+
+@pytest.fixture(autouse=True)
+def fixed_page_times(monkeypatch):
+    """A stored page's capture time and age come from the clock; fixing them keeps the files comparable byte for byte."""
+    monkeypatch.setattr(fav, "_fetched_at", lambda stamp: 1_800_000_000.0)
+    monkeypatch.setattr(fav, "_age_seconds", lambda doc: 0.0)
 
 
 def run_scenario_dir(name: str, tmp: Path) -> Path:

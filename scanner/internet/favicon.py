@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
+from datetime import UTC, datetime
 from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from urllib.parse import urlsplit
@@ -327,6 +328,15 @@ def _header(headers: Any, name: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _fetched_at(stamp: Any) -> float:
+    """zgrab2's own time of the request as epoch seconds; the time the line is read if it has none (a later, so younger, value)."""
+    try:
+        when = datetime.fromisoformat(stamp)
+        return round((when if when.tzinfo else when.replace(tzinfo=UTC)).timestamp(), 3)
+    except (TypeError, ValueError):
+        return round(time.time(), 3)
+
+
 def capture_http_document(line: str, *, port: int, max_icons: int) -> tuple[tuple[str, int], dict[str, Any]] | None:
     """Compact record of a plain-HTTP bare-IP page from one output line of the HTTP stage, or None.
 
@@ -340,13 +350,15 @@ def capture_http_document(line: str, *, port: int, max_icons: int) -> tuple[tupl
         body, ip = response.get("body"), obj.get("ip")
         if http.get("status") != "success" or obj.get("domain") or not ip or not isinstance(body, str):
             return None
+        if "�" in body:      # zgrab2 prints invalid UTF-8 as U+FFFD, so the raw bytes (and their hash) are no longer known
+            return None
         raw = body.encode("utf-8")
         headers = response.get("headers")
         url = f"http://{ip}:{port}/"
         return (ip, port), {
             "http_status": response.get("status_code"), "content_type": _header(headers, "content_type"),
             "content_encoding": _header(headers, "content_encoding"), "location": _header(headers, "location"),
-            "body_bytes": len(raw), "document_title": document_facts(body, raw)["document_title"],
+            "captured_at": _fetched_at(http.get("timestamp")), "body_bytes": len(raw), "document_title": document_facts(body, raw)["document_title"],
             "document_body_sha256": hashlib.sha256(raw).hexdigest() if raw else None,
             "declarations": [d.as_dict() for d in parse_icon_declarations(url, body, max_icons=max_icons)],
         }
@@ -360,6 +372,12 @@ def reusable_document(doc: dict[str, Any] | None, max_document_bytes: int) -> bo
         doc and doc.get("http_status") == 200 and not doc.get("location") and not doc.get("content_encoding")
         and _is_html(doc.get("content_type")) and 0 < (doc.get("body_bytes") or 0) <= min(MAX_REUSED_BODY_BYTES, max_document_bytes)
     )
+
+
+def _age_seconds(doc: dict[str, Any]) -> float | None:
+    """Seconds between the HTTP stage fetching the page and the favicon stage using it."""
+    captured = doc.get("captured_at")
+    return round(max(0.0, time.time() - captured), 1) if isinstance(captured, (int, float)) else None
 
 
 def _favicon_outcome(first: Any, image: Any) -> str:
@@ -387,13 +405,14 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
     """Fetch ``scheme://host:port/`` through ``ip`` and acquire its favicon. Never raises.
 
     ``stored_document`` (see ``capture_http_document``) replaces the page fetch for a plain-HTTP bare-IP job when
-    ``reusable_document`` accepts it; the record then says ``document_source: reused``.
+    ``reusable_document`` accepts it; the record then says ``document_source: reused`` and how old the page was.
+    Only plain HTTP is covered: the TLS stages are handshake-only, so no HTTPS page and no name-based page exists to reuse.
     """
     host = hostname or ip
     url = f"{scheme}://{host}:{port}/"
     record: dict[str, Any] = {
         "kind": "hostname" if hostname else "direct_ip", "url": url, "scheme": scheme, "hostname": hostname,
-        "document_outcome": None, "document_source": "fetched", "http_status": None, "final_url": None, "content_type": None,
+        "document_outcome": None, "document_source": "fetched", "document_age_seconds": None, "http_status": None, "final_url": None, "content_type": None,
         "favicon_url": None, "favicon_file": None, "favicon_sha256": None, "favicon_bytes": None, "favicon_content_type": None,
         "favicon_decode_status": None, "favicon_mmh3": None, "favicon_md5": None, "favicon_outcome": "not_attempted",
         "favicon_is_image": False,
@@ -408,7 +427,8 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
             declared = [FaviconDeclaration(**d) for d in stored_document["declarations"]]
             record.update(document_outcome="ok", document_source="reused", http_status=200, final_url=url,
                           content_type=stored_document["content_type"], document_title=stored_document["document_title"],
-                          document_body_sha256=stored_document["document_body_sha256"])
+                          document_body_sha256=stored_document["document_body_sha256"],
+                          document_age_seconds=_age_seconds(stored_document))
         else:
             result, body = fetcher.fetch(url, connect_ip=ip, kind="document", context=f"scanner:{ip}:{port}")
             record.update(document_outcome=result.outcome, http_status=result.http_status,

@@ -105,6 +105,26 @@ def test_pages_that_a_fetch_could_answer_differently_are_fetched(change):
     assert "document" in site.kinds() and record["document_source"] == "fetched"
 
 
+def test_reused_row_carries_the_age_of_the_stored_page(monkeypatch):
+    doc = stored()
+    monkeypatch.setattr(fav.time, "time", lambda: doc["captured_at"] + 42.26)
+    reused = probe(Site(), doc)
+    assert reused["document_source"] == "reused" and reused["document_age_seconds"] == 42.3
+    assert probe(Site())["document_age_seconds"] is None
+
+
+def test_the_age_counts_from_when_zgrab2_fetched_the_page_not_when_its_output_was_read():
+    obj = json.loads(zgrab_line())
+    obj["data"]["http"]["timestamp"] = "2026-10-31T22:14:15.123456789Z"
+    _key, doc = fav.capture_http_document(json.dumps(obj), port=80, max_icons=4)
+    assert doc["captured_at"] == 1793484855.123
+
+
+def test_pages_with_replacement_characters_are_not_stored():
+    """zgrab2 prints invalid UTF-8 as U+FFFD, so the hash of the raw bytes could not be reproduced."""
+    assert fav.capture_http_document(zgrab_line(body=HTML.replace("hi", "h�i")), port=80, max_icons=4) is None
+
+
 def test_large_pages_and_other_job_kinds_are_fetched():
     big = stored(body="<html>" + "x" * 250_000 + "</html>")
     for doc, kw in [(big, {}), (stored(), {"scheme": "https"}), (stored(), {"hostname": "www.example.test"}), (stored(), {"limit": 100})]:
@@ -135,8 +155,12 @@ def test_runner_passes_every_output_line_to_the_sink(tmp_path):
     assert seen == [("198.51.100.130", 80), ("198.51.100.131", 80)]
 
 
-def test_the_setting_is_off_unless_asked_for(tmp_path):
-    assert load_config(write_config(tmp_path)).favicon.reuse_http_document is False
+def test_the_setting_is_on_unless_switched_off(tmp_path):
+    assert load_config(write_config(tmp_path)).favicon.reuse_http_document is True
+    off = tmp_path / "off"
+    off.mkdir()
+    favicon = {"enabled": True, "max_hostnames_per_endpoint": 3, "workers": 2, "max_icons_per_page": 4, "reuse_http_document": False}
+    assert load_config(write_config(off, favicon=favicon)).favicon.reuse_http_document is False
 
 
 def test_pipeline_reuses_the_http_page_when_asked(tmp_path):
@@ -152,10 +176,17 @@ def test_pipeline_reuses_the_http_page_when_asked(tmp_path):
         run_dir = go(load_config(write_config(work, favicon=favicon)), tools(), fetcher=fetcher)
         http_row = row(rows_of(run_dir), IP_HTTP, None)
         asked = [url for url, _, kind in fetcher.calls if kind == "document" and f"//{IP_HTTP}:80/" in url]
-        results[reuse] = (http_row, asked, run_dir)
+        results[reuse] = (http_row, asked, run_dir, fetcher.calls)
     off, on = results[False], results[True]
     assert off[0]["direct_document_source"] == "fetched" and len(off[1]) == 1 and not (off[2] / "normalized" / "http_documents.jsonl").exists()
     assert on[0]["direct_document_source"] == "reused" and on[1] == []
     assert (on[2] / "normalized" / "http_documents.jsonl").exists()
     assert on[0]["direct_document_title"] == off[0]["direct_document_title"]
+    assert off[0]["direct_document_age_seconds"] is None and on[0]["direct_document_age_seconds"] >= 0
+    for key in ("direct_document_body_sha256", "direct_document_status", "direct_favicon_url", "direct_favicon_sha256",
+                "direct_favicon_outcome", "direct_icon_declared_count"):
+        assert on[0][key] == off[0][key], key
+    # No request is added and none is sent sooner: the calls are the live ones minus the page GET that was reused.
+    page = [c for c in off[3] if c[2] == "document" and f"//{IP_HTTP}:80/" in c[0]]
+    assert sorted(on[3]) == sorted(c for c in off[3] if c not in page) and len(off[3]) - len(on[3]) == len(page) == 1
     assert json.loads((on[2] / "manifest.json").read_text())["stage_counts"]["favicon_documents_reused"] == 1

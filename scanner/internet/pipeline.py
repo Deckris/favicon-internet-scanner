@@ -1135,7 +1135,7 @@ def _ip_rows(cfg, g: IpFacts, asn, incomplete: bool) -> tuple[list[dict[str, Any
             "direct_favicon_sha256": direct_fav.get("favicon_sha256"), "direct_favicon_file": direct_fav.get("favicon_file"),
             "direct_favicon_mmh3": direct_fav.get("favicon_mmh3"), "direct_favicon_md5": direct_fav.get("favicon_md5"), "direct_favicon_url": direct_fav.get("favicon_url"),
             "direct_document_outcome": direct_fav.get("document_outcome"), "direct_document_status": direct_fav.get("http_status"),
-            "direct_document_source": direct_fav.get("document_source"),
+            "direct_document_source": direct_fav.get("document_source"), "direct_document_age_seconds": direct_fav.get("document_age_seconds"),
             "direct_document_title": direct_fav.get("document_title"), "direct_document_body_sha256": direct_fav.get("document_body_sha256"),
             "direct_icon_declared_count": direct_fav.get("icon_declared_count"), "direct_icon_offhost_hosts": direct_fav.get("icon_offhost_hosts") or [],
             "direct_icon_embedded_images": direct_fav.get("icon_embedded_images"),

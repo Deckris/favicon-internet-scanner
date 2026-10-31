@@ -150,7 +150,7 @@ class FakeTools:
                     lines.append(json.dumps({"ip": ip, "data": {"http": {"status": "connection-timeout", "error": "no http"}}}))
                 else:
                     lines.append(json.dumps({"ip": ip, "data": {"http": {"status": "success", "result": {"response": {
-                        "status_code": status, "headers": {"content_type": ["text/html"]}, "body": "<html></html>"}}}}}))
+                        "status_code": status, "headers": {"content_type": ["text/html"]}, "body": PAGE}}}}}))
         return SimpleNamespace(returncode=0, stdout="\n".join(lines) + ("\n" if lines else ""), stderr="")
 
     def _zdns(self, c: list[str], stdin: str) -> Any:
@@ -195,6 +195,10 @@ def make_png() -> bytes:
     return buf.getvalue()
 
 
+# The page both the HTTP stage (zgrab2) and the favicon fetcher serve, so reusing it can be compared with fetching it.
+PAGE = '<html><head><link rel="icon" href="/fav.png"></head></html>'
+
+
 class FakeFetcher:
     """Stands in for WebFetcher: serves an HTML page and a PNG favicon for any URL."""
 
@@ -205,7 +209,7 @@ class FakeFetcher:
         from scanner.models import FetchResult
         self.calls.append((url, connect_ip, kind))
         is_icon = kind == "favicon"
-        body = make_png() if is_icon else b'<html><head><link rel="icon" href="/fav.png"></head></html>'
+        body = make_png() if is_icon else PAGE.encode()
         return FetchResult(
             kind=kind, requested_url=url, connect_ip=connect_ip, host_header=None, sni=None, outcome="ok",
             failure_category=None, http_status=200, content_type="image/png" if is_icon else "text/html",
