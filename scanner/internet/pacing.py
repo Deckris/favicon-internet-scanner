@@ -35,7 +35,11 @@ def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], 
 
 
 class IpPacer:
-    """Thread-safe: each address gets its next request slot at least ``min_interval`` after the previous one."""
+    """Thread-safe: a request to an address is released at least ``min_interval`` after the previous release.
+
+    The slot is claimed when the caller is actually released, not when it starts waiting. A waiter that wakes late
+    (a busy CPU, a long poll) therefore pushes the next release back instead of shortening the gap after it.
+    """
 
     def __init__(self, min_interval: float, killed: Callable[[], bool] = lambda: False,
                  now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
@@ -50,10 +54,16 @@ class IpPacer:
         """Block until a request to ``ip`` may start. False means a stop condition fired: do not send."""
         if self.min_interval <= 0:
             return not (self._killed() or (self._stop is not None and self._stop.is_set()))
-        with self._lock:
-            slot = max(self._now(), self._next.get(ip, 0.0))
-            self._next[ip] = slot + self.min_interval
-        return _sleep_until(slot, self._killed, self._now, self._sleep, self._stop, self._poll)
+        while True:
+            if self._killed() or (self._stop is not None and self._stop.is_set()):
+                return False
+            with self._lock:
+                now = self._now()
+                due = self._next.get(ip, float("-inf"))
+                if now >= due:
+                    self._next[ip] = now + self.min_interval
+                    return True
+            _nap(min(self._poll, due - now), self._sleep, self._stop)
 
 
 class Gap:

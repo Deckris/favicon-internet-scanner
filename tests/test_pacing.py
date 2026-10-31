@@ -30,6 +30,30 @@ def test_pacer_spaces_requests_to_one_address_and_leaves_others_alone():
     assert starts[2][1] - 100.0 < 31                       # the other address was not held back by the first
 
 
+class LateClock(Clock):
+    """Every sleep overshoots by ``late`` seconds the first time, as a busy CPU wakes a thread late."""
+
+    def __init__(self, late):
+        super().__init__()
+        self.late = list(late)
+
+    def sleep(self, seconds):
+        super().sleep(seconds + (self.late.pop(0) if self.late else 0.0))
+
+
+def test_a_late_wake_up_pushes_the_next_request_back_instead_of_shortening_the_gap():
+    c = LateClock([3.0])
+    p = pacing.IpPacer(10, now=c.now, sleep=c.sleep, poll=100)
+    released = []
+    for _ in range(3):
+        assert p.wait("1.1.1.1")
+        released.append(c.t)
+        c.t += 0.5                                          # the request itself
+    gaps = [b - a for a, b in zip(released, released[1:])]
+    assert gaps[0] >= 13 - 1e-9                             # woke 3 s late
+    assert min(gaps) >= 10 - 1e-9, gaps                     # the next one still waits the full interval
+
+
 def test_pacer_disabled_and_stopped():
     c = Clock()
     off = pacing.IpPacer(0, now=c.now, sleep=c.sleep)
