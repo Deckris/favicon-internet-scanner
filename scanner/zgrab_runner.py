@@ -252,15 +252,14 @@ def run_zgrab_batches(
                                                 capture_output=True, text=True, check=False)
             finished_at = datetime.now(UTC).isoformat()
 
-            chunk_results = [
-                _parse_line(line, job_id=job_id, scheme=scheme, mode=mode, port=port, observed_at=finished_at)
-                for line in iter_lines(output_path)
-                if line.strip()
-            ]
-            if document_sink is not None:
-                for line in stdout.split("\n"):
-                    if line.strip():
-                        document_sink(line, port)
+            chunk_results = []
+            for line in iter_lines(output_path):
+                if not line.strip():
+                    continue
+                chunk_results.append(
+                    _parse_line(line, job_id=job_id, scheme=scheme, mode=mode, port=port, observed_at=finished_at))
+                if document_sink is not None:
+                    document_sink(line, port)
 
             exit_code = getattr(result, "returncode", None)
             error = None
