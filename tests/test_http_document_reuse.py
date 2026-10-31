@@ -190,3 +190,19 @@ def test_pipeline_reuses_the_http_page_when_asked(tmp_path):
     page = [c for c in off[3] if c[2] == "document" and f"//{IP_HTTP}:80/" in c[0]]
     assert sorted(on[3]) == sorted(c for c in off[3] if c not in page) and len(off[3]) - len(on[3]) == len(page) == 1
     assert json.loads((on[2] / "manifest.json").read_text())["stage_counts"]["favicon_documents_reused"] == 1
+
+
+def test_stored_pages_are_written_once_and_listed_in_the_manifest(tmp_path):
+    import hashlib
+
+    from tests.helpers import FakeFetcher
+    from tests.test_pipeline import go, tools
+
+    favicon = {"enabled": True, "max_hostnames_per_endpoint": 3, "workers": 2, "max_icons_per_page": 4, "reuse_http_document": True}
+    run_dir = go(load_config(write_config(tmp_path, favicon=favicon)), tools(), fetcher=FakeFetcher())
+    path = run_dir / "normalized" / "http_documents.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert rows and [(r["ip"], r["port"]) for r in rows] == sorted((r["ip"], r["port"]) for r in rows)
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["output_checksums"]["normalized/http_documents.jsonl"] == hashlib.sha256(path.read_bytes()).hexdigest()
+

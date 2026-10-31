@@ -935,6 +935,16 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     tarpits_known("favicon", favicon_stage)
     st.check_now()          # a stop that arrived after the last check still belongs in the manifest
 
+    # The pages are written as soon as the favicon stage is done with them, so they are not held while the rows are built.
+    docs_sha = None
+    if http_docs:
+        try:
+            docs_sha = write_jsonl(run_dir / "normalized" / "http_documents.jsonl",
+                                   [{"ip": ip, "port": port, **doc} for (ip, port), doc in sorted(http_docs.items())])
+        except Exception as exc:
+            st.errors["write_outputs"] = f"{type(exc).__name__}: {exc}"[:500]
+        http_docs.clear()
+
     # ---- Records (never allowed to prevent the manifest from being written) ----------------
     tool_errors = [j.job_id for j in jobs if j.error]      # tools that crashed or exited non-zero
     incomplete = bool(st.errors or st.skipped or tool_errors)
@@ -959,9 +969,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             checksums["normalized/endpoints.jsonl"] = streamed["endpoints"]
             checksums["normalized/hostname_resolution.jsonl"] = streamed["hostnames"]
         checksums["normalized/tool_jobs.jsonl"] = write_jsonl(normalized / "tool_jobs.jsonl", jobs)
-        if http_docs:
-            checksums["normalized/http_documents.jsonl"] = write_jsonl(
-                normalized / "http_documents.jsonl", [{"ip": ip, "port": port, **doc} for (ip, port), doc in sorted(http_docs.items())])
+        if docs_sha:
+            checksums["normalized/http_documents.jsonl"] = docs_sha
         if cfg.favicon.offhost.enabled:
             checksums["normalized/offhost_icon_fetches.jsonl"] = write_jsonl(normalized / "offhost_icon_fetches.jsonl", offhost_log)
         checksums["normalized/policy_refusals.jsonl"] = write_jsonl(normalized / "policy_refusals.jsonl", [r.as_dict() for r in policy.refusals])
