@@ -1,0 +1,69 @@
+{
+  "counts": {
+    "dns_unknown_share": 0.0,
+    "favicon_images_indexed": 1,
+    "favicon_images_stored": 1,
+    "l4_endpoints": 5,
+    "l4_per_port": {
+      "443": 3,
+      "80": 1,
+      "8080": 1
+    },
+    "l4_unique_ips": 5,
+    "sample_listed": 5,
+    "sample_targets_per_port": 370225,
+    "tarpit_ips_not_probed": 0
+  },
+  "dns_status_by_row": {
+    "verified_current_mapping": 2
+  },
+  "favicon_direct_by_endpoint": {
+    "image": 1
+  },
+  "favicon_hostname_by_row": {},
+  "final_hostname_status_by_row": {
+    "no_hostname_evidence": 3,
+    "verified": 2
+  },
+  "hostname_rows_with_ptr_and_certificate": 0,
+  "icons_declared_on_other_hosts": 0,
+  "ips_with_verified_hostname": 2,
+  "protocol_by_endpoint": {
+    "http": 1,
+    "tcp_only": 4
+  },
+  "sni_confirmation_by_row": {
+    "failed": 2
+  },
+  "stage_errors": {},
+  "stage_seconds": {
+    "candidates": 0.0,
+    "dns_forward": 0.0,
+    "favicon": 0.0,
+    "http_direct": 0.0,
+    "ptr": 0.0,
+    "sample_list": 0.0,
+    "sni_confirm": 0.0,
+    "tls_direct": 0.0,
+    "zmap": 0.0
+  },
+  "stages_skipped": [],
+  "tarpit_ips_by_confidence": {},
+  "tarpit_suspect_ips": 0,
+  "tls_failed_but_sni_handshake_ok": 0,
+  "tls_outcome_by_endpoint": {
+    "tls_other_error": 5
+  },
+  "tool_job_counts": {
+    "zdns": 5,
+    "zgrab2": 7,
+    "zmap": 3
+  },
+  "unique_ips": 5,
+  "warnings": [
+    "sample list has 5 targets but the plan expected 370225; check raw/zmap/sample-*.",
+    "port 80: hit rate 0.0003% is far below typical Internet rates; scan may be impaired (NAT, loss, filtering).",
+    "port 443: hit rate 0.0008% is far below typical Internet rates; scan may be impaired (NAT, loss, filtering)."
+  ],
+  "wildcard_certificates": 0
+}

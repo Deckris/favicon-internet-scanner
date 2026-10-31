@@ -1,0 +1,196 @@
+{
+  "abort_reason": null,
+  "anonymous_traffic": false,
+  "approval_reference": "TEST-REF-1",
+  "approval_sha256": "5ae71944e2cdbd61f8f02ab6e540f376e65fac072b104e3dba33d8a9b9b1da5c",
+  "approval_valid_until": "2099-01-01T00:00:00+00:00",
+  "complete": true,
+  "config_checksum": "<config>",
+  "elapsed_seconds": "<time>",
+  "exclusion_count": 1,
+  "exclusions_sha256": "84845936e9dc2e69bad8b13a2a1f994d4790f5566648ad16318469b659f3f165",
+  "experiment": "scanner",
+  "finished_at": "<time>",
+  "instrument_version": "scanner.2",
+  "limitations": [
+    "Single vantage, single observation window; results describe what this vantage could observe at that time.",
+    "Hostname evidence is PTR plus certificate SAN/CN only; no CT, passive DNS, ASN or brand matching.",
+    "A verified mapping means the name resolved to the scanned IP via the configured resolvers at query time.",
+    "Wildcard certificate names are recorded as evidence but never queried.",
+    "ZMap loss and rate limiting can miss responsive hosts; the sample is a seeded random subset of IPv4.",
+    "Favicons are fetched only from scanned IPs and only on ports that answered the scan; other redirect targets are refused.",
+    "The sample is the first N targets of ZMap's seeded permutation of the allowed space: well spread, but not documented as a simple random sample.",
+    "protocol=https means a TLS handshake completed (bare IP or with SNI); it does not prove the service speaks HTTP.",
+    "Approval rate limits cover ZMap packets only; ZGrab2, ZDNS and favicon concurrency are bounded by configuration, not by the approval."
+  ],
+  "output_checksums": {
+    "favicons/004d763c4422955702006322e3669031463cbb1595c2c37a0a4b35b61b3bb510.png": "004d763c4422955702006322e3669031463cbb1595c2c37a0a4b35b61b3bb510",
+    "favicons/659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2.png": "659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2",
+    "favicons/index.jsonl": "aa9014c46977a2e3752455dda4eaf04d669286b3afb8cada7b6ab437957c5173",
+    "ip_results.csv": "c2a6792ed37a8612c1ddb942e0f558702cc1b0ac4cb6af9ed3ef4a91a0ca1f72",
+    "normalized/endpoints.jsonl": "00820f8278e468492fa18064504da8121562616778683a41c124031096f6e5a9",
+    "normalized/hostname_resolution.csv": "37ac6d7514afbae88345c3a7fd4b070a66de83b36b9a9f669bbcac8e6205cb42",
+    "normalized/hostname_resolution.jsonl": "1c6bd5c44a004d6fe207e51e1c4d0f1874eb3411fa3b1a0a541c5c5b011488df",
+    "normalized/policy_refusals.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "raw/zdns/ZDNS-415c61aa2997695d.jsonl": "0b3d5d68ffb26c52b2a5e4b2ddae662c115657b04f266c9be20aacacd7322783",
+    "raw/zdns/ZDNS-846a4bebdf1f043d.jsonl": "08c6fa833adf5fc354bc7d3ccfe2b7a6d737c043981fe87015507df8b56aa4ee",
+    "raw/zdns/ZDNS-90b30bda93e67582.jsonl": "016496738ef4d57a6b045dbde909f5059a95cdf99196367af9cad979fbfa2655",
+    "raw/zdns/ZDNS-a5de89742b8ad555.jsonl": "9f280e31b584b6eef12dabddaa60a0db1a91833410d811a80525e1d79ddac6ad",
+    "raw/zdns/ZDNS-d10bcf770e8125a9.jsonl": "2e01b9b0cfabe0f2eb9fbb63285315bcd1a5d34d74852ae322ab2a90e69f07a8",
+    "raw/zgrab/ZGRAB-0b5a65c5427d4715.jsonl": "72eae27482ff5bab6496d6b1c6bd22fdcbec532c60233ec50f1def1ce252a067",
+    "raw/zgrab/ZGRAB-2917485b5439f73c.jsonl": "fbf84a58cce5ba719db411ad42eae58956f9ec8a20be454d373077ed535cae5f",
+    "raw/zgrab/ZGRABTLS-0d807a75bfb4c54e.jsonl": "167204bf671d2643b52e5f0e8abfa7fb4095bdd8f6bbfe84b7c36caeef7a30a8",
+    "raw/zgrab/ZGRABTLS-35ca69e7cc574930.jsonl": "9213965613d8744e68e4e362b44d8cc9f1624a0e01400b5ae34371c0e9095df1",
+    "raw/zgrab/ZGRABTLS-3ac5270b00073e2d.jsonl": "106e5b7f4a86f20359f4d32bdf16113212009e0e9ab5f3a9178a55141691666d",
+    "raw/zgrab/ZGRABTLS-8baf34883b5eee7f.jsonl": "2efee8ed6cf86f173ddc8a34278fab18545aa0d38a2efe4a91d8955f0a5b9579",
+    "raw/zgrab/ZGRABTLS-8c40f36eadcd5a6f.jsonl": "1f7389709348bb235114b8afcedd4cab467df908c68f0b7d679793aa027a9f86",
+    "raw/zgrab/ZGRABTLS-9cd1ed71800a58a9.jsonl": "6f7ee85c70edc099f09c534c33f6e85d49814d18f7d82e162043d2816afaf80c",
+    "raw/zgrab/ZGRABTLS-af9b8a9b25955bf4.jsonl": "25c699040064909ecb38305a6840edfa84085398c37588304267d97d5b5c73d7",
+    "raw/zgrab/ZGRABTLS-b6eeb08be45b1d0b.jsonl": "b279143d6c91cead6c80cde32f51e4f99572ab932ed4b07c3571252abf9450f8",
+    "raw/zgrab/ZGRABTLS-baee6611e636b9bd.jsonl": "a5d41ec37304fbc5fbe91bb2f0e9ae64fc9de919c56279ffd2dae38885405af2",
+    "raw/zgrab/ZGRABTLS-db1b8357fb0f29e8.jsonl": "f92273070cadc39150b3e51e5cd340b50241c8543c78b9cdf1cc73c756e27057",
+    "raw/zgrab/ZGRABTLS-e93c293ffe5924b8.jsonl": "f7bc0c85b7d5216a19ae0256321825ddeb18aa2450408cda871a3681c8794f4c",
+    "raw/zmap/ZMAP-1e5849e157781cd0-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
+    "raw/zmap/ZMAP-1e5849e157781cd0-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
+    "raw/zmap/ZMAP-1e5849e157781cd0.csv": "b49fd5a5e2990a77aa732affcda121eac3a64af61412b649f4d8f9096f1546a1",
+    "raw/zmap/ZMAP-33c994c137fd01d8-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
+    "raw/zmap/ZMAP-33c994c137fd01d8-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
+    "raw/zmap/ZMAP-33c994c137fd01d8.csv": "aeea6d0216912b3ffa4920cd0c530e60d4d23a437bea144b21576b1826d26683",
+    "raw/zmap/ZMAP-c033b5e44ecbda0c-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
+    "raw/zmap/ZMAP-c033b5e44ecbda0c-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
+    "raw/zmap/ZMAP-c033b5e44ecbda0c.csv": "ad3bb1c05d0dbcc0048ab0a99cac4b6dd3d3722c2c8021b9001932761c9a9753",
+    "raw/zmap/sample-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
+    "raw/zmap/sample-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
+    "scanned_ips.txt": "3bd17d49d8be95d5169027f7c58225e84c0d74e06c57dc1f52250476b127de3f"
+  },
+  "parameters": {
+    "dns_network_timeout": 5.0,
+    "dns_resolvers": [
+      "9.9.9.9:53",
+      "1.1.1.1"
+    ],
+    "dns_retries": 2,
+    "dns_threads": 10,
+    "dns_timeout": 5.0,
+    "favicon": {
+      "enabled": true,
+      "max_hostnames_per_endpoint": 3,
+      "max_icons_per_page": 4,
+      "max_unverified_names_per_endpoint": 0,
+      "offhost": {
+        "enabled": false,
+        "max_bytes": 262144,
+        "max_per_host": 3,
+        "max_total_fetches": 500,
+        "min_interval_seconds": 1.0
+      },
+      "stage_max_seconds": 7200,
+      "store_images": true,
+      "workers": 2
+    },
+    "fetch": {
+      "connect_timeout": 4.0,
+      "max_decoded_bytes": 4194304,
+      "max_document_bytes": 1048576,
+      "max_favicon_bytes": 524288,
+      "max_redirects": 3,
+      "max_retries": 1,
+      "read_timeout": 8.0,
+      "retry_after_cap": 2.0,
+      "retry_statuses": [
+        429,
+        503
+      ],
+      "total_timeout": 15.0,
+      "user_agent": "scanner-research-scanner (+https://example.org/scan; contact optout@example.org)"
+    },
+    "max_candidates_per_ip": 20,
+    "min_seconds_between_probes_per_ip": 0.0,
+    "overlap_tls_with_zmap": false,
+    "sni_confirm": {
+      "enabled": true,
+      "max_per_endpoint": 3
+    },
+    "zgrab_batch_size": 500,
+    "zgrab_connect_timeout": 4.0,
+    "zgrab_parallel_batches": 1,
+    "zgrab_senders": 10,
+    "zgrab_target_timeout": 8.0,
+    "zmap_cli_rate": 50,
+    "zmap_sender_threads": 1,
+    "zmap_version": "2.1.1"
+  },
+  "run_id": "t1",
+  "sample": {
+    "allowed_addresses": 3702258176,
+    "fraction": 0.0001,
+    "population_cidrs": 116,
+    "ports": [
+      80,
+      443,
+      8080
+    ],
+    "probes": 2,
+    "rate_pps": 100,
+    "seed": 4,
+    "target_hostnames": [],
+    "target_ips": [],
+    "targets_per_port": 370225
+  },
+  "schema_version": 1,
+  "shard": {
+    "index": 0,
+    "of": 1,
+    "total_targets": 370225
+  },
+  "stage_counts": {
+    "dns_unknown_share": 0.0,
+    "favicon_images_indexed": 2,
+    "favicon_images_stored": 2,
+    "l4_endpoints": 9,
+    "l4_per_port": {
+      "443": 4,
+      "80": 2,
+      "8080": 3
+    },
+    "l4_unique_ips": 6,
+    "sample_listed": 6,
+    "sample_targets_per_port": 370225,
+    "tarpit_ips_not_probed": 0
+  },
+  "stage_errors": {},
+  "stage_seconds": {
+    "candidates": 0.0,
+    "dns_forward": 0.0,
+    "favicon": 0.0,
+    "http_direct": 0.0,
+    "ptr": 0.0,
+    "sample_list": 0.0,
+    "sni_confirm": 0.0,
+    "tls_direct": 0.0,
+    "zmap": 0.0
+  },
+  "stages_skipped": [],
+  "started_at": "<time>",
+  "status": "finished",
+  "tool_job_counts": {
+    "zdns": 5,
+    "zgrab2": 13,
+    "zmap": 3
+  },
+  "tool_job_errors": [],
+  "tools": {
+    "build_info": "zmap: zmap v4.4.0 (651ed713759a12e283c449259b2f6fa027ccf9b5)\nzmap_sha256: 44a51b73b8c188771c119348377758ff6e6bdc0e8bacb36a51c3fcfde12d6a19\nzgrab2_commit: ea734bcf60ef2921684cb522dfb87a07a322afa6\nzdns: zdns version 2.1.1 (97bdbc3a4c70d8e2dedc94355d7a1150507aad8d)\ngo: go version go1.25.8 linux/amd64\npython: Python 3.12.3\ninstalled_at: 2026-10-06T21:31:41Z",
+    "zdns": "",
+    "zgrab2": "/usr/local/bin/zgrab2 (sha256 9f4236fae3801419)",
+    "zmap": "ValueError: '-p' is not in list"
+  },
+  "vantage": {
+    "gateway_mac": null,
+    "id": "test-vantage",
+    "interface": "eth0",
+    "public_egress_ip": "93.184.216.99",
+    "source_ipv4": "192.168.1.10"
+  },
+  "zero_responsive": false
+}

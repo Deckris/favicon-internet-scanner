@@ -1,6 +1,7 @@
 """Shared helpers for the scanner tests: config builder and fake external tools."""
 from __future__ import annotations
 
+import functools
 import json
 import re
 from pathlib import Path
@@ -14,8 +15,13 @@ from scanner.internet.config import sha256_file
 FIX = Path(__file__).parent / "fixtures" / "scan"
 
 
+@functools.lru_cache(maxsize=None)
+def _fixture_first_line(rel: str) -> str:
+    return (FIX / rel).read_text(encoding="utf-8").splitlines()[0]
+
+
 def fixture_line(rel: str) -> dict[str, Any]:
-    return json.loads((FIX / rel).read_text(encoding="utf-8").splitlines()[0])
+    return json.loads(_fixture_first_line(rel))
 
 
 def write_exclusions(tmp: Path, text: str = "# opt-out\n8.8.4.0/24\n") -> Path:

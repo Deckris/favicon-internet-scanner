@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from scanner.internet import pipeline, preflight
+from scanner.internet import outputs, pipeline, preflight
 from scanner.internet.config import load_config
 from tests.helpers import FakeFetcher, FakeTools, write_config
 
@@ -36,7 +36,7 @@ def go(cfg, ft, **kw):
 
 
 def rows_of(run_dir: Path):
-    return [json.loads(l) for l in (run_dir / "normalized" / "hostname_resolution.jsonl").read_text().splitlines()]
+    return list(outputs.iter_hostname_rows(run_dir))
 
 
 def row(rows, ip, host=None, port=None):
@@ -144,16 +144,17 @@ def test_manifest_summary_and_checksums(cfg):
     assert any(k.startswith("raw/zmap/") for k in m["output_checksums"])
     s = json.loads((run_dir / "report" / "summary.json").read_text())
     assert s["ips_with_verified_hostname"] == 2 and s["tls_failed_but_sni_handshake_ok"] == 1
-    assert (run_dir / "normalized" / "hostname_resolution.csv").read_text().startswith("target_ip,port,")
+    assert m["output_schema"] == 2 and m["compression"] in ("zstd", "none")
+    assert not (run_dir / "normalized" / "hostname_resolution.csv").exists()
+    assert outputs.export_csv(run_dir).read_text().startswith("target_ip,port,")
 
 
 def test_deterministic_outputs_for_same_inputs(cfg):
     a = go(cfg, tools())
     b = pipeline.run(cfg, run_id="t2", executor=tools(), fetcher=FakeFetcher(), skip_preflight=True, offline_preflight=True)
     for name in ("hostname_resolution.jsonl", "endpoints.jsonl"):
-        ra = [{k: v for k, v in json.loads(l).items()} for l in (a / "normalized" / name).read_text().splitlines()]
-        rb = [{k: v for k, v in json.loads(l).items()} for l in (b / "normalized" / name).read_text().splitlines()]
-        assert ra == rb
+        assert (a / "normalized" / name).read_bytes() == (b / "normalized" / name).read_bytes()
+    assert list(outputs.iter_hostname_rows(a)) == list(outputs.iter_hostname_rows(b))
 
 
 # ------------------------------------------------------------------ failure isolation

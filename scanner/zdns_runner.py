@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from scanner.internet import outputs
+from scanner.internet.runner import capture_stdout, iter_lines
 from scanner.models import ToolJob, stable_id
 
 Executor = Callable[..., Any]
@@ -106,7 +108,7 @@ def run_zdns(
     answers: dict[str, ZdnsAnswer] = {}
     for chunk in _chunks(unique, chunk_size):
         job_id = stable_id("ZDNS", module, chunk[:1], len(chunk), len(jobs))
-        output_path = raw_dir / f"{job_id}.jsonl"
+        output_path = raw_dir / outputs.raw_name(job_id)
         command = [
             binary, module,
             "--name-servers", ",".join(nameservers),
@@ -118,17 +120,19 @@ def run_zdns(
         ]
         started_at = datetime.now(UTC).isoformat()
         try:
-            result = executor(command, input="".join(f"{n}\n" for n in chunk), capture_output=True, text=True, check=False)
-            stdout = getattr(result, "stdout", "") or ""
+            result, raw_sha256 = capture_stdout(executor, command, output_path, input="".join(f"{n}\n" for n in chunk),
+                                                capture_output=True, text=True, check=False)
             exit_code = getattr(result, "returncode", None)
             stderr = (getattr(result, "stderr", "") or "").strip()
         except Exception as exc:  # binary missing / OS error: every name becomes TOOL_ERROR
-            stdout, exit_code, stderr = "", -1, f"{type(exc).__name__}: {exc}"
+            exit_code, stderr = -1, f"{type(exc).__name__}: {exc}"
+            empty = outputs.compress_bytes(b"") if outputs.is_compressed(output_path) else b""      # a valid, empty file in either form
+            output_path.write_bytes(empty)
+            raw_sha256 = hashlib.sha256(empty).hexdigest()
         finished_at = datetime.now(UTC).isoformat()
-        output_path.write_text(stdout, encoding="utf-8")
 
         parsed = 0
-        for line in stdout.split("\n"):
+        for line in iter_lines(output_path):
             if not line.strip():
                 continue
             ans = parse_zdns_line(line, module)
@@ -149,7 +153,7 @@ def run_zdns(
             job_id=job_id, tool="zdns", purpose=f"{module}", command=tuple(command),
             input_count=len(chunk), output_count=parsed, exit_code=exit_code,
             raw_path=str(output_path.relative_to(run_dir)),
-            raw_sha256=hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+            raw_sha256=raw_sha256,
             started_at=started_at, finished_at=finished_at, error=tool_error,
         ))
     return jobs, answers

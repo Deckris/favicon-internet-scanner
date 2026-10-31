@@ -75,6 +75,8 @@ If a run does not finish cleanly:
 - Exit code 5 with `dns_degraded`: more than a few percent of the name lookups got no answer, so the hostname results are partial. Check the resolver in `settings.yaml` (a local or institutional resolver is better than a public one) and run again.
 - Every connection to the open ports reported as refused: the network was interrupted during the run. Run `doctor` and repeat the run.
 
+For a sharded `campaign` that runs for days, see "Long campaigns" in the [README](../README.md): a memory-capped systemd scope and `run/watchdog.sh`, which touches the kill-switch file when memory runs low or the output stops changing.
+
 `run` refuses a second run of an identical config; `--allow-rerun` overrides that on purpose. A finished run has `manifest.json` with `"complete": true`; anything else is partial and says why.
 
 `pack` puts only `manifest.json` and the aggregate report in the archive. `pack RUN_DIR --with-results` adds the per-address files (IP addresses, host names, certificate names); `--with-raw` adds the raw tool output as well.

@@ -1,0 +1,7 @@
+ip,responsive,open_ports,endpoints,ptr_names,verified_hostnames,other_hostnames,certificate_cns,tarpit_suspect,tarpit_confidence,tarpit_signals,tarpit_reason,document_titles,icon_offhost_hosts,favicon_sha256,unverified_name_favicon_sha256
+1.1.1.1,yes,443|8080,443=https; 8080=https,good.test,good.test,www.good.test:nxdomain,good.test,no,,,,Shop,,004d763c4422955702006322e3669031463cbb1595c2c37a0a4b35b61b3bb510,
+1.1.1.2,yes,443,443=https(tls_alert_unrecognized_name),edge.shop.example,edge.shop.example,,,no,,,,Shop,,004d763c4422955702006322e3669031463cbb1595c2c37a0a4b35b61b3bb510,
+1.1.1.3,yes,80,80=http(not_tls)[http 200],,,,,no,,,,Shop,,659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2,
+1.1.1.4,yes,443,443=https,,,good.test:resolved_elsewhere|www.good.test:nxdomain,good.test,no,,,,Shop,,004d763c4422955702006322e3669031463cbb1595c2c37a0a4b35b61b3bb510,
+1.1.1.5,yes,8080,8080=tcp_only(tls_reset),,,,,no,,,,,,,
+1.1.1.9,yes,80|443|8080,80=http(not_tls)[http 301]; 443=https; 8080=https,mail.other.test|other.test,mail.other.test|other.test,good.test:resolved_elsewhere|www.good.test:nxdomain,good.test,no,low,identical_content,3 ports return the same page,Shop,,659e82ae16064cd379be1a0780586aea7bf5d9f157b84ec8e3fcca14224a33a2,

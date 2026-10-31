@@ -13,6 +13,8 @@ from __future__ import annotations
 import gzip
 import hashlib
 import ipaddress
+import socket
+import ssl
 import threading
 import time
 import zlib
@@ -21,7 +23,9 @@ from datetime import UTC, datetime
 from typing import Callable, Protocol, runtime_checkable
 from urllib.parse import urljoin, urlsplit
 
+import httpcore
 import httpx
+from httpcore._backends.sync import SyncStream
 
 from scanner.models import CertificateInfo, FetchResult, RedirectHop
 from scanner.safety import TargetPolicy
@@ -115,6 +119,169 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _raw_shutdown(sock: socket.socket) -> None:
+    # socket.socket.shutdown, not SSLSocket.shutdown: the latter also drops the SSL object another thread is reading from.
+    socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+def _raw_close(sock: socket.socket) -> None:
+    sock.close()
+
+
+class _SocketGuard:
+    """Sockets of one request, shared between the worker and its watchdog.
+
+    The watchdog may only ``shutdown`` a socket: that wakes a thread blocked in recv or SSL_read with EOF but leaves the
+    descriptor allocated. Closing it from another thread would free the number while OpenSSL still reads from it, and the
+    number can be handed to an unrelated socket. Only the worker closes, and both go through one lock so a shutdown never
+    meets a descriptor that was just closed.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._socks: list[socket.socket] = []
+        self._closed: set[int] = set()
+        self.expired = False
+
+    def attach(self, sock: socket.socket) -> None:
+        with self._lock:
+            if self.expired:
+                raise OSError("request expired")
+            self._socks.append(sock)
+
+    def expire(self) -> None:
+        with self._lock:
+            self.expired = True
+            for sock in self._socks:
+                if id(sock) in self._closed:
+                    continue
+                try:
+                    _raw_shutdown(sock)
+                except OSError:
+                    pass
+
+    def close(self, sock: socket.socket | None = None) -> None:
+        with self._lock:
+            for item in ([sock] if sock is not None else list(self._socks)):
+                if id(item) in self._closed:
+                    continue
+                self._closed.add(id(item))
+                try:
+                    _raw_close(item)
+                except OSError:
+                    pass
+
+
+_SLICE = 0.25
+
+
+def _sliced_io(sock, guard, call, timeout, timeout_exc, error_exc):
+    end = None if timeout is None else time.monotonic() + timeout
+    while True:
+        if guard.expired:
+            raise error_exc(OSError("request expired"))
+        remaining = _SLICE if end is None else min(_SLICE, max(end - time.monotonic(), 0.001))
+        try:
+            sock.settimeout(remaining)
+            return call()
+        except socket.timeout as exc:
+            if end is not None and time.monotonic() >= end:
+                raise timeout_exc(exc) from exc
+        except OSError as exc:
+            raise error_exc(exc) from exc
+
+
+class _GuardedStream(SyncStream):
+    def __init__(self, sock: socket.socket, guard: _SocketGuard) -> None:
+        super().__init__(sock)
+        self._guard = guard
+
+    def close(self) -> None:
+        self._guard.close(self._sock)
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        return self._sliced(lambda: self._sock.recv(max_bytes), timeout, httpcore.ReadTimeout, httpcore.ReadError)
+
+    def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        while buffer:
+            sent = self._sliced(lambda: self._sock.send(buffer), timeout, httpcore.WriteTimeout, httpcore.WriteError)
+            buffer = buffer[sent:]
+
+    def _sliced(self, call, timeout, timeout_exc, error_exc):
+        # Waits in short slices so an expired request is noticed even where shutdown does not wake a blocked call.
+        return _sliced_io(self._sock, self._guard, call, timeout, timeout_exc, error_exc)
+
+    def start_tls(self, ssl_context: ssl.SSLContext, server_hostname: str | None = None, timeout: float | None = None):
+        tls = None
+        try:
+            self._sock.settimeout(timeout)
+            tls = ssl_context.wrap_socket(self._sock, server_hostname=server_hostname, do_handshake_on_connect=False)
+            self._guard.attach(tls)
+            _sliced_io(tls, self._guard, tls.do_handshake, timeout, httpcore.ConnectTimeout, httpcore.ConnectError)
+        except socket.timeout as exc:
+            self._abort(tls)
+            raise httpcore.ConnectTimeout(exc) from exc
+        except OSError as exc:
+            self._abort(tls)
+            raise httpcore.ConnectError(exc) from exc
+        except BaseException:
+            self._abort(tls)
+            raise
+        return _GuardedStream(tls, self._guard)
+
+    def _abort(self, tls: socket.socket | None) -> None:
+        if tls is not None:
+            self._guard.close(tls)
+        self._guard.close(self._sock)
+
+
+class _GuardedBackend(httpcore.SyncBackend):
+    """Opens sockets the watchdog can reach from the first moment of the connect."""
+
+    def __init__(self, guard: _SocketGuard) -> None:
+        super().__init__()
+        self._guard = guard
+
+    def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        source = None if local_address is None else (local_address, 0)
+        try:
+            error: OSError | None = None
+            for family, kind, proto, _name, address in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+                sock = socket.socket(family, kind, proto)
+                try:
+                    self._guard.attach(sock)
+                    sock.settimeout(timeout)
+                    if source is not None:
+                        sock.bind(source)
+                    sock.connect(address)
+                    if self._guard.expired:
+                        raise OSError("request expired")
+                    for option in socket_options or ():
+                        sock.setsockopt(*option)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError as exc:
+                    self._guard.close(sock)
+                    if self._guard.expired:
+                        raise
+                    error = exc
+                    continue
+                except BaseException:
+                    self._guard.close(sock)
+                    raise
+                return _GuardedStream(sock, self._guard)
+            raise error or OSError("no address")
+        except socket.timeout as exc:
+            raise httpcore.ConnectTimeout(exc) from exc
+        except OSError as exc:
+            raise httpcore.ConnectError(exc) from exc
+
+
+def _guarded_client(guard: _SocketGuard) -> httpx.Client:
+    transport = httpx.HTTPTransport(verify=False, http2=False, trust_env=False)
+    transport._pool._network_backend = _GuardedBackend(guard)
+    return httpx.Client(transport=transport, trust_env=False, follow_redirects=False)
+
+
 class WebFetcher:
     def __init__(
         self,
@@ -141,7 +308,7 @@ class WebFetcher:
 
     def fetch(self, url: str, *, connect_ip: str | None, kind: str, context: str = "") -> tuple[FetchResult, bytes | None]:
         limits = self.favicon_limits if kind == "favicon" else self.document_limits
-        deadline = time.monotonic() + limits.total_timeout
+        budget = limits.total_timeout       # request time left; waits for the pacer never count against it
         chain: list[RedirectHop] = []
         visited: set[tuple[str, str | None]] = set()
         current_url = url
@@ -189,13 +356,14 @@ class WebFetcher:
             if refusal is not None:
                 return self._failure(current_url, current_ip, hostname, None, "policy_refused", refusal.reason, chain, started, kind=kind), None
 
-            remaining = deadline - time.monotonic()
+            remaining = budget
             if remaining <= 0:
                 return self._failure(current_url, current_ip, hostname, None, "timeout", "total_deadline", chain, started, kind=kind), None
 
             outcome = self._one_request(
-                parts, hostname, port, current_ip, limits, min(remaining, limits.total_timeout), deadline,
+                parts, hostname, port, current_ip, limits, min(remaining, limits.total_timeout), None,
             )
+            budget -= outcome.elapsed
 
             if outcome.kind == "transport":
                 return self._finish(outcome, chain, started, kind=kind), outcome.body
@@ -243,11 +411,12 @@ class WebFetcher:
             if outcome.http_status in self.retry_statuses and retries < self.max_retries:
                 retries += 1
                 delay = min(outcome.retry_after_seconds or 1.0, self.retry_after_cap)
-                remaining_after_sleep = deadline - time.monotonic() - delay
+                remaining_after_sleep = budget - delay
                 if remaining_after_sleep <= 0:
                     outcome.retries = retries
                     return self._finish(outcome, chain, started, kind=kind), outcome.body
                 time.sleep(max(delay, 0.0))
+                budget -= delay
                 outcome.retries = retries
                 is_retry = True
                 continue
@@ -288,44 +457,66 @@ class WebFetcher:
             return sorted(allowed)[0], None
         return None, refusal_reason or "outside_population"
 
-    def _one_request(self, parts, hostname: str, port: int, connect_ip: str, limits: FetchLimits, timeout: float, deadline: float) -> "_RequestOutcome":
+    def _one_request(self, parts, hostname: str, port: int, connect_ip: str, limits: FetchLimits, timeout: float, deadline: float | None = None) -> "_RequestOutcome":
         """One request under a hard wall-clock cap: httpx's read timeout restarts on every byte, so a server that drips
-        its response headers would otherwise hold a worker for as long as it likes."""
-        fired = threading.Event()
-        holder: list = []
+        its response headers would otherwise hold a worker for as long as it likes. The cap starts here, when the request
+        does, so time spent waiting for the pacer is not taken out of it.
 
-        def expire() -> None:
-            fired.set()
-            for client in holder:
-                try:
-                    client.close()
-                except Exception:
-                    pass
+        At the cap the watchdog only shuts the sockets down (see :class:`_SocketGuard`); the worker unwinds on the
+        resulting EOF or error and closes everything itself."""
+        started = time.monotonic()
+        request_deadline = started + timeout
+        if deadline is not None:
+            request_deadline = min(request_deadline, deadline)
+        fired = threading.Event()
+        guard = _SocketGuard()
         done = threading.Event()
+
+        def transport_outcome(outcome: str) -> "_RequestOutcome":
+            return _RequestOutcome(kind="transport", outcome=outcome, http_status=None, content_type=None, content_encoding=None, location=None,
+                                   body=None, body_bytes=0, certificate=None, retry_after_seconds=None, connect_ip=connect_ip,
+                                   host_header=_host_header(hostname, port, parts.scheme), sni=None, final_url=f"{parts.scheme}://{connect_ip}:{port}",
+                                   elapsed=time.monotonic() - started)
 
         def watch() -> None:
             # Ends the request at its deadline, or within half a second of the kill switch.
-            while not done.wait(0.25):
-                if time.monotonic() >= deadline or self.killed():
-                    expire()
-                    return
+            try:
+                while not done.wait(max(0.0, min(0.25, request_deadline - time.monotonic()))):
+                    try:
+                        stop = self.killed()
+                    except Exception:
+                        stop = False
+                    if stop or time.monotonic() >= request_deadline:
+                        break
+            finally:
+                if not done.is_set():
+                    fired.set()
+                    try:
+                        guard.expire()
+                    except Exception:
+                        pass
         watchdog = threading.Thread(target=watch, daemon=True)
-        watchdog.start()
         try:
-            result = self._one_request_inner(parts, hostname, port, connect_ip, limits, timeout, deadline, holder)
+            watchdog.start()
+        except RuntimeError:
+            return transport_outcome("fetch_error")
+        try:
+            result = self._one_request_inner(parts, hostname, port, connect_ip, limits, timeout, request_deadline, guard)
         except Exception:
             if not fired.is_set():
                 raise
             result = None
         finally:
             done.set()
-        if result is None or (fired.is_set() and result.kind == "transport"):
-            return _RequestOutcome(kind="transport", outcome="timeout", http_status=None, content_type=None, content_encoding=None, location=None,
-                                   body=None, body_bytes=0, certificate=None, retry_after_seconds=None, connect_ip=connect_ip,
-                                   host_header=_host_header(hostname, port, parts.scheme), sni=None, final_url=f"{parts.scheme}://{connect_ip}:{port}")
+            guard.close()
+        # Once the watchdog has shut the sockets, an EOF can end a body without a length early,
+        # so nothing read after that point is trusted.
+        if result is None or fired.is_set():
+            return transport_outcome("timeout")
+        result.elapsed = time.monotonic() - started
         return result
 
-    def _one_request_inner(self, parts, hostname: str, port: int, connect_ip: str, limits: FetchLimits, timeout: float, deadline: float, holder: list) -> "_RequestOutcome":
+    def _one_request_inner(self, parts, hostname: str, port: int, connect_ip: str, limits: FetchLimits, timeout: float, deadline: float, guard: _SocketGuard) -> "_RequestOutcome":
         scheme = parts.scheme
         path = parts.path or "/"
         if parts.query:
@@ -343,8 +534,7 @@ class WebFetcher:
         final_url = request_url
 
         try:
-            with httpx.Client(verify=False, http2=False, trust_env=False, follow_redirects=False) as client:
-                holder.append(client)
+            with _guarded_client(guard) as client:
                 request = client.build_request("GET", request_url, headers=headers, extensions=extensions)
                 with client.stream("GET", request_url, headers=headers, extensions=extensions, timeout=httpx.Timeout(connect=limits.connect_timeout, read=limits.read_timeout, write=limits.read_timeout, pool=limits.connect_timeout)) as response:
                     cert_info = self._extract_certificate(response, connect_ip, port, sni)
@@ -352,8 +542,11 @@ class WebFetcher:
                     try:
                         decoder = _StreamDecoder(content_encoding, limits.max_decoded_bytes)
                     except _TooLarge as exc:
-                        for _ in response.iter_raw():
-                            pass
+                        drained = 0
+                        for chunk in response.iter_raw():
+                            drained += len(chunk)
+                            if drained > limits.max_bytes or time.monotonic() > deadline:
+                                break
                         return _RequestOutcome(
                             kind="transport", outcome=exc.outcome, http_status=response.status_code,
                             content_type=response.headers.get("content-type"), content_encoding=content_encoding,
@@ -501,6 +694,7 @@ class _RequestOutcome:
     final_url: str | None
     raw_retry_after: str | None = None
     retries: int = 0
+    elapsed: float = 0.0
 
 
 def _parse_retry_after(value: str | None) -> float | None:

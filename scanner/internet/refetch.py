@@ -19,6 +19,7 @@ from typing import Any
 
 from scanner.internet import favicon as fav
 from scanner.internet import icon_store
+from scanner.internet import outputs
 from scanner.internet import pacing
 from scanner.internet import pipeline
 from scanner.internet import preflight as pre
@@ -27,13 +28,6 @@ from scanner.internet.runner import ManagedExecutor
 from scanner.models import write_jsonl
 
 JobKey = tuple[str, int, str | None]
-
-
-def _rows(path: Path):
-    with path.open(encoding="utf-8") as fh:
-        for line in fh:
-            if line.strip():
-                yield json.loads(line)
 
 
 def _scheme(protocol: str | None) -> str:
@@ -74,14 +68,14 @@ def load_source(source: Path, cfg: ScanConfig) -> tuple[dict[str, Any], list[dic
         raise ConfigError("source run was made with a different config; re-fetch needs the config that produced it")
     jobs: dict[JobKey, dict[str, Any]] = {}
     previous: dict[JobKey, dict[str, Any]] = {}
-    for row in _rows(source / "normalized" / "endpoints.jsonl"):
+    for row in outputs.iter_endpoint_rows(source):
         outcome = row.get("direct_favicon_outcome")
         if outcome is None:
             continue
         key = (row["target_ip"], row["port"], None)
         jobs[key] = {"scheme": _scheme(row.get("protocol")), "ip": key[0], "port": key[1], "hostname": None}
         previous[key] = {"outcome": outcome, "sha256": row.get("direct_favicon_sha256")}
-    for row in _rows(source / "normalized" / "hostname_resolution.jsonl"):
+    for row in outputs.iter_hostname_rows(source):
         outcome = row.get("hostname_favicon_outcome")
         if outcome is None or not row.get("hostname"):
             continue

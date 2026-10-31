@@ -8,16 +8,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from urllib.parse import urlsplit
 from typing import Any
 
 import dns.resolver
 
+from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
@@ -31,7 +33,7 @@ class FingerprintCache:
     """Remembers the fingerprint of icon bodies already decoded, keyed by content digest.
 
     The same few icons (hosting defaults, device logos, CMS marks) turn up on a large share of the addresses of a
-    shard, and decoding plus hashing one costs several milliseconds of CPU that all workers share. The fingerprint
+    scan, and decoding plus hashing one costs several milliseconds of CPU that all workers share. The fingerprint
     is a pure function of the bytes, so reusing it changes nothing in the records.
     """
 
@@ -414,10 +416,14 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
             if body and _is_html(result.content_type):
                 html = body.decode("utf-8", errors="replace")
             record.update(document_facts(html, body))
+            body = None         # the raw bytes are not needed once the page facts are taken
             if result.outcome not in ("ok", "http_status") and result.http_status is None:
                 record["favicon_outcome"] = "document_failed"
                 return record
-        decls, resources = acquire_favicons(url, html, connect_ip=ip, fetcher=fetcher, max_icons=max_icons, declarations=declared,
+        if declared is None:
+            declared = parse_icon_declarations(url, html, max_icons=max_icons) if html is not None else []
+        html = None         # the page can be megabytes; icon fetches below may wait a long time for pacing
+        decls, resources = acquire_favicons(url, None, connect_ip=ip, fetcher=fetcher, max_icons=max_icons, declarations=declared,
                                             on_icon=icon_store.save if icon_store is not None else None,
                                             selection=selection, fallback=fallback, fingerprint=_FINGERPRINTS)
         record.update(icon_declaration_facts(url, decls, resources))
@@ -453,6 +459,8 @@ class RecordLog:
         self.path = Path(path)
         self._lock = threading.Lock()
         self._fh: Any = None
+        self._closed = False
+        self.dropped = 0        # appends refused because the log was already closed
 
     def load(self) -> dict[tuple[str, int, str | None], dict[str, Any]]:
         found: dict[tuple[str, int, str | None], dict[str, Any]] = {}
@@ -470,6 +478,9 @@ class RecordLog:
     def append(self, rec: dict[str, Any]) -> None:
         line = json.dumps(rec, default=str) + "\n"
         with self._lock:
+            if self._closed:
+                self.dropped += 1
+                return
             if self._fh is None:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 self._fh = self.path.open("a", encoding="utf-8", newline="\n")
@@ -478,33 +489,116 @@ class RecordLog:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             if self._fh is not None:
                 self._fh.close()
                 self._fh = None
 
 
+_WORKER_STACK_BYTES = 256 * 1024
+_SMALL_STACK_FROM = 64
+STOP_GRACE_SECONDS = 3.0
+_POLL_SECONDS = 0.5
+
+
+def _set_worker_stack(size: int) -> int | None:
+    """Set the stack size of threads created from now on; returns the previous size, or None if it cannot be set."""
+    try:
+        return threading.stack_size(size)
+    except (ValueError, RuntimeError):
+        return None
+
+
+class _DaemonPool:
+    """Minimal thread pool whose threads are daemons, so a job that never returns cannot hold the process open.
+
+    ``ThreadPoolExecutor`` joins all of its threads at interpreter exit and in ``shutdown(wait=True)``; one stuck
+    job then blocks both. Here a stuck thread is simply abandoned. Threads start on demand, and with many workers
+    they get a small stack (most of them sleep in the pacer).
+    """
+
+    def __init__(self, workers: int) -> None:
+        self._max = max(1, workers)
+        self._small_stack = self._max > _SMALL_STACK_FROM
+        self._tasks: queue.SimpleQueue = queue.SimpleQueue()
+        self._started = 0
+        self._released = False
+
+    def submit(self, fn: Any, *args: Any) -> Future:
+        fut: Future = Future()
+        self._tasks.put((fut, fn, args))
+        if self._started < self._max:
+            self._started += 1
+            previous = _set_worker_stack(_WORKER_STACK_BYTES) if self._small_stack else None
+            try:
+                threading.Thread(target=self._work, daemon=True, name="favicon-worker").start()
+            finally:
+                if previous is not None:
+                    _set_worker_stack(previous)
+        return fut
+
+    def _work(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+            fut, fn, args = task
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn(*args))
+            except BaseException as exc:      # handed to the collecting thread
+                fut.set_exception(exc)
+
+    def release(self) -> None:
+        """Let idle threads exit; threads still inside a job are left behind."""
+        if not self._released:
+            self._released = True
+            for _ in range(self._started):
+                self._tasks.put(None)
+
+
 def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, workers: int, max_icons: int, killed: Any = lambda: False,
                       icon_store: Any = None, on_record: Any = None, done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None,
                       selection: str = "all", fallback: str = "always_if_no_image",
-                      documents: dict[tuple[str, int], dict[str, Any]] | None = None, max_document_bytes: int = 0) -> list[dict[str, Any]]:
+                      documents: dict[tuple[str, int], dict[str, Any]] | None = None, max_document_bytes: int = 0,
+                      grace: float = STOP_GRACE_SECONDS, record_sink: Any = None) -> list[dict[str, Any]]:
     """``jobs``: dicts with scheme/ip/port/hostname. Returns one record per job, order preserved.
+
+    With ``record_sink`` the final record of every job (fetched, reused or skipped) is handed to
+    ``record_sink(job_index, record)`` instead of being collected, and the return value is empty.
 
     ``on_record`` receives each record fetched in this call as soon as it exists; ``done`` holds records from an
     earlier attempt, which are reused instead of fetched again. ``documents`` maps (ip, port) to the stored page of
     the HTTP stage (see ``capture_http_document``).
+
+    ``killed`` is polled every half second. Once it is true no further address is started; lookups already running
+    get ``grace`` seconds to finish, and whatever has not finished by then is recorded as skipped and left behind
+    (its thread is a daemon), so the stage always returns.
     """
+    abandoned = threading.Event()
+    settle = threading.Lock()       # one decision per job: sunk by its worker, or skipped by wind_down, never both
+
+    def prior_of(job: dict[str, Any]) -> dict[str, Any] | None:
+        return done.get((job["ip"], job["port"], job.get("hostname"))) if done else None
+
+    def skipped(job: dict[str, Any]) -> dict[str, Any]:
+        return {"kind": "hostname" if job.get("hostname") else "direct_ip", "scheme": job["scheme"], "hostname": job.get("hostname"),
+                "favicon_outcome": "skipped_kill_switch", "ip": job["ip"], "port": job["port"]}
+
     def one(job: dict[str, Any]) -> dict[str, Any]:
-        prior = done.get((job["ip"], job["port"], job.get("hostname"))) if done else None
+        prior = prior_of(job)
         if prior is not None:
             return prior
         if killed():
-            return {"kind": "hostname" if job.get("hostname") else "direct_ip", "scheme": job["scheme"], "hostname": job.get("hostname"),
-                    "favicon_outcome": "skipped_kill_switch", "ip": job["ip"], "port": job["port"]}
+            return skipped(job)
         rec = probe_identity(fetcher, scheme=job["scheme"], ip=job["ip"], port=job["port"], hostname=job.get("hostname"), max_icons=max_icons,
                               icon_store=icon_store, selection=selection, fallback=fallback,
                               stored_document=(documents or {}).get((job["ip"], job["port"])), max_document_bytes=max_document_bytes)
         rec["ip"], rec["port"] = job["ip"], job["port"]
-        if on_record is not None:
+        if rec.get("favicon_outcome") == "document_failed" and rec.get("document_outcome") == "timeout" and killed():
+            return skipped(job)     # cut short by the kill switch, not a verdict on the address
+        if on_record is not None and not abandoned.is_set():
             try:
                 on_record(rec)
             except OSError:
@@ -522,32 +616,78 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
 
     def run_group(indexes: list[int]) -> None:
         for i in indexes:
-            out[i] = one(jobs[i])
-    # Longest chains first, so the few addresses with many names do not set the tail of the stage. Most workers
-    # spend their time asleep in the pacer, so with many workers they get a small thread stack (threads are created
-    # as the work is submitted; the setting is process wide, so it is put back as soon as everything is submitted).
-    ordered = sorted(groups.values(), key=len, reverse=True)
-    previous_stack = _set_worker_stack(_WORKER_STACK_BYTES) if workers > _SMALL_STACK_FROM else None
+            if abandoned.is_set():
+                return
+            rec = one(jobs[i])
+            with settle:
+                if abandoned.is_set():
+                    return
+                if record_sink is None:
+                    out[i] = rec
+                else:
+                    record_sink(i, rec)
+                    out[i] = True
+    pool = _DaemonPool(workers)
+    cap = 2 * max(1, workers)
+    # Longest chains first, so the few addresses with many names do not set the tail of the stage.
+    pending = iter(sorted(groups.values(), key=len, reverse=True))
+    inflight: dict[Future, list[int]] = {}
+    failure: BaseException | None = None
+
+    def note_failure(exc: BaseException) -> None:
+        nonlocal failure
+        if failure is None:
+            failure = exc
+
+    def collect(timeout: float) -> None:
+        nonlocal failure
+        finished, _ = wait(list(inflight), timeout=timeout, return_when=FIRST_COMPLETED)
+        for fut in finished:
+            del inflight[fut]
+            exc = fut.exception()
+            if exc is not None and failure is None:
+                failure = exc
+
+    def wind_down(patience: float) -> None:
+        """Cancel what has not begun, wait up to ``patience`` for the rest, then walk away from whatever is stuck."""
+        give_up = time.monotonic() + patience
+        for fut in list(inflight):
+            if fut.cancel():
+                del inflight[fut]
+        while inflight and time.monotonic() < give_up:
+            collect(min(_POLL_SECONDS, max(0.01, give_up - time.monotonic())))
+        with settle:
+            abandoned.set()
+            for i, rec in enumerate(out):     # never started or still stuck: the record of a job that begins after the kill
+                if rec is None:
+                    rec = prior_of(jobs[i]) or skipped(jobs[i])
+                    if record_sink is None:
+                        out[i] = rec
+                    else:
+                        try:
+                            record_sink(i, rec)
+                        except Exception as exc:
+                            note_failure(exc)
+                            break
+                        out[i] = True
+        pool.release()
+
     try:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            pending = pool.map(run_group, ordered)
-            if previous_stack is not None:
-                _set_worker_stack(previous_stack)
-                previous_stack = None
-            list(pending)
-    finally:
-        if previous_stack is not None:
-            _set_worker_stack(previous_stack)
-    return [r for r in out if r is not None]
-
-
-_WORKER_STACK_BYTES = 256 * 1024
-_SMALL_STACK_FROM = 64
-
-
-def _set_worker_stack(size: int) -> int | None:
-    """Set the stack size of threads created from now on; returns the previous size, or None if it cannot be set."""
-    try:
-        return threading.stack_size(size)
-    except (ValueError, RuntimeError):
-        return None
+        while not killed() and failure is None:
+            while len(inflight) < cap:
+                indexes = next(pending, None)
+                if indexes is None:
+                    break
+                inflight[pool.submit(run_group, indexes)] = indexes
+            if not inflight:
+                break
+            collect(_POLL_SECONDS)
+        else:
+            wind_down(grace)
+        pool.release()
+    except BaseException:
+        wind_down(min(grace, 1.0))
+        raise
+    if failure is not None:
+        raise failure
+    return [] if record_sink is not None else [r for r in out if r is not None]

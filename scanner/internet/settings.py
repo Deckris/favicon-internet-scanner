@@ -81,7 +81,13 @@ class SettingsError(Exception):
 
 
 def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    with open(path, "rb") as fh:
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(fh, "sha256").hexdigest()
+        h = hashlib.sha256()
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+        return h.hexdigest()
 
 
 def write_settings(workdir: Path, answers: dict[str, Any], *, force: bool = False) -> Path:

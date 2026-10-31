@@ -41,6 +41,7 @@ Run:
   stop                           ask a running scan to stop
   summary RUN_DIR                print the run's report
   pack RUN_DIR [--with-results]  make an archive: manifest and report only; --with-results adds per-address files
+  export-csv RUN_DIR [--out FILE]  write the hostname table of a run as CSV (runs no longer store it)
 
 Other:
   build                          docker mode: build the image from this package
@@ -105,7 +106,7 @@ approval's validity, and for a large sample until a small pilot has completed (-
 last). Requests to one address are spaced by min_seconds_between_probes_per_ip (15 s or more). `scanner stop` ends it.
 EOF
     ;;
-    stop|summary|pack|build|verify|favicons) usage ;;
+    stop|summary|pack|export-csv|build|verify|favicons) usage ;;
     *) usage ;;
   esac
 }
@@ -269,6 +270,14 @@ case "$CMD" in
     [ ${#REST[@]} -ge 1 ] || die "summary needs RUN_DIR"
     cat "${REST[0]}/report/summary.md"
     ;;
+  export-csv)
+    [ ${#REST[@]} -ge 1 ] || die "export-csv needs RUN_DIR"
+    src="${REST[0]}"; outopt=()
+    if [ "${REST[1]:-}" = "--out" ]; then outopt=(--out "${REST[2]:?--out needs a file}"); fi
+    case "$src" in /*) ;; *) src="$WORKDIR/$src" ;; esac
+    if [ "$MODE" = docker ]; then case "$src" in "$WORKDIR"/*) src="/work/${src#"$WORKDIR"/}" ;; *) die "RUN_DIR must be inside --workdir in docker mode" ;; esac; fi
+    scanner export-csv "$src" "${outopt[@]}"
+    ;;
   pack)
     [ ${#REST[@]} -ge 1 ] || die "pack needs RUN_DIR"
     run="$(cd "${REST[0]}" && pwd)"; base="$(basename "$run")"; results=0; raw=0
@@ -281,7 +290,8 @@ case "$CMD" in
     done
     grep -q '"complete": true' "$run/manifest.json" || echo "scanner: WARNING: this run's manifest is not marked complete" >&2
     # Default: the manifest and the aggregate report only. Per-address results and raw tool output contain IPs,
-    # host names and certificate names, so they are added only on request.
+    # host names and certificate names, so they are added only on request. The hostname table in normalized/ is
+    # slim and needs endpoints.jsonl next to it, which the archive holds; `export-csv` rebuilds the CSV from it.
     items=("$base/manifest.json" "$base/report")
     if [ "$results" -eq 1 ]; then
       for f in normalized ip_results.csv scanned_ips.txt favicons; do [ -e "$run/$f" ] && items+=("$base/$f"); done

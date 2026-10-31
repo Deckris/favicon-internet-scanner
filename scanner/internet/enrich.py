@@ -88,6 +88,12 @@ def dns_unknown_share(statuses: list[str]) -> float:
     return sum(1 for s in statuses if s in UNKNOWN_DNS) / len(statuses) if statuses else 0.0
 
 
+def dns_unknown_share_of_counts(by_status: dict[str, int]) -> float:
+    """``dns_unknown_share`` from {status: lookups}, for callers that never hold the list of statuses."""
+    total = sum(by_status.values())
+    return sum(n for s, n in by_status.items() if s in UNKNOWN_DNS) / total if total else 0.0
+
+
 def clean_text(text: str | None, limit: int = 120) -> str | None:
     if not text:
         return None

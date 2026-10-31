@@ -1,4 +1,5 @@
-"""CLI: ``python -m scanner.internet {preflight|plan|run|campaign|favicon-refetch|selftest} --config FILE``.
+"""CLI: ``python -m scanner.internet {preflight|plan|run|campaign|favicon-refetch|selftest} --config FILE``
+and ``python -m scanner.internet export-csv RUN_DIR [--out FILE]``.
 
 Exit codes: 0 complete, 2 refused (config, approval, preflight, confirmation, or a prior run of this config),
 3 run error, 4 run finished but found zero responsive endpoints, 5 run ended early or with stage errors
@@ -105,7 +106,9 @@ def _settings_command(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="scanner.internet")
-    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest") + SETTINGS_COMMANDS)
+    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv") + SETTINGS_COMMANDS)
+    ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv: the finished run")
+    ap.add_argument("--out", type=Path, help="export-csv: output file (default: normalized/hostname_resolution.csv in the run)")
     ap.add_argument("--config", type=Path)
     ap.add_argument("--workdir", type=Path, default=Path("."), help="init, apply, exclusions: folder holding settings.yaml")
     ap.add_argument("--contact", help="init: opt-out and abuse e-mail")
@@ -129,12 +132,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shard", type=int, help="run: which shard of a sharded config (0-based); `campaign` runs them all")
     ap.add_argument("--skip-pilot-check", action="store_true",
                     help="run: skip the requirement that a small completed pilot precedes a larger sample")
+    ap.add_argument("--pipeline", type=int, choices=(1, 2), default=1,
+                    help="campaign: 2 runs the next shard's network stages while the previous shard works through its favicon stage")
     ap.add_argument("--allow-rerun", action="store_true",
                     help="run: permit a second run of an identical config (it re-probes the same sample)")
     args = ap.parse_args(argv)
 
     if args.command in SETTINGS_COMMANDS:
         return _settings_command(args)
+    if args.command == "export-csv":
+        if args.run_dir is None:
+            ap.error("export-csv needs RUN_DIR")
+        from scanner.internet import outputs
+        print(outputs.export_csv(args.run_dir, args.out))
+        return 0
     if args.config is None:
         ap.error("--config is required for this command")
     if args.command == "selftest":     # loopback only: needs no approval and sends nothing external
@@ -233,14 +244,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         from scanner.internet.campaign import CampaignLocked, run_campaign
         try:
-            result = run_campaign(cfg)
+            result = run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config) if args.pipeline > 1 else run_campaign(cfg)
         except (CampaignLocked, ValueError) as exc:
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(result, indent=2, default=str))
         if result["complete"]:
             return 0
-        return {"preflight_failed": 2, "zero_responsive": 4}.get((result["stopped"] or {}).get("reason"), 5)
+        return {"preflight_failed": 2, "zero_responsive": 4, "drain": 0}.get((result["stopped"] or {}).get("reason"), 5)
     if cfg.shards > 1:
         if args.shard is None or not 0 <= args.shard < cfg.shards:
             print(f"REFUSED: this config has {cfg.shards} shards; use `campaign`, or `run --shard N` with 0 <= N < {cfg.shards}", file=sys.stderr)

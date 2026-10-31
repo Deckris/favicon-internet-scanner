@@ -3,7 +3,8 @@
 mmh3>=4.1
 Pillow>=10.0
 ImageHash>=4.3
-httpx>=0.27          # ground-truth collection only (not the internet scan)
+httpx>=0.28.1,<0.29  # ground-truth collection and the internet scan's fetcher
+httpcore==1.0.9      # the fetcher replaces httpcore internals (network backend, SyncStream): keep this exact
 PyYAML>=6.0
 defusedxml>=0.7      # SVG parsing hardened against entity expansion
 resvg-py>=0.1        # deterministic SVG rasterisation in a bounded subprocess
@@ -12,3 +13,4 @@ pyasn>=1.6          # optional: offline IP-to-ASN lookup from a RouteViews snaps
 cryptography>=42.0   # TLS certificate (SAN) parsing
 brotli>=1.2.0         # bounded output_buffer_limit API used by the streaming decoder
 pytest>=8.0           # the offline test suite (`scanner verify`)
+zstandard>=0.22     # raw tool output is stored zstd-compressed (falls back to plain files if missing)

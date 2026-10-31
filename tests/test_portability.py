@@ -37,7 +37,7 @@ def test_url_mode_falls_back_to_the_next_service_when_one_is_blocked(tmp_path, m
     cfg = load_config(_config(tmp_path, egress_check_urls=["https://blocked.example/ip", "https://ok.example/ip"]))
     asked = []
 
-    def fake(url, timeout=10.0):
+    def fake(url, timeout=10.0, resolvers=()):
         asked.append(url)
         return None if "blocked" in url else "93.184.216.99"
     monkeypatch.setattr(pre, "_public_ip", fake)

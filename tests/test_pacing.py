@@ -35,8 +35,8 @@ def test_pacer_disabled_and_stopped():
     off = pacing.IpPacer(0, now=c.now, sleep=c.sleep)
     assert off.wait("1.1.1.1") and off.wait("1.1.1.1") and c.sleeps == []
     stopped = pacing.IpPacer(15, killed=lambda: True, now=c.now, sleep=c.sleep)
-    assert stopped.wait("1.1.1.1")                          # first request has no wait
-    assert stopped.wait("1.1.1.1") is False                 # second would have to wait: refuses once stopped
+    assert stopped.wait("1.1.1.1") is False                 # once stopped nothing is sent, not even a first request
+    assert stopped.wait("1.1.1.1") is False
 
 
 def test_split_rounds_never_repeats_an_address_within_a_round():

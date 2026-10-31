@@ -258,14 +258,14 @@ def test_executor_kill_switch_stops_a_running_tool(cfg, tmp_path):
 def test_executor_kills_tool_on_keyboard_interrupt(cfg, tmp_path, monkeypatch):
     ex = _mx(cfg, tmp_path)
     calls = {"n": 0}
-    real = subprocess.Popen.communicate
+    real = subprocess.Popen.wait
 
-    def interrupting(self, input=None, timeout=None):
+    def interrupting(self, timeout=None):
         calls["n"] += 1
         if calls["n"] == 2:
             raise KeyboardInterrupt
-        return real(self, input, timeout)
-    monkeypatch.setattr(subprocess.Popen, "communicate", interrupting)
+        return real(self, timeout)
+    monkeypatch.setattr(subprocess.Popen, "wait", interrupting)
     with pytest.raises(KeyboardInterrupt):
         ex(["bash", "-c", "sleep 79.52 & wait"], timeout=60)
     monkeypatch.undo()

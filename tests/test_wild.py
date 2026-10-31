@@ -55,7 +55,7 @@ def test_surrogate_in_ptr_still_produces_every_output_and_an_honest_manifest(tmp
     cfg = load_config(write_config(tmp_path))
     ft = tools(ptr={IP_OK: ["bad\ud800name.test."]})
     run_dir = go(cfg, ft)
-    for name in ("endpoints.jsonl", "hostname_resolution.jsonl", "hostname_resolution.csv", "tool_jobs.jsonl"):
+    for name in ("endpoints.jsonl", "hostname_resolution.jsonl", "tool_jobs.jsonl"):
         assert (run_dir / "normalized" / name).stat().st_size > 0, name
     manifest = json.loads((run_dir / "manifest.json").read_text())
     assert manifest["complete"] is True and not manifest["stage_errors"]

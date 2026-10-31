@@ -309,9 +309,9 @@ def test_campaign_exit_codes_distinguish_refusal_zero_and_partial(tmp_path, monk
     cfg = load_config(p)
     token = pipeline.confirm_token(cfg, pipeline.build_policy(cfg)[1])
     for reason, code in (("preflight_failed", 2), ("zero_responsive", 4), ("kill_switch", 5), ("egress_changed", 5)):
-        monkeypatch.setattr(c, "run_campaign", lambda cfg_, r=reason: {"complete": False, "stopped": {"reason": r}})
+        monkeypatch.setattr(c, "run_campaign", lambda cfg_, r=reason, **_kw: {"complete": False, "stopped": {"reason": r}})
         assert main(["campaign", "--skip-pilot-check", "--config", str(p), "--confirm", token]) == code, reason
-    monkeypatch.setattr(c, "run_campaign", lambda cfg_: {"complete": True, "stopped": None})
+    monkeypatch.setattr(c, "run_campaign", lambda cfg_, **_kw: {"complete": True, "stopped": None})
     assert main(["campaign", "--skip-pilot-check", "--config", str(p), "--confirm", token]) == 0
 
 

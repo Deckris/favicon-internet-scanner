@@ -64,6 +64,34 @@ $E run --confirm <TOKEN>               # sends traffic; run it inside tmux or sc
 
 The full walk-through, including opt-outs, stopping a run and packing results, is in [`run/QUICKSTART.md`](run/QUICKSTART.md).
 
+## Long campaigns
+
+A full-Internet `campaign` runs for days on a small host. Run it inside tmux, in a systemd scope that caps memory, and start the watchdog beside it:
+
+```bash
+tmux new -s campaign
+ulimit -n 65536
+MALLOC_ARENA_MAX=2 systemd-run --scope -p MemoryHigh=2800M -p MemoryMax=3200M -p MemorySwapMax=1G \
+  python -m scanner.internet campaign --config config.yaml --confirm <TOKEN>
+```
+
+In a second tmux window, give [`run/watchdog.sh`](run/watchdog.sh) the kill-switch file from `operations.kill_switch_file` and the files that should keep changing while the campaign works:
+
+```bash
+bash run/watchdog.sh -k <kill-switch file> -m 700 -s 30 -i 30 -l watchdog.log \
+  -w 'campaign.log' -w 'runs/*/raw/favicon_records.jsonl' -p <campaign pid>
+```
+
+It touches the kill-switch file when `MemAvailable + SwapFree` drops below `-m` MiB, or when none of the `-w` paths (globs allowed) changed for `-s` minutes while no `zmap`, `zgrab2` or `zdns` is running. It writes a heartbeat line every few checks and exits when the kill switch exists or the campaign process is gone. The same file stops the campaign by hand: `bash run/scanner stop`, or `touch` it.
+
+To stop between shards instead of mid-shard, create a file named `DRAIN` in the campaign directory (`<output dir>/campaign-<checksum prefix>/`): the shard in progress finishes, no further shard starts, and the command exits 0. Remove the file before resuming. A run that makes no progress for `operations.stall_minutes` (default 30, 0 = off) while no tool is running is aborted with `abort_reason: stalled`; `kill -USR1 <pid>` writes every thread's stack to `raw/stacks.txt` in the run directory.
+
+On a host with two CPUs the favicon stage (Python, hours per shard) leaves the network tools idle. `campaign --pipeline 2` runs each shard in its own process and starts the next shard's network stages while the previous shard is still in its favicon stage. Two lock files in the campaign directory keep the load per target unchanged: `phase-a.lock` is held from the start of a shard to the end of its network stages, so at most one ZMap sweep is on the wire and the packet rate never exceeds the approved rate; `phase-b.lock` is held from the start of the favicon stage to the end of the write-out, so at most one favicon stage runs at a time. Shards are disjoint slices of one seeded ZMap permutation (same seed, shard count and configuration, one sender thread), so two shards never contact the same address and the 15 s spacing per address holds across processes. For the same reason `--pipeline 2` is refused when `favicon.offhost_icons` is enabled, because an off-host fetch can reach an address in another shard's slice. At most two shards are in flight, the favicon stage runs at a lower priority, and the option is recorded in `campaign.json` and in each manifest. A kill switch, `DRAIN` or SIGTERM is passed on to both shards, a shard that fails stops further launches while the other one finishes, and resuming works as before. It needs POSIX file locks; elsewhere the shards run one after another.
+
+A stopped campaign is marked partial. To resume, delete the kill-switch file and run the same `campaign` command again with the same config and token; finished shards are kept and the rest are run.
+
+To record CPU per core, per-process and per-thread CPU, memory (including the scope's cgroup counters), network and disk figures for tuning, run [`run/measure.sh`](run/measure.sh) next to the campaign, for example `bash run/measure.sh -o measure -m 'scanner.internet campaign' -u <scope name> -l campaign.log -i 10`. It writes CSV files that are sampled every `-i` seconds until the process exits or `measure/stop` appears, and logs the stage transitions found in the log. With `py-spy` installed, `--pyspy 30` also records a flame graph and a stack dump in the background at the start of each stage.
+
 ## Choosing how much of the Internet to scan
 
 The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:
@@ -122,6 +150,8 @@ You edit one file, `settings.yaml`, in your work folder. `config.yaml` and `appr
 ## Output
 
 Each run writes a folder under `runs/` in the work folder: `manifest.json` (settings, checksums, whether the run completed), `report/summary.md`, per-address results (`ip_results.csv`, `normalized/`), any stored favicons, and the raw tool output. `pack` makes an archive of the manifest and report only; per-address files and raw output are added only on request.
+
+The manifest records `output_schema` (2; a run without it is schema 1) and `compression`. In schema 2, `normalized/hostname_resolution.jsonl` holds only the key (`target_ip`, `port`, `hostname`) and the fields that belong to the name; the rest of each row is the endpoint's record in `normalized/endpoints.jsonl`, which `scanner.internet.outputs.iter_hostname_rows(run_dir)` joins back (it reads schema 1 runs as they are). The raw ZGrab2 and ZDNS files are stored as `.jsonl.zst` (zstd) and their checksums are over the compressed file; without the `zstandard` package they stay plain and the manifest says so. `hostname_resolution.csv` is no longer written: `scanner export-csv RUN_DIR [--out FILE]` produces it from the stored rows.
 
 ## Limits
 
