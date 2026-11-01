@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from scanner.zdns_runner import run_zdns
+from scanner.internet import profile
 from scanner.internet.zmap_compat import supported, version_number
 
 Executor = Callable[..., Any]
@@ -96,7 +97,8 @@ def running_zmap_pids(names: tuple[str, ...] = ("zmap",), proc: Path = Path("/pr
     return sorted(found)
 
 
-def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = subprocess.run, offline: bool = False) -> dict[str, Any]:
+def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = subprocess.run, offline: bool = False,
+                  resources: Any = None) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     versions: dict[str, str] = {}
 
@@ -113,12 +115,24 @@ def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = s
                                  "; ".join(f'{c["case"]}={c["outcome"]}' for c in control["cases"]) + " (loopback only)"))
         except Exception as exc:
             checks.append(_check("favicon_positive_control", False, f"{type(exc).__name__}: {exc}"[:200]))
-    try:
-        mem_gib = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemTotal")) / 2**20
-        cores = os.cpu_count() or 1
-        checks.append(_check("host_resources", mem_gib >= 2 and cores >= 2, f"{cores} cores, {mem_gib:.1f} GiB RAM (want >= 2 cores and 2 GiB)", warn=True))
-    except (OSError, StopIteration, ValueError):
-        pass
+    res = resources or profile.detect()
+    mem_gib = res.memory_gb
+    if mem_gib is not None:
+        checks.append(_check("host_resources", mem_gib >= 2 and res.cores >= 2,
+                             f"{res.cores} cores, {mem_gib:.1f} GiB RAM (want >= 2 cores and 2 GiB)", warn=True))
+    plan = {"zgrab_senders": cfg.measurement.zgrab_senders, "zgrab_parallel_batches": cfg.measurement.zgrab_parallel_batches,
+            "dns_threads": cfg.dns.threads, "favicon_max_active_requests": cfg.favicon.max_active_requests}
+    need, budget = profile.file_demand(plan), int(profile.OPEN_FILE_FRACTION * res.open_files)
+    checks.append(_check("plan_fits_open_files", need <= budget,
+                         f"the configured concurrency can hold {need} descriptors at once (ZGrab2 {plan['zgrab_senders']} x "
+                         f"{plan['zgrab_parallel_batches']}, DNS {plan['dns_threads']}, favicon {plan['favicon_max_active_requests']}); "
+                         f"the open-file limit {res.open_files} allows {budget}. Lower the settings or raise the limit (ulimit -n)"))
+    if mem_gib is not None:
+        mem_need = need * profile.PER_CONNECTION_BYTES / 2**30
+        checks.append(_check("plan_fits_memory", mem_need + profile.RESERVED_MEMORY_GB <= mem_gib,
+                             f"{need} connections need about {mem_need:.1f} GiB plus {profile.RESERVED_MEMORY_GB:g} GiB for the system; "
+                             f"the host has {mem_gib:.1f} GiB", warn=True))
+    checks.extend(_kernel_limit_checks(need))
     others = running_zmap_pids(("zmap", Path(cfg.binaries.zmap).name))
     if others is not None:
         checks.append(_check("no_other_zmap", not others,
@@ -207,6 +221,33 @@ def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = s
 
 
 DEFAULT_EGRESS_URLS = ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com")
+
+
+def _read_ints(path: str) -> list[int] | None:
+    try:
+        return [int(x) for x in Path(path).read_text(encoding="ascii").split()]
+    except (OSError, ValueError):
+        return None
+
+
+def _kernel_limit_checks(connections: int, proc: Path = Path("/proc/sys")) -> list[dict[str, str]]:
+    """Ephemeral port range and connection tracking, where the kernel exposes them (Linux); nothing elsewhere."""
+    out: list[dict[str, str]] = []
+    ports = _read_ints(str(proc / "net/ipv4/ip_local_port_range"))
+    if ports and len(ports) == 2:
+        usable = ports[1] - ports[0] + 1
+        out.append(_check("ephemeral_ports", usable >= connections,
+                          f"ip_local_port_range {ports[0]}-{ports[1]} gives {usable} source ports; the plan can hold {connections} "
+                          "connections (a source port is reused across different addresses, so this only bites against few addresses; "
+                          "widen the range with sysctl net.ipv4.ip_local_port_range)", warn=True))
+    limit = _read_ints(str(proc / "net/netfilter/nf_conntrack_max"))
+    if limit:
+        count = _read_ints(str(proc / "net/netfilter/nf_conntrack_count"))
+        used = count[0] if count else 0
+        out.append(_check("conntrack_limit", limit[0] - used >= 2 * connections,
+                          f"nf_conntrack_max {limit[0]} with {used} in use; the plan can hold {connections} connections and each "
+                          "lingers after it closes (raise net.netfilter.nf_conntrack_max, or exempt scan traffic with NOTRACK)", warn=True))
+    return out
 
 
 def zmap_version_supported(version_line: str) -> bool:
