@@ -181,3 +181,146 @@ def test_shards_in_settings_reach_the_config(tmp_path):
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     st.apply(tmp_path)
     assert yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))["sample"]["shards"] == 5
+
+
+def _new_workdir(tmp: Path, *extra: str) -> Path:
+    path = _init(tmp, "--cores", "4", "--memory-gb", "16", "--max-open-files", "65536", *extra)
+    _approve(path)
+    return path
+
+
+def _set_scope(path: Path, **values) -> None:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["scope"].update(values)
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def _config(tmp: Path) -> dict:
+    return yaml.safe_load((tmp / "config.yaml").read_text(encoding="utf-8"))
+
+
+def test_absent_icon_keys_leave_the_config_as_before(tmp_path):
+    _new_workdir(tmp_path)
+    st.apply(tmp_path)
+    favicon = _config(tmp_path)["favicon"]
+    assert "icon_selection" not in favicon and "javascript" not in favicon
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.favicon.icon_selection == "first_image" and cfg.favicon.javascript.enabled is False
+
+
+def test_old_settings_without_the_new_keys_apply_to_the_same_config(tmp_path):
+    path = _new_workdir(tmp_path)
+    st.apply(tmp_path)
+    before = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for key in ("icon_selection", "javascript", "max_connections_per_subnet"):
+        data["scope"].pop(key, None)
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    assert st.apply(tmp_path)["written"] == []
+    assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == before
+
+
+def test_icon_selection_round_trips_and_is_checked(tmp_path, capsys):
+    path = _new_workdir(tmp_path)
+    _set_scope(path, icon_selection="browser_models")
+    st.apply(tmp_path)
+    assert load_config(tmp_path / "config.yaml").favicon.icon_selection == "browser_models"
+    _set_scope(path, icon_selection="everything")
+    assert main(["apply", "--workdir", str(tmp_path)]) == 2
+    assert "icon_selection" in capsys.readouterr().err
+    assert main(["apply", "--workdir", str(tmp_path), "--icon-selection", "first_image"]) == 0
+    assert load_config(tmp_path / "config.yaml").favicon.icon_selection == "first_image"
+
+
+def test_javascript_block_round_trips(tmp_path):
+    path = _new_workdir(tmp_path)
+    _set_scope(path, javascript={"enabled": True, "max_pages_per_shard": 50, "page_timeout_seconds": 12, "concurrency": 3, "wait_ms": 700})
+    st.apply(tmp_path)
+    js = load_config(tmp_path / "config.yaml").favicon.javascript
+    assert (js.enabled, js.max_pages_per_shard, js.page_timeout_seconds, js.concurrency, js.wait_ms) == (True, 50, 12, 3, 700)
+
+
+def test_javascript_concurrency_is_automatic_unless_given(tmp_path):
+    path = _new_workdir(tmp_path)
+    _set_scope(path, javascript={"enabled": True, "concurrency": "auto"})
+    st.apply(tmp_path)
+    assert "concurrency" not in _config(tmp_path)["favicon"]["javascript"]
+    assert load_config(tmp_path / "config.yaml").favicon.javascript.concurrency is None
+    assert main(["apply", "--workdir", str(tmp_path), "--javascript-concurrency", "2", "--javascript-wait-ms", "0"]) == 0
+    js = load_config(tmp_path / "config.yaml").favicon.javascript
+    assert js.enabled is True and js.concurrency == 2 and js.wait_ms == 0
+
+
+@pytest.mark.parametrize("block", [
+    {"enabled": "yes"}, {"enabled": True, "max_pages_per_shard": 0}, {"page_timeout_seconds": 500},
+    {"concurrency": 65}, {"concurrency": "many"}, {"wait_ms": -1}, {"wait_ms": 1.5}, {"unknown": 1}, "on",
+])
+def test_invalid_javascript_settings_are_refused(tmp_path, block):
+    path = _new_workdir(tmp_path)
+    _set_scope(path, javascript=block)
+    with pytest.raises(st.SettingsError, match="javascript"):
+        st.apply(tmp_path)
+
+
+def test_icon_flags_in_init_are_written_to_settings_and_applied(tmp_path):
+    path = _new_workdir(tmp_path, "--icon-selection", "browser_models", "--javascript-enabled", "true",
+                        "--javascript-concurrency", "2", "--max-connections-per-subnet", "3", "--offhost-icons", "true")
+    scope = yaml.safe_load(path.read_text(encoding="utf-8"))["scope"]
+    assert scope["icon_selection"] == "browser_models" and scope["max_connections_per_subnet"] == 3 and scope["offhost_icons"] is True
+    assert scope["javascript"]["enabled"] is True and scope["javascript"]["concurrency"] == 2
+    st.apply(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.favicon.icon_selection == "browser_models" and cfg.favicon.javascript.enabled and cfg.favicon.javascript.concurrency == 2
+    assert cfg.measurement.max_connections_per_subnet == 3 and cfg.favicon.offhost.enabled is True
+
+
+def test_offhost_icons_work_with_several_favicon_processes(tmp_path):
+    path = _new_workdir(tmp_path)
+    _set_scope(path, offhost_icons=True, favicon_processes=4, favicon_workers=64)
+    st.apply(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.favicon.offhost.enabled and cfg.favicon.processes == 4
+    assert "offhost_icon_fetch" in yaml.safe_load((tmp_path / "approval.yaml").read_text(encoding="utf-8"))["operations"]
+
+
+def test_max_connections_per_subnet_round_trips_and_is_checked(tmp_path):
+    path = _new_workdir(tmp_path)
+    _set_scope(path, max_connections_per_subnet=2)
+    st.apply(tmp_path)
+    assert load_config(tmp_path / "config.yaml").measurement.max_connections_per_subnet == 2
+    _set_scope(path, max_connections_per_subnet=65)
+    with pytest.raises(st.SettingsError, match="max_connections_per_subnet"):
+        st.apply(tmp_path)
+
+
+def test_icon_settings_change_the_checksum_but_hardware_settings_do_not(tmp_path):
+    path = _new_workdir(tmp_path)
+    st.apply(tmp_path)
+    base = load_config(tmp_path / "config.yaml").checksum
+    _set_scope(path, icon_selection="browser_models")
+    st.apply(tmp_path)
+    selected = load_config(tmp_path / "config.yaml").checksum
+    _set_scope(path, javascript={"enabled": True})
+    st.apply(tmp_path)
+    scripted = load_config(tmp_path / "config.yaml").checksum
+    assert len({base, selected, scripted}) == 3
+    _set_scope(path, javascript={"enabled": True}, favicon_workers=128)
+    st.apply(tmp_path)
+    assert load_config(tmp_path / "config.yaml").checksum == scripted
+
+
+def test_plan_prints_the_icon_settings(tmp_path, capsys):
+    path = _new_workdir(tmp_path)
+    _set_scope(path, icon_selection="browser_models", javascript={"enabled": True})
+    st.apply(tmp_path)
+    capsys.readouterr()
+    assert main(["plan", "--config", str(tmp_path / "config.yaml"), "--cores", "8", "--memory-gb", "32"]) == 0
+    out = capsys.readouterr().out
+    shown = yaml.safe_load(out[:out.index("\nNothing was sent")])["resource_plan"]["favicon_settings"]
+    assert shown["icon_selection"] == "browser_models" and shown["javascript"]["enabled"] is True
+    assert shown["javascript"]["concurrency"] == prof_js(8, 32) and shown["javascript"]["concurrency_from"] == "host"
+
+
+def prof_js(cores, memory):
+    from scanner.internet import profile
+    return profile.javascript_concurrency(cores, memory)

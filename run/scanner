@@ -42,6 +42,13 @@ Run:
   summary RUN_DIR                print the run's report
   pack RUN_DIR [--with-results]  make an archive: manifest and report only; --with-results adds per-address files
   export-csv RUN_DIR [--out FILE]  write the hostname table of a run as CSV (runs no longer store it)
+  campaign --confirm TOKEN       run every shard of a sharded config (see `scanner help campaign`)
+  compact RUN_DIR                compress the per-address files of a finished run
+  prune-raw RUN_DIR              delete raw/ of a compacted run
+  export-shard RUN_DIR DEST      copy a finished shard to another disk, verified
+  export-network RUN_DIR OUT_DIR copy a network-only shard so its favicon stage can run elsewhere
+  favicon-stage RUN_DIR --confirm TOKEN   run the favicon stage of a network-only shard
+  import-favicons RUN_DIR FAV_RUN_DIR     take the favicon outputs of another host into a network-only shard
 
 Other:
   build                          docker mode: build the image from this package
@@ -104,6 +111,17 @@ scanner run --confirm TOKEN [--allow-rerun] [--skip-pilot-check]
 Runs the pipeline. Refused without a contact and information page, past the approved rate or size, outside the
 approval's validity, and for a large sample until a small pilot has completed (--skip-pilot-check overrides the
 last). Requests to one address are spaced by min_seconds_between_probes_per_ip (5 s or more). `scanner stop` ends it.
+EOF
+    ;;
+    campaign|favicon-stage|export-network|import-favicons|export-shard|compact|prune-raw) cat <<'EOF'
+scanner campaign --confirm TOKEN [--shards-from N] [--shards-to N] [--pipeline 1|2] [--stop-after-network] [--no-resume]
+scanner favicon-stage RUN_DIR --confirm TOKEN
+scanner export-network RUN_DIR OUT_DIR | import-favicons RUN_DIR FAV_RUN_DIR | export-shard RUN_DIR DEST [--remove-source]
+scanner compact RUN_DIR | prune-raw RUN_DIR
+
+Same program, same checks as `run`; RUN_DIR and the other folders are paths relative to --workdir. In docker mode
+they must lie inside --workdir. The settings flags of `apply` (--icon-selection, --javascript-enabled, ...) are
+accepted by init, apply and plan; `plan` shows the result under favicon_settings.
 EOF
     ;;
     stop|summary|pack|export-csv|build|verify|favicons) usage ;;
@@ -216,15 +234,61 @@ stage_args() {   # prints the arguments with the file after --exclusions / --fro
   REST=("${out[@]+"${out[@]}"}")
 }
 
+# The flags that change settings.yaml's output (resources, concurrency, icons, JavaScript); doctor, plan and run apply them too.
+SETTINGS_FLAGS=()
+collect_settings_flags() {
+  SETTINGS_FLAGS=()
+  local i=0 a
+  while [ $i -lt ${#REST[@]} ]; do
+    a="${REST[$i]}"
+    case "$a" in
+      --cores|--memory-gb|--max-open-files|--zgrab-senders|--zgrab-parallel-batches|--zgrab-batch-size|--dns-threads|--favicon-workers|--favicon-processes|--favicon-max-active-requests|--favicon-stage-max-seconds|--overlap-tls-with-zmap|--max-connections-per-subnet|--icon-selection|--offhost-icons|--javascript-enabled|--javascript-max-pages-per-shard|--javascript-page-timeout-seconds|--javascript-concurrency|--javascript-wait-ms)
+        SETTINGS_FLAGS+=("$a" "${REST[$((i + 1))]:?$a needs a value}"); i=$((i + 2)) ;;
+      *) i=$((i + 1)) ;;
+    esac
+  done
+}
+
+# A folder argument as the program sees it: relative to --workdir, and inside it in docker mode.
+path_in() {
+  local p="$1"
+  case "$p" in /*) ;; *) p="$WORKDIR/$p" ;; esac
+  if [ "$MODE" = docker ]; then
+    case "$p" in "$WORKDIR"/*) p="/work/${p#"$WORKDIR"/}" ;; *) die "$1 must be inside --workdir in docker mode" ;; esac
+  fi
+  PATH_IN="$p"
+}
+
+# Arguments of a command with folder arguments: the first $1 positional words and the values of --archive-to / --out are paths.
+map_paths() {
+  local want="$1" seen=0 prev="" a out=()
+  shift
+  for a in "$@"; do
+    if [ "$prev" = "--archive-to" ] || [ "$prev" = "--out" ]; then path_in "$a"; out+=("$PATH_IN")
+    else
+      case "$a" in
+        -*) out+=("$a") ;;
+        *) case "$prev" in
+             --confirm|--shards-from|--shards-to|--pipeline|--archive-when-free-gb-below|--run-id|--shard|--config) out+=("$a") ;;
+             *) if [ $seen -lt "$want" ]; then path_in "$a"; out+=("$PATH_IN"); seen=$((seen + 1)); else out+=("$a"); fi ;;
+           esac ;;
+      esac
+    fi
+    prev="$a"
+  done
+  REST=("${out[@]+"${out[@]}"}")
+}
+
 # settings.yaml is the one file people edit; make config.yaml and approval.yaml follow it.
 ensure_applied() {
   [ -f "$WORKDIR/settings.yaml" ] || return 0
-  scanner apply --workdir "$WORK_IN" >/dev/null || die "settings.yaml needs attention (run: scanner apply)"
+  collect_settings_flags
+  scanner apply --workdir "$WORK_IN" "${SETTINGS_FLAGS[@]+"${SETTINGS_FLAGS[@]}"}" >/dev/null || die "settings.yaml needs attention (run: scanner apply)"
 }
 
 case "$CMD" in
   init)       stage_args "${REST[@]+"${REST[@]}"}"; scanner init --workdir "$WORK_IN" "${REST[@]+"${REST[@]}"}" ;;
-  apply)      scanner apply --workdir "$WORK_IN" ;;
+  apply)      scanner apply --workdir "$WORK_IN" "${REST[@]+"${REST[@]}"}" ;;
   exclusions) stage_args "${REST[@]+"${REST[@]}"}"; scanner exclusions --workdir "$WORK_IN" "${REST[@]+"${REST[@]}"}" ;;
   build)
     [ "$MODE" = docker ] || die "build is for docker mode (use --docker)"
@@ -245,8 +309,17 @@ case "$CMD" in
     echo "test results are in $out"
     ;;
   doctor)    ensure_applied; scanner preflight --config "$CONFIG_IN" "${REST[@]}" ;;
-  plan)      ensure_applied; scanner plan --config "$CONFIG_IN" ;;
+  plan)      ensure_applied; scanner plan --config "$CONFIG_IN" "${SETTINGS_FLAGS[@]+"${SETTINGS_FLAGS[@]}"}" ;;
   run)       ensure_applied; scanner run --config "$CONFIG_IN" "${REST[@]}" ;;
+  campaign)   ensure_applied; map_paths 0 "${REST[@]+"${REST[@]}"}"; scanner campaign --config "$CONFIG_IN" "${REST[@]+"${REST[@]}"}" ;;
+  favicon-stage) ensure_applied; map_paths 1 "${REST[@]+"${REST[@]}"}"; scanner favicon-stage --config "$CONFIG_IN" "${REST[@]+"${REST[@]}"}" ;;
+  export-network|import-favicons) map_paths 2 "${REST[@]+"${REST[@]}"}"; scanner "$CMD" "${REST[@]+"${REST[@]}"}" ;;
+  export-shard)
+    map_paths 2 "${REST[@]+"${REST[@]}"}"
+    cfgopt=(); [ -f "$CONFIG_ABS" ] && cfgopt=(--config "$CONFIG_IN")
+    scanner export-shard "${cfgopt[@]+"${cfgopt[@]}"}" "${REST[@]+"${REST[@]}"}"
+    ;;
+  compact|prune-raw) map_paths 1 "${REST[@]+"${REST[@]}"}"; scanner "$CMD" "${REST[@]+"${REST[@]}"}" ;;
   favicons)
     src=""; extra=()
     while [ ${#REST[@]} -gt 0 ]; do

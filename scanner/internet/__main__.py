@@ -93,6 +93,7 @@ def _settings_command(args) -> int:
                 if Path(args.exclusions).resolve() != target.resolve():
                     shutil.copyfile(args.exclusions, target)
             answers.update(_profile_flags(args))
+            answers.update(_scope_flags(args))
             path = st.write_settings(workdir, answers, force=args.force)
             print(f"wrote {path}\nEdit it (every REPLACE_ME), then run: scanner apply")
             if not args.exclusions and not (workdir / "exclusions.txt").exists():
@@ -100,7 +101,7 @@ def _settings_command(args) -> int:
                       f"{workdir / 'exclusions.txt'} (or run `scanner init --force --exclusions FILE`).")
             return 0
         if args.command == "apply":
-            result = st.apply(workdir, _profile_flags(args))
+            result = st.apply(workdir, {**_profile_flags(args), **_scope_flags(args)})
             print(json.dumps(result, indent=2))
             print("config.yaml and approval.yaml are up to date" if not result["written"]
                   else "wrote " + ", ".join(result["written"]))
@@ -146,6 +147,24 @@ def _profile_flags(args) -> dict:
     return out
 
 
+SCOPE_FLAGS = ("icon_selection", "max_connections_per_subnet", "javascript_enabled", "javascript_max_pages_per_shard",
+               "javascript_page_timeout_seconds", "javascript_concurrency", "javascript_wait_ms", "offhost_icons")
+
+
+def _scope_flags(args) -> dict:
+    """The icon, JavaScript, off-host and per-subnet flags that were given, with the true/false ones as booleans."""
+    out = {name: getattr(args, name) for name in SCOPE_FLAGS if getattr(args, name, None) is not None}
+    for name in ("javascript_enabled", "offhost_icons"):
+        if name in out:
+            out[name] = out[name] == "true"
+    if "javascript_concurrency" in out and out["javascript_concurrency"] != "auto":
+        try:
+            out["javascript_concurrency"] = int(out["javascript_concurrency"])
+        except ValueError:
+            pass       # left as given; apply refuses it with the range
+    return out
+
+
 def _resource_plan(cfg, args) -> dict:
     """What the configured concurrency asks of this host, next to what the host offers."""
     from scanner.internet import profile
@@ -156,10 +175,17 @@ def _resource_plan(cfg, args) -> dict:
             "dns_threads": cfg.dns.threads, "favicon_workers": f.workers, "favicon_processes": f.processes,
             "favicon_max_active_requests": f.max_active_requests, "favicon_stage_max_seconds": f.stage_max_seconds,
             "overlap_tls_with_zmap": m.overlap_tls_with_zmap}
+    js = f.javascript
+    icons = {"icon_selection": f.icon_selection, "offhost_icons": f.offhost.enabled,
+             "max_connections_per_subnet": m.max_connections_per_subnet,
+             "javascript": {"enabled": js.enabled, "max_pages_per_shard": js.max_pages_per_shard,
+                            "page_timeout_seconds": js.page_timeout_seconds, "wait_ms": js.wait_ms,
+                            "concurrency": js.concurrency or profile.javascript_concurrency(res.cores, res.memory_gb),
+                            "concurrency_from": "config" if js.concurrency else "host"}}
     budget = profile.connection_budget(res.cores, res.memory_gb, res.open_files)
     return {"host": {"cores": res.cores, "memory_gb": None if res.memory_gb is None else round(res.memory_gb, 1),
                      "max_open_files": res.open_files},
-            "connection_budget": budget, "configured": plan, "descriptors_needed": profile.file_demand(plan),
+            "connection_budget": budget, "configured": plan, "favicon_settings": icons, "descriptors_needed": profile.file_demand(plan),
             "fits_open_files": profile.fits_open_files(plan, res.open_files)}
 
 
@@ -260,6 +286,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--favicon-stage-max-seconds", type=int, help="init, apply: time limit of the favicon stage (1-86400)")
     ap.add_argument("--overlap-tls-with-zmap", choices=("true", "false", "auto"),
                     help="init, apply: start TLS while ZMap sweeps later ports (auto: on from 4 cores)")
+    ap.add_argument("--max-connections-per-subnet", type=int, help="init, apply: connections open at once to one /24 (1-64)")
+    ap.add_argument("--icon-selection", choices=("first_image", "browser_models"), help="init, apply: which declared icons the favicon stage fetches")
+    ap.add_argument("--offhost-icons", choices=("true", "false"), help="apply: fetch icons hosted elsewhere (the approval must allow it)")
+    ap.add_argument("--javascript-enabled", choices=("true", "false"), help="init, apply: render pages in a headless browser to find script-added icons")
+    ap.add_argument("--javascript-max-pages-per-shard", type=int, help="init, apply: pages rendered per shard (1-10000000)")
+    ap.add_argument("--javascript-page-timeout-seconds", type=float, help="init, apply: time limit per rendered page (1-120)")
+    ap.add_argument("--javascript-concurrency", help="init, apply: browsers at once (1-64 or auto)")
+    ap.add_argument("--javascript-wait-ms", type=int, help="init, apply: wait after page load for scripts, in ms (0-30000)")
 
     # campaign: which shards this invocation covers (several hosts can share one campaign definition)
     ap.add_argument("--shards-from", type=int, default=0, metavar="N",

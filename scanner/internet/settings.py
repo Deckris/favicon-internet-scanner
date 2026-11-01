@@ -23,6 +23,8 @@ PLACEHOLDER = "REPLACE_ME"
 SETTINGS_NAME, CONFIG_NAME, APPROVAL_NAME = "settings.yaml", "config.yaml", "approval.yaml"
 MIN_PACE_SECONDS = 5.0                     # the shortest pause between two requests to one address that any approval may allow
 ALLOWED_ADDRESSES = 3_702_258_432          # routable IPv4 after reserved space; the run recomputes the exact figure
+ICON_SELECTIONS = ("first_image", "browser_models")
+JAVASCRIPT_KEYS = ("enabled", "max_pages_per_shard", "page_timeout_seconds", "concurrency", "wait_ms")
 EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 TEMPLATE = """\
@@ -62,7 +64,14 @@ scope:
   # favicon_max_active_requests: 512  # favicon requests on the wire at once (1-8192)
   # favicon_stage_max_seconds: 86400  # time limit of the favicon stage (1-86400)
   try_unverified_names: false       # also request pages under certificate names that did not verify
-  offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it)
+  offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it); works with favicon_processes above 1
+  # icon_selection: first_image       # first_image | browser_models: which declared icons are fetched; part of the config checksum
+  # javascript:                       # render pages in a headless browser to find icons added by scripts; off unless enabled
+  #   enabled: false
+  #   max_pages_per_shard: 1000       # 1 to 10000000
+  #   page_timeout_seconds: 20        # 1 to 120
+  #   concurrency: auto               # 1 to 64; auto follows the cores and RAM of the host
+  #   wait_ms: 1500                   # wait after load for scripts to add icons, 0 to 30000
 
 approval:                           # copy these from the real approval; they cap what a run may ask for
   status: {approval_status}         # `blocked` until the approving authority has approved, then `approved`
@@ -139,6 +148,22 @@ def _with_profile_answers(text: str, answers: dict[str, Any]) -> str:
             text = re.sub(rf"^#   {key}: .*$", f"  {key}: {value}", text, count=1, flags=re.MULTILINE)
     if any(answers.get(k) is not None for k in ("cores", "memory_gb", "max_open_files")):
         text = text.replace("# resources:", "resources:", 1)
+    for key in ("icon_selection", "max_connections_per_subnet"):
+        value = answers.get(key)
+        if value is not None:
+            text = re.sub(rf"^(\s*)# {key}: [^#\n]*?(\s*#.*)?$", lambda m: f"{m.group(1)}{key}: {value}{m.group(2) or ''}",
+                          text, count=1, flags=re.MULTILINE)
+    if answers.get("offhost_icons") is not None:
+        shown = str(bool(answers["offhost_icons"])).lower()
+        text = re.sub(r"^(\s*)offhost_icons: \w+", lambda m: f"{m.group(1)}offhost_icons: {shown}", text, count=1, flags=re.MULTILINE)
+    given = {k[len("javascript_"):]: v for k, v in answers.items() if k.startswith("javascript_") and v is not None}
+    if given:
+        text = text.replace("  # javascript:", "  javascript:", 1)
+        for key in JAVASCRIPT_KEYS:
+            shown = given.get(key)
+            shown = str(shown).lower() if isinstance(shown, bool) else shown
+            pattern = re.compile(rf"^  #   {key}: ([^#\n]*?)(\s*#.*)?$", re.MULTILINE)
+            text = pattern.sub(lambda m: f"    {key}: {m.group(1) if shown is None else shown}{m.group(2) or ''}", text, count=1)
     return text
 
 
@@ -256,11 +281,47 @@ def resolve_resources(s: dict[str, Any], cli: dict[str, Any] | None = None) -> t
     return resources, overrides
 
 
+def _whole(value: Any, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
+
+
+def _icon_settings(scope: dict[str, Any], cli: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """The icon selection and the JavaScript block from settings.yaml, with command-line flags over them; None when not set."""
+    selection = cli.get("icon_selection", scope.get("icon_selection"))
+    if selection is not None and selection not in ICON_SELECTIONS:
+        raise SettingsError(f"scope.icon_selection `{selection}` must be one of {', '.join(ICON_SELECTIONS)}")
+    block = scope.get("javascript")
+    given = {k[len("javascript_"):]: v for k, v in cli.items() if k.startswith("javascript_") and v is not None}
+    if block is None and not given:
+        return selection, None
+    if block is not None and not isinstance(block, dict):
+        raise SettingsError("scope.javascript must hold enabled, max_pages_per_shard, page_timeout_seconds, concurrency and wait_ms")
+    js = {**(block or {}), **given}
+    unknown = set(js) - set(JAVASCRIPT_KEYS)
+    if unknown:
+        raise SettingsError(f"scope.javascript has unknown setting {', '.join(sorted(map(str, unknown)))}")
+    if not isinstance(js.get("enabled", False), bool):
+        raise SettingsError("scope.javascript.enabled must be true or false")
+    if "max_pages_per_shard" in js and not _whole(js["max_pages_per_shard"], 1, 10**7):
+        raise SettingsError("scope.javascript.max_pages_per_shard must be a whole number from 1 to 10000000")
+    timeout = js.get("page_timeout_seconds")
+    if "page_timeout_seconds" in js and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 1 <= timeout <= 120):
+        raise SettingsError("scope.javascript.page_timeout_seconds must be a number from 1 to 120")
+    if isinstance(js.get("concurrency"), str) and js["concurrency"].strip().lower() == "auto":
+        js["concurrency"] = None
+    if js.get("concurrency") is not None and not _whole(js["concurrency"], 1, 64):
+        raise SettingsError("scope.javascript.concurrency must be auto or a whole number from 1 to 64")
+    if "wait_ms" in js and not _whole(js["wait_ms"], 0, 30000):
+        raise SettingsError("scope.javascript.wait_ms must be a whole number from 0 to 30000")
+    return selection, {"enabled": False, **{k: v for k, v in js.items() if v is not None}}
+
+
 def derived_plan(s: dict[str, Any], cli: dict[str, Any] | None = None) -> tuple[prof.Resources, dict[str, Any]]:
     resources, overrides = resolve_resources(s, cli)
     try:
         plan = prof.derive(resources.cores, resources.memory_gb, resources.open_files,
-                           offhost_icons=bool(s.get("scope", {}).get("offhost_icons", False)), overrides=overrides)
+                           offhost_icons=bool((cli or {}).get("offhost_icons", s.get("scope", {}).get("offhost_icons", False))),
+                           overrides=overrides)
     except ValueError as exc:
         raise SettingsError(str(exc)) from exc
     return resources, plan
@@ -314,7 +375,8 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
     overlap = scope.get("overlap_tls_with_zmap", "auto")
     if not isinstance(overlap, bool) and str(overlap).strip().lower() != "auto":
         raise SettingsError("scope.overlap_tls_with_zmap must be auto, true or false")
-    subnet_cap = scope.get("max_connections_per_subnet")
+    cli_flags = {k: v for k, v in (cli or {}).items() if v is not None}
+    subnet_cap = cli_flags.get("max_connections_per_subnet", scope.get("max_connections_per_subnet"))
     if subnet_cap is not None and (not isinstance(subnet_cap, int) or isinstance(subnet_cap, bool) or not 1 <= subnet_cap <= 64):
         raise SettingsError("scope.max_connections_per_subnet must be a whole number from 1 to 64")
     if appr["status"] not in ("blocked", "approved"):
@@ -330,7 +392,10 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
         check = "nic" if source_ip == public_ip else "url"
     if check not in ("nic", "url", "off"):
         raise SettingsError("host.egress_check must be auto, nic, url or off")
-    offhost = bool(scope.get("offhost_icons", False))
+    offhost = cli_flags.get("offhost_icons", scope.get("offhost_icons", False))
+    if not isinstance(offhost, bool):
+        raise SettingsError("scope.offhost_icons must be true or false")
+    icon_selection, javascript = _icon_settings(scope, cli_flags)
     resources, plan = derived_plan(s, cli)
     if not prof.fits_open_files(plan, resources.open_files):
         raise SettingsError(f"the plan needs {prof.file_demand(plan)} open descriptors but only "
@@ -369,6 +434,10 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
              max_active_requests=plan["favicon_max_active_requests"],
              max_unverified_names_per_endpoint=2 if scope.get("try_unverified_names") else 0)
     f["offhost_icons"] = {**f.get("offhost_icons", {}), "enabled": offhost}
+    if icon_selection is not None:
+        f["icon_selection"] = icon_selection
+    if javascript is not None:
+        f["javascript"] = javascript
     base["fetch"]["user_agent"] = f"{s.get('scanner_name', 'research-scanner')} (+{info}; contact {contact})"
     base["transparency"] = {"info_url": info, "contact": contact}
     base["output"] = {"dir": str(run["output_dir"])}
