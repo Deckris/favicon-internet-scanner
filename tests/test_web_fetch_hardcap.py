@@ -264,6 +264,7 @@ def test_a_watchdog_that_cannot_start_fails_the_request_cleanly(serve, monkeypat
         def start(self):
             raise RuntimeError("can't start new thread")
     srv = serve(silent)
+    monkeypatch.setattr(web_fetch, "_WATCHDOG", web_fetch._WatchdogService())
     monkeypatch.setattr(web_fetch.threading, "Thread", Refusing)
     res, took = _get(_fetcher(), "http", srv.port)
     assert res.outcome == "fetch_error" and took < 1.0
@@ -309,3 +310,61 @@ def test_connect_after_expiry_fails_fast():
     import httpcore
     with pytest.raises(httpcore.ConnectError):
         backend.connect_tcp(LOOPBACK, 9, timeout=1.0)
+
+
+def _answer_ok(conn, stop):
+    conn.recv(4096)
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+
+
+def test_requests_share_one_watchdog_thread_and_one_client_per_worker(serve):
+    srv = serve(_answer_ok)
+    fetcher = _fetcher()
+    _get(fetcher, "http", srv.port)
+    client = web_fetch._LOCAL.client
+    before = threading.active_count()
+    for _ in range(5):
+        res, _took = _get(fetcher, "http", srv.port)
+        assert res.outcome == "ok"
+        assert web_fetch._LOCAL.client is client
+        assert not client._transport._pool.connections          # nothing is kept alive between requests
+    assert threading.active_count() <= before + 1                 # the server's handler thread; no thread per request
+
+
+def test_one_watchdog_ends_many_stalled_requests_at_their_deadline(serve):
+    srv = serve(silent)
+    results = []
+
+    def one():
+        results.append(_get(_fetcher(limits=_limits(total=1.0)), "http", srv.port))
+    threads = [threading.Thread(target=one) for _ in range(12)]
+    t0 = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(results) == 12 and all(r.outcome == "timeout" for r, _ in results)
+    assert time.monotonic() - t0 < 1.0 + 1.0
+
+
+def test_watchdog_thread_ends_when_idle_and_restarts_on_demand():
+    service = web_fetch._WatchdogService()
+    service.IDLE = 0.1
+    fired = []
+    watch = service.watch(time.monotonic() + 0.05, lambda: False, lambda: fired.append(1))
+    assert watch.fired.wait(2.0) and fired == [1]
+    thread = service._thread
+    thread.join(2.0)
+    assert not thread.is_alive()
+    done = service.watch(time.monotonic() + 30, lambda: False, lambda: fired.append(2))
+    done.finish()
+    assert fired == [1] and service._thread is not thread
+
+
+def test_a_finished_request_is_never_expired_afterwards():
+    service = web_fetch._WatchdogService()
+    fired = []
+    watch = service.watch(time.monotonic() + 0.1, lambda: False, lambda: fired.append(1))
+    watch.finish()
+    time.sleep(0.6)
+    assert fired == [] and not watch.fired.is_set()

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import contextlib
 import ipaddress
+import os
 import socket
 import ssl
 import threading
@@ -172,6 +174,114 @@ class _SocketGuard:
                     pass
 
 
+class _Watch:
+    """One request's registration with the watchdog service."""
+
+    def __init__(self, service: "_WatchdogService", deadline: float, killed: Callable[[], bool], expire: Callable[[], None]) -> None:
+        self._service = service
+        self.deadline = deadline
+        self.killed = killed
+        self._expire = expire
+        self._lock = threading.Lock()
+        self._done = False
+        self.fired = threading.Event()
+
+    def fire(self) -> None:
+        with self._lock:
+            if self._done:
+                return
+            self.fired.set()
+            self._done = True
+            try:
+                self._expire()
+            except Exception:
+                pass
+
+    def finish(self) -> None:
+        """Called by the worker when the request is over; once this returns the watchdog never fires for it."""
+        with self._lock:
+            self._done = True
+        self._service.forget(self)
+
+
+class _WatchdogService:
+    """One thread that enforces the wall-clock cap and the kill switch of every request in flight.
+
+    A thread per request costs a thread start and stop on each fetch; here the requests register a deadline and an
+    ``expire`` callback instead. The thread wakes at the earliest deadline or every ``TICK`` seconds, whichever is
+    sooner, so a deadline is met to within a tick and the kill switch is noticed within one. It ends after ``IDLE``
+    seconds without a request and is started again by the next one. A kill switch is asked once per tick however
+    many requests share it, and one that raises counts as not set.
+    """
+
+    TICK = 0.25
+    IDLE = 1.0
+
+    def __init__(self) -> None:
+        self._reset()
+
+    def _reset(self) -> None:
+        self._cond = threading.Condition()
+        self._entries: set[_Watch] = set()
+        self._thread: threading.Thread | None = None
+        self._sleeping_idle = False
+
+    def watch(self, deadline: float, killed: Callable[[], bool], expire: Callable[[], None]) -> _Watch:
+        """Registers a request; raises ``RuntimeError`` when the service thread cannot be started."""
+        entry = _Watch(self, deadline, killed, expire)
+        with self._cond:
+            if self._thread is None or not self._thread.is_alive():
+                thread = threading.Thread(target=self._run, daemon=True)
+                thread.start()
+                self._thread = thread
+            self._entries.add(entry)
+            if self._sleeping_idle:
+                self._cond.notify()
+        return entry
+
+    def forget(self, entry: _Watch) -> None:
+        with self._cond:
+            self._entries.discard(entry)
+
+    def _run(self) -> None:
+        me = threading.current_thread()
+        while True:
+            with self._cond:
+                if not self._entries:
+                    self._sleeping_idle = True
+                    try:
+                        self._cond.wait(self.IDLE)
+                    finally:
+                        self._sleeping_idle = False
+                    if not self._entries:
+                        if self._thread is me:
+                            self._thread = None
+                        return
+                entries = list(self._entries)
+            now = time.monotonic()
+            stops: dict[int, bool] = {}
+            for entry in entries:
+                if now < entry.deadline:
+                    key = id(entry.killed)
+                    if key not in stops:
+                        try:
+                            stops[key] = bool(entry.killed())
+                        except Exception:
+                            stops[key] = False
+                    if not stops[key]:
+                        continue
+                entry.fire()
+                self.forget(entry)
+            soonest = min((e.deadline for e in entries if not e.fired.is_set()), default=now + self.TICK)
+            time.sleep(max(0.0, min(self.TICK, soonest - time.monotonic())))
+
+
+_WATCHDOG = _WatchdogService()
+if hasattr(os, "register_at_fork"):
+    # a forked favicon process keeps neither the thread nor a lock another thread held at the fork
+    os.register_at_fork(after_in_child=lambda: _WATCHDOG._reset())
+
+
 _SLICE = 0.25
 
 
@@ -274,6 +384,57 @@ class _GuardedBackend(httpcore.SyncBackend):
             raise httpcore.ConnectTimeout(exc) from exc
         except OSError as exc:
             raise httpcore.ConnectError(exc) from exc
+
+
+class _ThreadGuardBackend(_GuardedBackend):
+    """The same backend for a client that outlives a request: the guard is the one of the request this thread is running."""
+
+    def __init__(self) -> None:
+        httpcore.SyncBackend.__init__(self)
+
+    @property
+    def _guard(self) -> _SocketGuard:           # type: ignore[override]
+        guard = getattr(_LOCAL, "guard", None)
+        if guard is None:
+            raise httpcore.ConnectError(OSError("no request in progress"))
+        return guard
+
+
+_LOCAL = threading.local()
+_SSL_LOCK = threading.Lock()
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _thread_client() -> httpx.Client:
+    global _SSL_CONTEXT
+    with _SSL_LOCK:         # the transport sets the ALPN list on the context it is given
+        if _SSL_CONTEXT is None:
+            _SSL_CONTEXT = httpx.create_ssl_context(verify=False)
+        transport = httpx.HTTPTransport(verify=_SSL_CONTEXT, http2=False, trust_env=False,
+                                        limits=httpx.Limits(max_connections=None, max_keepalive_connections=0))
+    transport._pool._network_backend = _ThreadGuardBackend()
+    return httpx.Client(transport=transport, trust_env=False, follow_redirects=False)
+
+
+@contextlib.contextmanager
+def _request_client(guard: _SocketGuard):
+    """The calling thread's client, bound to ``guard`` for one request.
+
+    Building a client builds a pool and a transport, which a fetch of a few kilobytes does not need to repeat.
+    Nothing is kept alive between requests: the pool holds no idle connection, and whatever it still holds when
+    the request ends is closed.
+    """
+    client = getattr(_LOCAL, "client", None)
+    if client is None:
+        client = _LOCAL.client = _thread_client()
+    _LOCAL.guard = guard
+    try:
+        yield client
+    finally:
+        _LOCAL.guard = None
+        pool = client._transport._pool
+        if pool.connections:
+            pool.close()
 
 
 def _guarded_client(guard: _SocketGuard) -> httpx.Client:
@@ -463,14 +624,12 @@ class WebFetcher:
         does, so time spent waiting for the pacer is not taken out of it.
 
         At the cap the watchdog only shuts the sockets down (see :class:`_SocketGuard`); the worker unwinds on the
-        resulting EOF or error and closes everything itself."""
+        resulting EOF or error and closes everything itself. The watchdog is the shared :class:`_WatchdogService`."""
         started = time.monotonic()
         request_deadline = started + timeout
         if deadline is not None:
             request_deadline = min(request_deadline, deadline)
-        fired = threading.Event()
         guard = _SocketGuard()
-        done = threading.Event()
 
         def transport_outcome(outcome: str) -> "_RequestOutcome":
             return _RequestOutcome(kind="transport", outcome=outcome, http_status=None, content_type=None, content_encoding=None, location=None,
@@ -478,40 +637,22 @@ class WebFetcher:
                                    host_header=_host_header(hostname, port, parts.scheme), sni=None, final_url=f"{parts.scheme}://{connect_ip}:{port}",
                                    elapsed=time.monotonic() - started)
 
-        def watch() -> None:
-            # Ends the request at its deadline, or within half a second of the kill switch.
-            try:
-                while not done.wait(max(0.0, min(0.25, request_deadline - time.monotonic()))):
-                    try:
-                        stop = self.killed()
-                    except Exception:
-                        stop = False
-                    if stop or time.monotonic() >= request_deadline:
-                        break
-            finally:
-                if not done.is_set():
-                    fired.set()
-                    try:
-                        guard.expire()
-                    except Exception:
-                        pass
-        watchdog = threading.Thread(target=watch, daemon=True)
         try:
-            watchdog.start()
+            watch = _WATCHDOG.watch(request_deadline, self.killed, guard.expire)
         except RuntimeError:
             return transport_outcome("fetch_error")
         try:
             result = self._one_request_inner(parts, hostname, port, connect_ip, limits, timeout, request_deadline, guard)
         except Exception:
-            if not fired.is_set():
+            if not watch.fired.is_set():
                 raise
             result = None
         finally:
-            done.set()
+            watch.finish()
             guard.close()
         # Once the watchdog has shut the sockets, an EOF can end a body without a length early,
         # so nothing read after that point is trusted.
-        if result is None or fired.is_set():
+        if result is None or watch.fired.is_set():
             return transport_outcome("timeout")
         result.elapsed = time.monotonic() - started
         return result
@@ -534,7 +675,7 @@ class WebFetcher:
         final_url = request_url
 
         try:
-            with _guarded_client(guard) as client:
+            with _request_client(guard) as client:
                 request = client.build_request("GET", request_url, headers=headers, extensions=extensions)
                 with client.stream("GET", request_url, headers=headers, extensions=extensions, timeout=httpx.Timeout(connect=limits.connect_timeout, read=limits.read_timeout, write=limits.read_timeout, pool=limits.connect_timeout)) as response:
                     cert_info = self._extract_certificate(response, connect_ip, port, sni)

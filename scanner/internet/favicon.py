@@ -457,9 +457,19 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
         if declared is None:
             declared = parse_icon_declarations(url, html, max_icons=max_icons) if html is not None else []
         html = None         # the page can be megabytes; icon fetches below may wait a long time for pacing
+        selection_report: dict[str, Any] = {}
         decls, resources = acquire_favicons(url, None, connect_ip=ip, fetcher=fetcher, max_icons=max_icons, declarations=declared,
                                             on_icon=icon_store.save if icon_store is not None else None,
-                                            selection=selection, fallback=fallback, fingerprint=_FINGERPRINTS)
+                                            selection=selection, fallback=fallback, fingerprint=_FINGERPRINTS,
+                                            report=selection_report)
+        if selection_report:
+            # columns exist only under browser_models, so records of the other modes keep their shape
+            chosen = selection_report["chosen"]
+            record.update(icon_rule_version=selection_report["rule_version"],
+                          icon_chosen_chromium=_display_url(chosen["chromium"]) if chosen["chromium"] else None,
+                          icon_chosen_firefox=_display_url(chosen["firefox"]) if chosen["firefox"] else None,
+                          icon_chosen_spec=_display_url(chosen["spec"]) if chosen["spec"] else None,
+                          icon_models_differ=selection_report["differ"])
         record.update(icon_declaration_facts(url, decls, resources))
         record["favicon_candidates"] = len(resources)
         image = next((r for r in resources if r.fingerprint and r.fingerprint.get("image_ok")), None)
