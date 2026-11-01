@@ -129,7 +129,7 @@ def test_live_requests_never_exceed_the_cap(monkeypatch):
     assert 1 <= peak <= 3
 
 
-def test_pacer_poll_interval_is_used_for_long_waits():
+def test_pacer_long_waits_are_cut_into_kill_switch_checks():
     clock = {"t": 0.0}
     naps: list[float] = []
 
@@ -140,7 +140,7 @@ def test_pacer_poll_interval_is_used_for_long_waits():
     pacer = pacing.IpPacer(15, now=lambda: clock["t"], sleep=sleep, poll=2.0)
     assert pacer.wait("203.0.113.5") and not naps
     assert pacer.wait("203.0.113.5")
-    assert naps and max(naps) == 2.0 and sum(naps) == pytest.approx(15)
+    assert naps and max(naps) == 1.0 and sum(naps) == pytest.approx(15)     # one look per second, not per poll
 
 
 def test_config_bounds(tmp_path):

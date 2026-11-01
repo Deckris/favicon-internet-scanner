@@ -31,14 +31,15 @@ def test_pacer_spaces_requests_to_one_address_and_leaves_others_alone():
 
 
 class LateClock(Clock):
-    """Every sleep overshoots by ``late`` seconds the first time, as a busy CPU wakes a thread late."""
+    """The sleep that reaches the deadline overshoots by ``late`` seconds once, as a busy CPU wakes a thread late."""
 
     def __init__(self, late):
         super().__init__()
         self.late = list(late)
 
     def sleep(self, seconds):
-        super().sleep(seconds + (self.late.pop(0) if self.late else 0.0))
+        late = self.late.pop(0) if self.late and len(self.sleeps) == 9 else 0.0     # the tenth one-second slice
+        super().sleep(seconds + late)
 
 
 def test_a_late_wake_up_pushes_the_next_request_back_instead_of_shortening_the_gap():
@@ -213,3 +214,94 @@ def test_paced_batches_stop_starting_batches_after_a_kill_or_an_error():
     with pytest.raises(RuntimeError):
         pacing.paced_batches([("a", 1), ("b", 1), ("c", 1)], lambda t: t[0], pacing.ContactLedger(0), boom, batch_size=1, workers=1)
     assert len(calls) == 1
+
+
+class CountingEvent:
+    """A stop event on a fake clock that records every wait, so wake-ups can be counted."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.waits = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.clock.t += seconds
+        return False
+
+
+def test_a_long_wait_is_one_sleep_to_the_deadline_with_a_stop_event():
+    c = Clock()
+    event = CountingEvent(c)
+    p = pacing.IpPacer(30, now=c.now, stop_event=event, poll=100)
+    assert p.wait("1.1.1.1")
+    assert p.wait("1.1.1.1")
+    assert c.t - 100.0 == 30
+    assert len(event.waits) <= 30 and max(event.waits) <= 1.0     # looks at the kill switch about once a second
+    quiet = pacing.IpPacer(30, now=c.now, stop_event=CountingEvent(c), poll=1.0)
+    assert quiet.wait("2.2.2.2")
+
+
+def test_waiters_do_not_wake_between_the_deadline_and_the_kill_switch_checks():
+    c = Clock()
+    p = pacing.IpPacer(60, now=c.now, sleep=c.sleep)
+    assert p.wait("1.1.1.1") and p.wait("1.1.1.1")
+    assert len(c.sleeps) == 60                                     # 1 s checks, no 0.25 s polling
+    assert min(c.sleeps) == 1.0
+
+
+def test_gap_is_kept_between_many_waiters_on_one_address_and_they_are_served_in_order():
+    import threading
+    import time as _time
+    pacer = pacing.IpPacer(0.05, poll=0.5)
+    released, lock = [], threading.Lock()
+    started = threading.Barrier(7)
+
+    def worker(i):
+        started.wait()
+        _time.sleep(0.004 * i)                                     # arrival order 0..5
+        assert pacer.wait("9.9.9.9")
+        with lock:
+            released.append((i, _time.monotonic()))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    [t.start() for t in threads]
+    started.wait()
+    [t.join(10) for t in threads]
+    assert [i for i, _ in released] == [0, 1, 2, 3, 4, 5]
+    times = [t for _, t in released]
+    assert min(b - a for a, b in zip(times, times[1:])) >= 0.05 - 0.003
+
+
+def test_a_stop_wakes_a_waiter_at_once():
+    import threading
+    import time as _time
+    event = threading.Event()
+    pacer = pacing.IpPacer(60, stop_event=event, poll=1.0)
+    assert pacer.wait("1.1.1.1")
+    out = []
+    t = threading.Thread(target=lambda: out.append(pacer.wait("1.1.1.1")))
+    t.start()
+    _time.sleep(0.05)
+    started = _time.monotonic()
+    event.set()
+    t.join(5)
+    assert out == [False] and _time.monotonic() - started < 0.5
+
+
+def test_a_burned_reservation_does_not_shorten_the_gap_for_the_next_caller():
+    c = Clock()
+    stop = [False]
+    p = pacing.IpPacer(10, killed=lambda: stop[0], now=c.now, sleep=c.sleep)
+    assert p.wait("1.1.1.1")
+    def sleep_then_stop(seconds):
+        c.sleep(seconds)
+        stop[0] = True
+    p._sleep = sleep_then_stop
+    assert not p.wait("1.1.1.1")                                   # reserved 110, then stopped
+    stop[0] = False
+    p._sleep = c.sleep
+    assert p.wait("1.1.1.1")
+    assert c.t >= 120 - 1e-9                                       # behind the burned slot, never inside the pause
