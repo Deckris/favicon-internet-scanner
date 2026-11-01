@@ -51,6 +51,8 @@ $E init --contact scan-optout@example.org --info-url https://example.org/scan \
 
 The approval status starts as `blocked`. While it is `blocked`, `doctor` (also `--offline`), `plan` and `run` refuse to start; until you have approval, `apply` is the check you can run. Set `approved` only when the approving authority has signed off. The default values are conservative: 100 packets per second, a pilot-size sample, no off-host icon fetching.
 
+On a host with several cores set `scope.favicon_processes` (default 1) to share the favicon requests between worker processes, one address always in one process, so the pause per address is unchanged. It cannot exceed `scope.favicon_workers` and is refused together with `scope.offhost_icons`. The favicon stage reuses the page the HTTP stage fetched for plain-HTTP addresses (`favicon.reuse_http_document` in `config.yaml`, on by default).
+
 If the address is on the host's own network card, the scanner compares the card's address with the approved one and asks no outside service. Behind NAT, set `host.source_ip`; the scanner then asks a public-IP service once. It does not look for a VPN.
 
 To honour an opt-out: `$E exclusions --add 203.0.113.0/24` (or `--from-file FILE`), then `$E apply` (it also runs before `plan`) and `plan` again for a new token. The scanner is IPv4-only; IPv6 lines in an exclusion list are kept in the file and ignored.
