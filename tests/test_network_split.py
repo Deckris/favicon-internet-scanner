@@ -304,3 +304,15 @@ def test_cli_export_commands(tmp_path):
     assert main(["export-network", str(net), str(tmp_path / "ship")]) == 0
     assert main(["export-network", str(net), str(tmp_path / "ship")]) == 2
     assert main(["export-shard", str(net), str(tmp_path / "disk2"), "--remove-source"]) == 2
+
+
+def test_a_network_done_shard_that_lost_its_fact_store_is_refused_not_rescanned(tmp_path):
+    cfg = _two_shards(tmp_path)
+    calls = []
+    campaign.run_campaign(cfg, run_fn=_network_run_fn(calls), log=lambda *_: None, network_only=True)
+    state = json.loads((campaign.campaign_dir(cfg) / "campaign.json").read_text())
+    (Path(state["shard_states"]["0"]["run_dir"]) / "work" / "facts.sqlite").unlink()
+    with pytest.raises(ValueError, match="network_done"):
+        campaign.run_campaign(cfg, run_fn=_network_run_fn(calls), log=lambda *_: None, network_only=True)
+    assert len(calls) == 2
+
