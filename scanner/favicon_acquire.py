@@ -193,6 +193,11 @@ def acquire_favicons(
             page_url=page_url, order=order, rel=None, kind="fallback", sizes=None, type=None, media=None,
             declared_href=FAVICON_POLICY["fallback"], resolved_url=fallback_url, policy_status=policy_status,
         )]
+        if report is not None and "chosen" in report and _resource_has_image(resources[index_by_url[fallback_url]]):
+            chosen = report["chosen"]            # a model with no icon of its own shows what /favicon.ico gave
+            for model in chosen:
+                chosen[model] = chosen[model] or fallback_url
+            report["differ"] = len(set(chosen.values())) > 1
 
     return declarations, resources
 

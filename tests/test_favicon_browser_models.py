@@ -151,7 +151,17 @@ def test_no_declared_icon_falls_back_to_favicon_ico():
     site, decls, resources, report = run("<html></html>", {"/favicon.ico"})
     assert site.icon_urls() == [PAGE + "favicon.ico"]
     assert decls[-1].kind == "fallback" and report["differ"] is False
-    assert report["chosen"] == {"chromium": None, "firefox": None, "spec": None}
+    assert report["chosen"] == {"chromium": PAGE + "favicon.ico", "firefox": PAGE + "favicon.ico", "spec": PAGE + "favicon.ico"}
+
+
+def test_the_record_names_the_fallback_icon_instead_of_no_icon():
+    site = Site("<html></html>", {"/favicon.ico"})
+    rec = fav.probe_identity(site, scheme="https", ip="203.0.113.7", port=443, hostname="origin.test", max_icons=4, selection="browser_models")
+    assert rec["icon_chosen_chromium"].endswith("/favicon.ico") and rec["icon_chosen_firefox"].endswith("/favicon.ico")
+    assert rec["icon_models_differ"] is False
+    none = fav.probe_identity(Site("<html></html>", set()), scheme="https", ip="203.0.113.7", port=443, hostname="origin.test",
+                              max_icons=4, selection="browser_models")
+    assert none["icon_chosen_chromium"] is None
 
 
 def test_only_apple_touch_icons_count_as_undeclared_for_the_only_if_undeclared_fallback():
