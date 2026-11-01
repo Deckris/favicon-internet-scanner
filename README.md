@@ -4,6 +4,12 @@ A scanner for Internet-wide favicon measurements. It takes a seeded random sampl
 
 > **Running it against the Internet needs the approvals your institution requires.** This repository does not grant any. The program refuses to send anything without an approval file that matches its config.
 
+## If this scanner contacted your network
+
+The traffic is a research measurement of which favicons web servers serve. Each address receives one SYN per web port; an address that answers receives a TLS handshake or a plain HTTP request, a second handshake under a hostname from its certificate when that name resolves to the address, and requests for its home page and its favicon, with at least 5 s between any two requests to the same address. Nothing else is requested, no credentials are tried and no vulnerability is probed.
+
+To have an address or range left out, write to the e-mail address in the user agent of the requests you saw, or open an issue in this repository with the address or CIDR range. The range is added to the exclusion list, which every sweep applies, and is not contacted again.
+
 ## What it does
 
 ```
