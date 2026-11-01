@@ -323,7 +323,14 @@ def derived_plan(s: dict[str, Any], cli: dict[str, Any] | None = None) -> tuple[
                            offhost_icons=bool((cli or {}).get("offhost_icons", s.get("scope", {}).get("offhost_icons", False))),
                            overrides=overrides)
     except ValueError as exc:
-        raise SettingsError(str(exc)) from exc
+        text = str(exc)
+        scope = s.get("scope", {})
+        given = {k: v for k, v in (cli or {}).items() if v is not None}
+        for name in overrides:
+            if text.startswith(name) and name in scope and name not in given:
+                text = f"scope.{text}"      # the bad value is in settings.yaml: name it the way the file does
+                break
+        raise SettingsError(text) from exc
     return resources, plan
 
 
