@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -170,13 +171,20 @@ STAGE_CAP_SECONDS = 86400           # the largest value favicon.stage_max_second
 STAGE_MIN_JOBS_PER_SECOND = 180     # a third of the 540 lookups/s a tuned host is expected to sustain
 
 
-def favicon_stage_seconds(cfg: "ScanConfig", jobs: int) -> int:
+def favicon_stage_seconds(cfg: "ScanConfig", jobs: int, *, longest_chain: int = 0, resumed: int = 0) -> int:
     """Time the favicon stage of one shard may take: ``favicon.stage_max_seconds`` when the config sets it, otherwise
-    derived from the number of lookups (at least ``STAGE_MIN_JOBS_PER_SECOND`` of them per second), between the floor and the cap."""
+    derived from the lookups still to do, between the floor and the cap.
+
+    ``jobs`` is the number of lookups and ``resumed`` how many of them an earlier attempt already holds. The stage
+    needs at least ``STAGE_MIN_JOBS_PER_SECOND`` lookups per second, and also the pause between the requests to one
+    address: ``longest_chain`` is the most lookups still to do on a single address, each of which may fetch the
+    page and up to ``favicon.max_icons_per_page`` icons."""
     section = cfg.raw.get("favicon") if isinstance(cfg.raw, dict) else None
     if isinstance(section, dict) and section.get("stage_max_seconds") is not None:
         return cfg.favicon.stage_max_seconds
-    return int(min(STAGE_CAP_SECONDS, max(STAGE_FLOOR_SECONDS, -(-jobs // STAGE_MIN_JOBS_PER_SECOND))))
+    by_rate = -(-max(0, jobs - resumed) // STAGE_MIN_JOBS_PER_SECOND)
+    by_pace = math.ceil(max(0, longest_chain) * (1 + cfg.favicon.max_icons_per_page) * cfg.measurement.min_seconds_between_probes_per_ip)
+    return int(min(STAGE_CAP_SECONDS, max(STAGE_FLOOR_SECONDS, by_rate, by_pace)))
 
 
 MIN_PACE_SECONDS = 5.0      # the pause an approval is assumed to require when it does not state one

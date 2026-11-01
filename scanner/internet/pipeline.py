@@ -7,6 +7,7 @@ The manifest is written even when the run ends early (kill switch, error).
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import csv
 import dataclasses
@@ -1014,7 +1015,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         if not fjobs or not ledger.wait(job_ips):
             return
         fp = fav.fetch_policy(cfg, sorted(job_ips))
-        stage_seconds = favicon_stage_seconds(cfg, len(fjobs))
+        chains = collections.Counter(j["ip"] for j in fjobs)
+        stage_seconds = favicon_stage_seconds(cfg, len(fjobs), longest_chain=max(chains.values()))
         counts["favicon_stage_max_seconds"] = stage_seconds
         deadline = time.monotonic() + stage_seconds
 
@@ -1043,6 +1045,11 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             earlier[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
         if earlier:
             counts["favicon_lookups_resumed"] = len(earlier)
+            todo = [j for j in fjobs if (j["ip"], j["port"], j.get("hostname")) not in earlier]
+            stage_seconds = favicon_stage_seconds(cfg, len(fjobs), resumed=len(fjobs) - len(todo),
+                                                  longest_chain=max(collections.Counter(j["ip"] for j in todo).values(), default=0))
+            counts["favicon_stage_max_seconds"] = stage_seconds
+            deadline = time.monotonic() + stage_seconds
         reused_pages = [0]
 
         def sink(idx: int, rec: dict[str, Any]) -> None:
