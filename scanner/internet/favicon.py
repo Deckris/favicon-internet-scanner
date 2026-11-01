@@ -7,6 +7,7 @@ redirect can never lead the run to a host outside the sample.
 from __future__ import annotations
 
 import copy
+import ctypes
 import hashlib
 import json
 import multiprocessing
@@ -796,6 +797,37 @@ def _failed(job: dict[str, Any], why: str) -> dict[str, Any]:
     return {**_skipped(job), "favicon_outcome": "error", "error": why[:300]}
 
 
+class SharedFlag:
+    """A stop flag in shared memory that takes no lock, with the ``is_set``/``set``/``clear`` of an event.
+
+    A ``multiprocessing.Event`` guards its state with a lock held while the flag is read or written. A process killed
+    inside that window leaves the lock taken for good, and every other process then blocks in ``is_set`` and the
+    parent in ``set``. A single byte is read and written atomically, so no lock is needed.
+    """
+
+    def __init__(self, ctx: Any) -> None:
+        self._value = ctx.RawValue(ctypes.c_bool, False)
+
+    def is_set(self) -> bool:
+        return bool(self._value.value)
+
+    def set(self) -> None:
+        self._value.value = True
+
+    def clear(self) -> None:
+        self._value.value = False
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Sleep in short slices until the flag is set or ``timeout`` seconds have passed."""
+        end = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            left = None if end is None else end - time.monotonic()
+            if left is not None and left <= 0:
+                break
+            time.sleep(0.05 if left is None else min(0.05, left))
+        return self.is_set()
+
+
 def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings: dict[str, Any], store_root: Any,
                  documents: dict[tuple[str, int], dict[str, Any]], done: dict[tuple[str, int, str | None], dict[str, Any]],
                  stop: Any, conn: Any) -> None:
@@ -877,7 +909,7 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     parts = partition_by_ip(jobs, processes)
     store_root = icon_store.root if icon_store is not None else None
     ctx = multiprocessing.get_context("spawn")
-    stop = ctx.Event()
+    stop = SharedFlag(ctx)
     settings = {"pace": pace, "workers": split_cap(workers, len(parts)), "max_icons": max_icons, "selection": selection,
                 "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace}
     procs, conns, sends = [], [], []
@@ -913,6 +945,14 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
             settle_rest(parts[i], f"favicon worker process {i}: {message[1]}")
             finished.add(i)
 
+    def lost(i: int) -> None:
+        """Process ``i`` is gone without a result: error records for what it left, and the others are told to wind down."""
+        code = procs[i].exitcode
+        settle_rest(parts[i], f"favicon worker process {i}: exited with code {code} without a result")
+        finished.add(i)
+        if code != 0:
+            stop.set()
+
     def drain(i: int) -> None:
         while i not in finished:
             try:
@@ -921,8 +961,7 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                 handle(i, conns[i].recv())
             except (EOFError, OSError):
                 procs[i].join(2.0)          # the process is gone: whatever it did not report is lost
-                settle_rest(parts[i], f"favicon worker process {i}: exited with code {procs[i].exitcode} without a result")
-                finished.add(i)
+                lost(i)
                 return
 
     try:
@@ -944,8 +983,7 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                 if i not in finished and not p.is_alive():
                     drain(i)                           # it may have answered just before exiting
                     if i not in finished:
-                        settle_rest(parts[i], f"favicon worker process {i}: exited with code {p.exitcode} without a result")
-                        finished.add(i)
+                        lost(i)
             if stopped_at is not None and time.monotonic() - stopped_at > grace + _BACKSTOP_SECONDS:
                 for i, p in enumerate(procs):
                     if i not in finished:
@@ -954,13 +992,13 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                         settle_rest(parts[i], None)
                         finished.add(i)
     finally:
-        stop.set()
-        for p in procs:
+        for p in procs:                 # children first: the flag is lock-free, but nothing may wait on a child that is stuck
             if p.is_alive():
                 p.terminate()
         for p in procs:
             if p.pid is not None:
                 p.join(5.0)
+        stop.set()
         for c in conns + sends:
             c.close()
         if icon_store is not None:

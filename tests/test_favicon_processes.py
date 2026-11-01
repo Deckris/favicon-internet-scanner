@@ -171,8 +171,31 @@ def test_a_crashed_process_gives_error_records_for_its_jobs_and_not_a_hung_stage
     for i, rec in enumerate(out):
         if i in doomed:
             assert rec["favicon_outcome"] == "error" and "exited with code 3" in rec["error"]
-        else:
-            assert rec["favicon_outcome"] == "image"
+        else:       # the survivors are told to wind down, so a job is either done or skipped, never lost
+            assert rec["favicon_outcome"] in ("image", "skipped_kill_switch")
+
+
+def test_the_stop_flag_has_the_interface_of_an_event_and_survives_a_pickle_into_a_child():
+    import multiprocessing
+    ctx = multiprocessing.get_context("spawn")
+    flag = fav.SharedFlag(ctx)
+    assert not flag.is_set() and not flag.wait(0.05)
+    flag.set()
+    assert flag.is_set() and flag.wait(0.05)
+    flag.clear()
+    assert not flag.is_set()
+
+
+def test_a_crashing_process_never_hangs_the_stage_however_often_it_is_repeated():
+    jobs = make_jobs(6, hostnames=False)
+    crash = jobs[0]["ip"]
+    doomed = next(p for p in fav.partition_by_ip(jobs, 2) if any(jobs[i]["ip"] == crash for i in p))
+    for attempt in range(60):
+        begin = time.monotonic()
+        out = run(jobs, 2, workers=4, factory=ProcessFetcherFactory(crash_ip=crash))
+        assert time.monotonic() - begin < 60, f"attempt {attempt} took too long"
+        assert len(out) == len(jobs)
+        assert all(out[i]["favicon_outcome"] == "error" for i in doomed), f"attempt {attempt}"
 
 
 def test_a_worker_that_cannot_build_its_fetcher_reports_error_records():
