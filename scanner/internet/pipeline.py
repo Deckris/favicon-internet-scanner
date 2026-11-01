@@ -38,6 +38,7 @@ from scanner.internet import overlap as ovl
 from scanner.internet import pacing
 from scanner.internet import population as pop
 from scanner.internet import preflight as pre
+from scanner.internet import resume as resume_mod
 from scanner.internet import tls as tlsmod
 from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, sha256_file, shared_config_checksum
 from scanner.internet.runner import ManagedExecutor
@@ -51,6 +52,7 @@ from scanner.zmap_runner import run_zmap
 Executor = Callable[..., Any]
 SCHEMA_VERSION = 1
 INSTRUMENT_VERSION = "scanner.3"
+DNS_BATCH = 50_000          # names per forward-lookup batch (what ZDNS was already given at a time)
 MONITOR_TICK = 0.5          # how often the run monitor evaluates the stop conditions
 WEB_PROTOCOLS = ("https", "http")
 # TLS outcomes after which a plain-HTTP probe is still worth sending: the port did not prove it speaks TLS.
@@ -85,6 +87,18 @@ def build_policy(cfg: ScanConfig) -> tuple[TargetPolicy, pop.SamplePlan, list[st
         exclusions=tuple(exclusions),
     ))
     return policy, splan, exclusions
+
+
+def overlap_batch_size(batch_size: int, senders: int) -> int:
+    """Targets per ZGrab2 batch while ZMap is still sweeping.
+
+    The overlap gate admits a batch only for the time it is allowed to run (connect plus target timeout plus a margin),
+    on the assumption that every target is dialled at once. With more targets than senders the last ones would start
+    one timeout round later, possibly after ZMap has reached them with the next sweep's SYN, inside the pause. The
+    batch therefore never exceeds the senders. Large batches are for the sequential path; here the processes run in
+    parallel instead.
+    """
+    return max(1, min(batch_size, senders))
 
 
 def _scrub(value: Any) -> Any:
@@ -454,9 +468,12 @@ def run(
     phase_gate: Callable[[str], Any] | None = None,
     resume_from: Path | None = None,
     network_only: bool = False,
+    resume: bool = True,
 ) -> Path:
     """``resume_from``: the run directory (or the ``favicon_records.jsonl`` itself) of an earlier unfinished attempt of
-    this shard; the favicon lookups it completed are reused instead of being sent again.
+    this shard; the favicon lookups it completed are reused instead of being sent again. When that directory also
+    holds a fact store of the same run identity, the network units it finished (ZMap sweeps, ZGrab2, PTR and DNS
+    batches, see ``resume``) are reused too. ``resume=False`` starts from nothing and keeps nothing for a later attempt.
 
     ``network_only`` ends the run where the favicon stage would start: the network stages are written out as usual, the
     fact store ``work/facts.sqlite`` is kept, and the manifest says ``network_done`` instead of ``complete``. The
@@ -494,7 +511,7 @@ def run(
         if not report["ok"] and not skip_preflight:
             raise pre.PreflightFailed(report)
         finished = _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                               started, wall, run_id, resume_from, fetcher_factory)
+                               started, wall, run_id, resume_from, fetcher_factory, resume)
     finally:
         st.phases.close()
         st.stop_monitor()
@@ -583,16 +600,27 @@ def run_favicon_only(
 
 
 def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
-                resume_from=None, fetcher_factory=None) -> Path:
+                resume_from=None, fetcher_factory=None, resume=True) -> Path:
     # What the stages learn about each endpoint goes to disk, not into dictionaries: memory then stays flat in the shard size.
+    identity = resume_mod.run_identity(cfg)
+    taken, refused = False, None
+    if st.replay is None and resume and resume_from is not None and Path(resume_from).is_dir():
+        refused = resume_mod.adopt_store(Path(resume_from), run_dir, identity)
+        taken = refused is None
     try:
-        store = ShardStore(run_dir / "work" / "facts.sqlite", reset=st.replay is None)
+        store = ShardStore(run_dir / "work" / "facts.sqlite", reset=st.replay is None and not taken)
+        if st.replay is None:
+            if taken:
+                store.clear_for_resume()
+            else:
+                store.set_meta("identity", json.dumps(identity, sort_keys=True))
     except Exception as exc:
         st.errors["store"] = f"{type(exc).__name__}: {exc}"[:500]
         return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
+    book = resume_mod.UnitBook(store, identity, enabled=resume and st.replay is None, source=resume_from if taken else None, run_dir=run_dir)
     try:
         return _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                                started, wall, run_id, resume_from, fetcher_factory)
+                                started, wall, run_id, resume_from, fetcher_factory, book=book, continued=taken, not_reused=refused)
     except Exception as exc:               # whatever escaped the stages: the run still ends with a manifest
         st.errors["run"] = f"{type(exc).__name__}: {exc}"[:500]
         return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
@@ -618,7 +646,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
 
 
 def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
-                     resume_from=None, fetcher_factory=None) -> Path:
+                     resume_from=None, fetcher_factory=None, *, book, continued=False, not_reused=None) -> Path:
     from scanner.internet.zmap_compat import output_args, packet_rate_args
     killed = st.killed
     pace = cfg.measurement.min_seconds_between_probes_per_ip
@@ -643,6 +671,11 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     gap = pacing.Gap(pace, killed, stop_event=st.stop)             # pause between ZMap port runs
     limiter = pacing.SubnetLimiter(cfg.measurement.max_connections_per_subnet)     # simultaneous connections per /24, all stages
     ledger = pacing.ContactLedger(pace, killed, stop_event=st.stop, limiter=limiter)    # last contact per address, shared by every target-facing step
+    attempt = re.search(r"-a(\d+)$", run_id)
+    if (resume_from is not None or continued or (attempt is not None and int(attempt[1]) > 1)) and st.replay is None:
+        # The contacts of a lost attempt are not on file, so no address is contacted before one full pause has passed.
+        ledger.mark_all()
+        gap.mark()
     gateway_mac = cfg.vantage.gateway_mac or report.get("gateway_mac")
     # Stub manifest before the first probe: if the process is killed hard (OOM, WSL shutdown) the run still
     # leaves evidence of what was started and the run-once guard still sees it.
@@ -721,12 +754,18 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     ptr_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ptr")
     ptr_early: list[Any] = []       # one future per port, in port order
 
-    def ptr_lookup(addresses: list[str]) -> list[ToolJob]:
+    def ptr_lookup(addresses: list[str], stage: str = "ptr") -> list[ToolJob]:
         """One PTR batch. The answers go straight to the store; if it fails the addresses count as not sent again."""
+        unit = book.unit_id(stage, items=addresses)
+        kept = book.reuse(unit)
+        if kept is not None:
+            return kept
         try:
             wanted = set(addresses)
             j, part = run_zdns("PTR", addresses, **dns_kw)
             store.put_ptr_many((ip, ptr_names(a), a.status) for ip, a in part.items() if ip in wanted)
+            if not killed():
+                book.commit(unit, stage, j, size=len(addresses))
         except BaseException:
             store.unmark_ptr_sent(addresses)
             raise
@@ -743,15 +782,42 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         else:
             counts["overlap"] = {"enabled": False, "reason": "no ZMap send order: the sample listing was skipped or failed"}
 
+    def zmap_unit(port: int) -> str:
+        return book.unit_id("zmap", port, m.zmap_rate, m.zmap_probes)
+
+    def prepare_resume() -> None:
+        """Rows of a sweep that did not finish are dropped; the tarpit flags are rebuilt from the sweeps that did."""
+        for port in m.ports:
+            if store.get_unit(zmap_unit(port)) is None:
+                store.clear_port(port)
+        store.reset_tarpits()
+        store.flag_tarpits(tiny)
+
+    def after_sweep(port: int, ips: list[str]) -> None:
+        new = store.mark_ptr_sent(ips)
+        if new:
+            ptr_early.append(ptr_pool.submit(ptr_lookup, new))
+        if gate:
+            tls_ports.put(port)
+
     def zmap_stage() -> None:
         for port in m.ports:
             if killed():
                 st.skipped.append(f"zmap:{port}")
                 continue
+            kept = book.reuse(zmap_unit(port))
+            if kept is not None:           # this sweep finished in the lost attempt: its rows are in the store
+                jobs.extend(kept)
+                st.progress()
+                if gate:
+                    gate.progress.add_finished_sweep()
+                after_sweep(port, [ip for ip, _ in store.iter_endpoints(port)])
+                continue
             # Every port probes the same seeded sample, so a pause between port runs keeps one address's SYNs apart.
             if not gap.wait():
                 st.skipped.append(f"zmap:{port}")
                 continue
+            store.clear_port(port)          # what an unfinished sweep of this port left behind is replaced, not added to
             status = run_dir / "raw" / "zmap" / f"status-{port}.csv" if gate else None
             if gate:
                 gate.progress.start_sweep(status)
@@ -777,24 +843,29 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                     st.guard("store:flag_tarpits", lambda: store.flag_tarpits(tiny, synacks))
             except OSError:
                 pass
-            new = store.mark_ptr_sent(ips)
-            if new:
-                ptr_early.append(ptr_pool.submit(ptr_lookup, new))
-            if gate:
-                tls_ports.put(port)
+            if not killed():
+                book.commit(zmap_unit(port), "zmap", [job], port=port, size=len(ips))
+            after_sweep(port, ips)
 
     # ---- Stage 2: TLS first, direct IP (no SNI) ---------------------------------------------
     tls_jobs: list[ToolJob] = []
     # With overlap a batch must end by a known time: the gate leaves room for that, and the executor enforces it.
     tls_limit = m.zgrab_connect_timeout + m.zgrab_target_timeout + 15
 
+    def tls_unit(batch: list) -> str:
+        return book.unit_id("tls_direct", items=batch)
+
     def tls_runner(timeout: float | None = None) -> Callable[[list], Any]:
         def one(batch):
+            if continued:           # what an earlier attempt left of this batch is replaced, not added to
+                store.delete_rows("tls_direct", [(t[0], t[1]) for t in batch])
             batch_jobs, results = tlsmod.run_tls_batches(batch, mode="direct_ip", cfg=cfgview, policy=policy, run_dir=run_dir,
                                                          binary=cfg.binaries.zgrab2, executor=executor, timeout=timeout)
             store.put_tls_many(results)
             ledger.observe(results)
             st.progress()
+            if not killed():
+                book.commit(tls_unit(batch), "tls_direct", batch_jobs, port=batch[0][1], size=len(batch))
             return batch_jobs
         return one
 
@@ -805,11 +876,12 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     def tls_stage() -> None:
         items = [(ip, port, None) for ip, port in store.iter_endpoints() if ip not in tarpit_ips]
         collect_tls(pacing.paced_batches(items, lambda t: t[0], ledger, tls_runner(), batch_size=m.zgrab_batch_size,
-                                         workers=m.zgrab_parallel_batches))
+                                         workers=m.zgrab_parallel_batches, group_of=lambda t: t[1],
+                                         reuse=lambda b: book.reuse(tls_unit(b))))
 
     def tls_overlap_stage() -> None:
         assert gate is not None
-        size = max(1, min(m.zgrab_batch_size, m.zgrab_senders))      # every target of a batch in flight at once
+        size = overlap_batch_size(m.zgrab_batch_size, m.zgrab_senders)
         while (port := tls_ports.get()) is not None:
             if killed():
                 continue
@@ -824,10 +896,12 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             items = sorted(((ip, port, None) for ip, _ in store.iter_endpoints(port) if ip not in skip),
                            key=lambda t: (send_order.get(t[0], 1 << 62), t[0]))
             collect_tls(pacing.paced_batches(items, lambda t: t[0], ledger, tls_runner(tls_limit), batch_size=size,
-                                             workers=m.zgrab_parallel_batches,
+                                             workers=m.zgrab_parallel_batches, reuse=lambda b: book.reuse(tls_unit(b)),
                                              extra=lambda b: gate.admit([t[0] for t in b], tls_limit + 10)))
             del items
 
+    if continued:
+        st.guard("resume:prepare", prepare_resume)
     tls_thread = None
     if gate:
         tls_thread = threading.Thread(target=st.run, args=("tls_direct", tls_overlap_stage, None), name="tls-overlap", daemon=True)
@@ -877,25 +951,42 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     # ---- Stage 3: plain HTTP only where TLS did not prove the port speaks TLS ---------------
     http_docs: dict[tuple[str, int], dict[str, Any]] = {}      # compact pages for the favicon stage (favicon.reuse_http_document)
     http_docs_lock = threading.Lock()
+    if continued:
+        for doc_ip, doc_port, doc in store.iter_docs():       # the pages the lost attempt kept from its finished batches
+            http_docs[(doc_ip, doc_port)] = doc
 
     def keep_document(line: str, port: int) -> None:
         got = fav.capture_http_document(line, port=port, max_icons=cfg.favicon.max_icons_per_page)
         if got is not None:
             with http_docs_lock:
                 http_docs[got[0]] = got[1]
+            if book.enabled:
+                store.put_doc(got[0][0], got[0][1], got[1])
+
+    def http_unit(batch: list) -> str:
+        return book.unit_id("http_direct", items=batch, key=lambda t: (t.ip, t.port, t.hostname))
 
     def http_stage() -> None:
         targets = [ZGrabTarget(ip, None, port) for ip, port in store.iter_endpoints_with_tls_outcome(HTTP_FALLBACK)]
         def one(batch):
+            if continued:
+                store.delete_rows("http_res", [(t.ip, t.port) for t in batch])
+                store.delete_rows("docs", [(t.ip, t.port) for t in batch])
+                with http_docs_lock:
+                    for t in batch:
+                        http_docs.pop((t.ip, t.port), None)
             batch_jobs, results = run_zgrab_batches(batch, scheme="http", mode="direct_ip", cfg=cfgview, policy=policy,
                                                     run_dir=run_dir, executor=executor,
                                                     document_sink=keep_document if cfg.favicon.enabled and cfg.favicon.reuse_http_document else None)
             store.put_http_many(results)
             ledger.observe(results)
             st.progress()
+            if not killed():
+                book.commit(http_unit(batch), "http_direct", batch_jobs, port=batch[0].port, size=len(batch))
             return batch_jobs
         for batch_jobs in pacing.paced_batches(targets, lambda t: t.ip, ledger, one, batch_size=m.zgrab_batch_size,
-                                               workers=m.zgrab_parallel_batches):
+                                               workers=m.zgrab_parallel_batches, group_of=lambda t: t.port,
+                                               reuse=lambda b: book.reuse(http_unit(b))):
             jobs.extend(batch_jobs)
 
     def tarpits_known(name: str, fn: Callable[[], Any]) -> Any:
@@ -916,10 +1007,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 counts["ptr_early_failed"] = f"{type(exc).__name__}: {exc}"[:300]     # its addresses are asked again below
         missing = list(store.iter_unsent_ptr_ips())
         if missing:
-            j, part = run_zdns("PTR", missing, **dns_kw)
-            jobs.extend(j)
-            wanted = set(missing)
-            store.put_ptr_many((ip, ptr_names(a), a.status) for ip, a in part.items() if ip in wanted)
+            jobs.extend(ptr_lookup(missing, "ptr_rest"))
         store.fill_missing_ptr()
 
     try:
@@ -929,6 +1017,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     # ---- Stage 5: hostname candidates = PTR U cert SAN/CN ----------------------------------
     def cand_stage() -> None:
+        store.clear_names()                         # rebuilt in full from what the stages above stored
         for g in store.iter_ips():
             for e in g.endpoints:
                 store.put_names(g.ip, e.port, cand.build_endpoint_names(
@@ -939,15 +1028,25 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     # ---- Stage 6: forward verification via ZDNS (A + AAAA, CNAME chains) -------------------
     def dns_stage() -> None:
+        store.prune_resolutions()                   # answers for names that are no longer candidates are not carried along
         names = list(store.iter_candidate_names())
         if not names:
             return
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dns") as pool:     # resolver traffic only
-            fa, fb = pool.submit(run_zdns, "A", names, **dns_kw), pool.submit(run_zdns, "AAAA", names, **dns_kw)
-            (ja, a_ans), (jb, aaaa_ans) = fa.result(), fb.result()
-        jobs.extend(ja)
-        jobs.extend(jb)
-        store.put_resolutions(resolve(n, a_ans.get(n), aaaa_ans.get(n), max_cnames=cfg.dns.max_cnames) for n in names)
+            for at in range(0, len(names), DNS_BATCH):
+                chunk = names[at:at + DNS_BATCH]
+                unit = book.unit_id("dns_forward", items=chunk)
+                kept = book.reuse(unit)
+                if kept is not None:
+                    jobs.extend(kept)
+                    continue
+                fa, fb = pool.submit(run_zdns, "A", chunk, **dns_kw), pool.submit(run_zdns, "AAAA", chunk, **dns_kw)
+                (ja, a_ans), (jb, aaaa_ans) = fa.result(), fb.result()
+                jobs.extend(ja)
+                jobs.extend(jb)
+                store.put_resolutions(resolve(n, a_ans.get(n), aaaa_ans.get(n), max_cnames=cfg.dns.max_cnames) for n in chunk)
+                if not killed():
+                    book.commit(unit, "dns_forward", [*ja, *jb], size=len(chunk))
         share = enrich.dns_unknown_share_of_counts(store.resolution_status_counts())
         counts["dns_unknown_share"] = round(share, 4)
         if len(names) >= 20 and share > 0.10:
@@ -957,6 +1056,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     st.run("dns_forward", dns_stage, None)
 
     # ---- Stage 7: optional SNI confirmation (batched, verified names only) -----------------
+    def sni_unit(batch: list) -> str:
+        return book.unit_id("sni_confirm", items=batch)
+
     def sni_stage() -> None:
         targets: list[tuple[str, int, str | None]] = []
         for g in store.iter_ips():
@@ -976,6 +1078,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         if not targets:
             return
         def one(batch):
+            if continued:
+                store.delete_rows("sni_res", batch)
             batch_jobs, results = tlsmod.run_tls_batches(batch, mode="hostname_aware", cfg=cfgview, policy=policy, run_dir=run_dir,
                                                          binary=cfg.binaries.zgrab2, executor=executor)
             for r in results:
@@ -983,9 +1087,12 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                     store.put_sni(r)
             ledger.observe(results)
             st.progress()
+            if not killed():
+                book.commit(sni_unit(batch), "sni_confirm", batch_jobs, port=batch[0][1], size=len(batch))
             return batch_jobs
         for batch_jobs in pacing.paced_batches(targets, lambda t: t[0], ledger, one, batch_size=m.zgrab_batch_size,
-                                               workers=m.zgrab_parallel_batches):
+                                               workers=m.zgrab_parallel_batches, group_of=lambda t: t[1],
+                                               reuse=lambda b: book.reuse(sni_unit(b))):
             jobs.extend(batch_jobs)
 
     tarpits_known("sni_confirm", sni_stage)
@@ -1098,6 +1205,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         tarpits_known("favicon", favicon_stage)
     st.check_now()          # a stop that arrived after the last check still belongs in the manifest
 
+    if resume_from is not None and st.replay is None:
+        counts["resume"] = book.summary(source=resume_from if continued else None, refused=not_reused)
+
     # The pages are written as soon as the favicon stage is done with them, so they are not held while the rows are built.
     docs_sha = None
     if http_docs:
@@ -1151,7 +1261,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     stopped_early = bool(st.errors or st.skipped or tool_errors or st.reason or st.interrupted)
     # A network-only run keeps its fact store for the favicon stage, and so does a favicon stage that did not finish.
     keep_store = (st.network_only and not stopped_early) or (st.replay is not None and stopped_early)
-    if not {"records", "ip_results", "write_outputs"} & set(st.errors) and not keep_store:
+    # An attempt that stopped early keeps its fact store, so that the next attempt continues from the units it finished.
+    keep_for_resume = book.enabled and stopped_early and st.replay is None
+    if not {"records", "ip_results", "write_outputs"} & set(st.errors) and not keep_store and not keep_for_resume:
         store.delete()                  # kept after a failed write-out, for diagnosis; never part of the listed outputs
         shutil.rmtree(run_dir / "work", ignore_errors=True)
     for p in sorted(run_dir.rglob("*")):

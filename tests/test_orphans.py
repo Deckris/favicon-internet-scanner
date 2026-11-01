@@ -192,17 +192,33 @@ def _attempt(cfg, shard, n, *, records=True, work=True, complete=False, checksum
     return d
 
 
-def test_a_new_attempt_clears_the_work_files_of_earlier_unfinished_ones_and_resumes_from_the_latest(tmp_path):
+def test_a_new_attempt_clears_the_work_files_of_earlier_unfinished_ones_but_keeps_those_it_continues_from(tmp_path):
     cfg = load_config(_cfg(tmp_path))
     first, second = _attempt(cfg, 1, 1), _attempt(cfg, 1, 2, records=False)
     other_shard = _attempt(cfg, 0, 1)
     state = {"shard_states": {"1": {"status": "crashed", "attempts": 2}}}
     action, run_id = campaign.begin_shard(cfg, state, 1, lambda *_: None)
     assert action == "run" and run_id.endswith("-a3")
-    for d in (first, second):
-        assert not (d / "work").exists() and (d / "manifest.json").exists()
+    assert (second / "work" / "facts.sqlite").exists() and not (first / "work").exists()      # the newest store is the one continued from
+    assert (first / "manifest.json").exists() and (second / "manifest.json").exists()
     assert (first / "raw" / "favicon_records.jsonl").exists() and (other_shard / "work").exists()
-    assert campaign.resume_source(cfg, 1, run_id) == first          # the newest attempt had no records, so the one before
+    assert campaign.resume_source(cfg, 1, run_id) == second
+
+
+def test_no_resume_removes_every_earlier_work_directory_and_names_no_source(tmp_path):
+    cfg = load_config(_cfg(tmp_path))
+    first, second = _attempt(cfg, 1, 1), _attempt(cfg, 1, 2)
+    state = {"shard_states": {"1": {"status": "crashed", "attempts": 2}}}
+    action, run_id = campaign.begin_shard(cfg, state, 1, lambda *_: None, resume=False)
+    assert action == "run" and not (first / "work").exists() and not (second / "work").exists()
+
+
+def test_the_resume_source_may_hold_only_a_fact_store(tmp_path):
+    cfg = load_config(_cfg(tmp_path))
+    d = _attempt(cfg, 1, 1, records=False)
+    assert campaign.resume_source(cfg, 1, campaign._run_id(cfg, 1, 2)) == d
+    _attempt(cfg, 2, 1, records=False, work=False)
+    assert campaign.resume_source(cfg, 2, campaign._run_id(cfg, 2, 2)) is None
 
 
 def test_resume_source_ignores_other_configurations_and_finished_runs(tmp_path):
@@ -236,7 +252,7 @@ def test_the_campaign_passes_the_earlier_attempt_to_the_next_run(tmp_path):
     assert second["complete"]
     a1, a2 = (Path(cfg.output_dir) / campaign._run_id(cfg, 1, n) for n in (1, 2))
     assert seen[a2.name] == a1 and seen[a1.name] is None
-    assert not (a1 / "work").exists() and (a1 / "raw" / "favicon_records.jsonl").exists()
+    assert (a1 / "work").exists() and (a1 / "raw" / "favicon_records.jsonl").exists()      # kept for the attempt that continues from it
 
 
 def test_the_overlapped_launcher_names_the_resume_source_and_its_own_pid(tmp_path):

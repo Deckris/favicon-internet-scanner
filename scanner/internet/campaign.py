@@ -3,7 +3,9 @@
 Each shard is a complete scanner run over a disjoint slice of the same seeded ZMap permutation, so memory,
 disk and the length of any single run stay bounded however large the sample is. Progress lives in
 ``<output>/campaign-<config checksum>/campaign.json``; running ``campaign`` again skips finished shards and
-repeats the one that was interrupted (as a new attempt, in a new run directory).
+repeats the one that was interrupted (as a new attempt, in a new run directory). The new attempt continues from
+the units the interrupted one finished (see ``resume``): the interrupted attempt's fact store is kept for it, and
+``--no-resume`` starts the shard from nothing instead.
 
 The campaign stops at the first shard that does not finish cleanly: the kill switch, a changed public IP, low
 disk, an expired approval and tool errors all end it, and nothing further is sent until the operator looks.
@@ -192,9 +194,15 @@ def shard_span(cfg: Any, shards_from: int = 0, shards_to: int | None = None) -> 
 
 def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: Callable[[str], None] = print,
                  pipeline_depth: int = 1, config_path: Path | None = None, shards_from: int = 0, shards_to: int | None = None,
-                 network_only: bool = False, archive: ArchivePolicy | None = None, **run_kwargs: Any) -> dict[str, Any]:
-    """``network_only``: every shard stops after its network stages (state ``network_done``); see ``pipeline.run``."""
+                 network_only: bool = False, archive: ArchivePolicy | None = None, resume: bool = True,
+                 **run_kwargs: Any) -> dict[str, Any]:
+    """``network_only``: every shard stops after its network stages (state ``network_done``); see ``pipeline.run``.
+
+    ``resume=False``: an interrupted shard starts again from nothing (no unit and no favicon lookup of the earlier
+    attempt is reused, and its working files are removed)."""
     span = shard_span(cfg, shards_from, shards_to)
+    if not resume:
+        run_kwargs["resume"] = False
     if network_only:
         if pipeline_depth > 1:
             raise ValueError("a network-only campaign has no favicon stage to overlap; run it without --pipeline 2")
@@ -210,7 +218,7 @@ def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: C
         if pipeline_depth > 1:
             from scanner.internet import supervisor
             return supervisor.run_overlapped(cfg, log=log, config_path=config_path, shards_from=span.start, shards_to=span.stop,
-                                             archive=archive, **run_kwargs)
+                                             archive=archive, resume=resume, **{k: v for k, v in run_kwargs.items() if k != "resume"})
         return _run_campaign(cfg, run_fn, log, run_kwargs, span, archive)
     finally:
         lock.unlink(missing_ok=True)
@@ -388,25 +396,32 @@ def _finished_cleanly(run_dir: Path) -> bool:
     return bool(data.get("complete")) and not data.get("zero_responsive")
 
 
-def discard_stale_work(cfg: Any, i: int, attempt: int, log: Callable[[str], None] = lambda *_: None) -> None:
+def discard_stale_work(cfg: Any, i: int, attempt: int, log: Callable[[str], None] = lambda *_: None,
+                       keep: Path | None = None) -> None:
     """Remove ``work/`` (the fact store and its journal, up to a GB at scale) of earlier attempts that did not finish.
 
-    Manifests, logs and ``raw/`` stay: a later attempt reuses the favicon lookup records from there.
+    Manifests, logs and ``raw/`` stay: a later attempt reuses the favicon lookup records from there. The attempt
+    named by ``keep`` (the one the new attempt continues from) keeps its ``work/``: its fact store holds the units it finished.
     """
     for d in _earlier_attempts(cfg, i, attempt):
         work = d / "work"
+        if keep is not None and Path(d) == Path(keep):
+            continue
         if work.is_dir() and not _finished_cleanly(d) and not _network_done(d):
             shutil.rmtree(work, ignore_errors=True)
             log(f"[campaign] shard {i + 1}/{cfg.shards}: removed the working files of {d.name}")
 
 
 def resume_source(cfg: Any, i: int, run_id: str) -> Path | None:
-    """The newest earlier attempt of this shard, same configuration, whose favicon lookup records a new attempt can start from."""
+    """The newest earlier attempt of this shard, same configuration, that a new attempt can continue from: it left favicon
+    lookup records, or the fact store with the network units it finished."""
     m = re.search(r"-a(\d+)$", run_id)
     if m is None:
         return None
     for d in _earlier_attempts(cfg, i, int(m.group(1))):
-        if _finished_cleanly(d) or not outputs.resolve(d / "raw" / "favicon_records.jsonl").is_file():
+        if _finished_cleanly(d):
+            continue
+        if not outputs.resolve(d / "raw" / "favicon_records.jsonl").is_file() and not (d / "work" / "facts.sqlite").is_file():
             continue
         try:
             manifest = json.loads((d / "manifest.json").read_text(encoding="utf-8")) if (d / "manifest.json").exists() else {}
@@ -418,7 +433,7 @@ def resume_source(cfg: Any, i: int, run_id: str) -> Path | None:
 
 
 def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], None],
-                archive: ArchivePolicy | None = None) -> tuple[str, str | None]:
+                archive: ArchivePolicy | None = None, resume: bool = True) -> tuple[str, str | None]:
     """Decide what to do with shard ``i``: ``("complete", None)``, ``("network_done", None)``, ``("drain", None)``, ``("disk", shortfall message)``
     or ``("run", run_id)`` (attempt counted)."""
     path = campaign_dir(cfg) / "campaign.json"
@@ -452,7 +467,7 @@ def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], No
         entry.pop(stale, None)
     entry.update(status="running", started_at=datetime.now(UTC).isoformat())
     run_id = _run_id(cfg, i, entry["attempts"])
-    discard_stale_work(cfg, i, entry["attempts"], log)
+    discard_stale_work(cfg, i, entry["attempts"], log, keep=resume_source(cfg, i, run_id) if resume else None)
     entry["run_id"] = run_id
     _write_json(path, state)
     log(f"[campaign] shard {i + 1}/{cfg.shards} (attempt {entry['attempts']}) -> {run_id}")
@@ -509,8 +524,9 @@ def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], No
     run_dirs: dict[int, Path] = {}
     stopped: dict[str, Any] | None = None
     path = campaign_dir(cfg) / "campaign.json"
+    resume = run_kwargs.get("resume", True)
     for i in span:
-        action, run_id = begin_shard(cfg, state, i, log, archive)
+        action, run_id = begin_shard(cfg, state, i, log, archive, resume)
         entry = state["shard_states"][str(i)]
         if action == "complete":
             run_dirs[i] = Path(entry["run_dir"])
@@ -524,8 +540,8 @@ def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], No
             stopped = {"shard": i, "reason": "disk", "detail": run_id}
             break
         try:
-            resume = resume_source(cfg, i, run_id)
-            extra = {"resume_from": resume} if resume is not None else {}
+            source = resume_source(cfg, i, run_id) if resume else None
+            extra = {"resume_from": source} if source is not None else {}
             run_dir = run_fn(replace(cfg, shard=i), run_id=run_id, **extra, **run_kwargs)
         except PreflightFailed as exc:
             stopped = record_failure(entry, i, exc)
