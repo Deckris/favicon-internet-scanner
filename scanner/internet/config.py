@@ -392,12 +392,16 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     sc = _section(raw, "sni_confirm", {"enabled", "max_per_endpoint"})
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
                                    "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images",
-                                   "icon_selection", "fallback", "max_active_requests", "reuse_http_document", "processes"},
+                                   "icon_selection", "fallback", "max_active_requests", "reuse_http_document", "processes", "javascript"},
                   {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page"})
     oh = _section({"offhost_icons": fv.get("offhost_icons") or {"enabled": False}}, "offhost_icons",
                   {"enabled", "max_total_fetches", "max_per_host", "min_interval_seconds", "max_bytes"}, {"enabled"})
     if not isinstance(oh["enabled"], bool):
         raise ConfigError("favicon.offhost_icons.enabled must be true or false")
+    js = _section({"javascript": fv.get("javascript") or {"enabled": False}}, "javascript",
+                  {"enabled", "max_pages_per_shard", "page_timeout_seconds", "concurrency", "wait_ms"}, {"enabled"})
+    if not isinstance(js["enabled"], bool):
+        raise ConfigError("favicon.javascript.enabled must be true or false")
     procs = _int(fv.get("processes", 1), "favicon.processes", 1, 64)
     for key, cap in (("workers", fv.get("workers")), ("max_active_requests", fv.get("max_active_requests", 512))):
         if isinstance(cap, int) and not isinstance(cap, bool) and procs > cap:
@@ -452,6 +456,12 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
             fallback=_choice(fv.get("fallback", "always_if_no_image"), "favicon.fallback", FALLBACK_MODES),
             max_active_requests=_int(fv.get("max_active_requests", 512), "favicon.max_active_requests", 1, 8192),
             reuse_http_document=_bool(fv.get("reuse_http_document", True), "favicon.reuse_http_document"),
+            javascript=SimpleNamespace(
+                enabled=js["enabled"],
+                max_pages_per_shard=_int(js.get("max_pages_per_shard", 1000), "favicon.javascript.max_pages_per_shard", 1, 10**7),
+                page_timeout_seconds=_float(js.get("page_timeout_seconds", 20), "favicon.javascript.page_timeout_seconds", 1, 120),
+                concurrency=(None if js.get("concurrency") is None else _int(js["concurrency"], "favicon.javascript.concurrency", 1, 64)),
+                wait_ms=_int(js.get("wait_ms", 1500), "favicon.javascript.wait_ms", 0, 30000)),
             offhost=SimpleNamespace(
                 enabled=oh["enabled"],
                 max_total_fetches=_int(oh.get("max_total_fetches", 500), "favicon.offhost_icons.max_total_fetches", 1, 100000),

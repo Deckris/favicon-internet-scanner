@@ -457,6 +457,40 @@ def _display_url(url: str) -> str:
     return url if not url.lower().startswith("data:") else f"{url[:40]}... (embedded, {len(url)} chars)"
 
 
+def fill_icon_fields(record: dict[str, Any], fetcher: Any, *, url: str, ip: str, declared: list[FaviconDeclaration], max_icons: int,
+                     icon_store: Any = None, selection: str = "all", fallback: str = "always_if_no_image") -> None:
+    """Fetch the icons of ``declared`` for the page at ``url`` (reached through ``ip``) and write the favicon fields of ``record``."""
+    selection_report: dict[str, Any] = {}
+    decls, resources = acquire_favicons(url, None, connect_ip=ip, fetcher=fetcher, max_icons=max_icons, declarations=declared,
+                                        on_icon=icon_store.save if icon_store is not None else None,
+                                        selection=selection, fallback=fallback, fingerprint=_FINGERPRINTS,
+                                        report=selection_report)
+    if selection_report:
+        # columns exist only under browser_models, so records of the other modes keep their shape
+        chosen = selection_report["chosen"]
+        record.update(icon_rule_version=selection_report["rule_version"],
+                      icon_chosen_chromium=_display_url(chosen["chromium"]) if chosen["chromium"] else None,
+                      icon_chosen_firefox=_display_url(chosen["firefox"]) if chosen["firefox"] else None,
+                      icon_chosen_spec=_display_url(chosen["spec"]) if chosen["spec"] else None,
+                      icon_models_differ=selection_report["differ"])
+    record.update(icon_declaration_facts(url, decls, resources))
+    record["favicon_candidates"] = len(resources)
+    image = next((r for r in resources if r.fingerprint and r.fingerprint.get("image_ok")), None)
+    first = image or (resources[0] if resources else None)
+    if first is None:
+        record["favicon_outcome"] = "none_declared"
+    else:
+        fp = first.fingerprint or {}
+        record.update(
+            favicon_url=_display_url(first.resolved_url), favicon_sha256=first.favicon_sha256, favicon_bytes=first.favicon_bytes,
+            favicon_content_type=first.content_type_claimed, favicon_decode_status=first.decode_status,
+            favicon_mmh3=fp.get("mmh3_hash"), favicon_md5=fp.get("md5_hex"),
+            favicon_is_image=image is not None,
+            favicon_file=icon_store.path_for(first.favicon_sha256) if icon_store is not None and image is not None else None,
+            favicon_outcome=_favicon_outcome(first, image),
+        )
+
+
 def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, hostname: str | None, max_icons: int,
                    icon_store: Any = None, selection: str = "all", fallback: str = "always_if_no_image",
                    stored_document: dict[str, Any] | None = None, max_document_bytes: int = 0) -> dict[str, Any]:
@@ -501,35 +535,8 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
         if declared is None:
             declared = parse_icon_declarations(url, html, max_icons=max_icons) if html is not None else []
         html = None         # the page can be megabytes; icon fetches below may wait a long time for pacing
-        selection_report: dict[str, Any] = {}
-        decls, resources = acquire_favicons(url, None, connect_ip=ip, fetcher=fetcher, max_icons=max_icons, declarations=declared,
-                                            on_icon=icon_store.save if icon_store is not None else None,
-                                            selection=selection, fallback=fallback, fingerprint=_FINGERPRINTS,
-                                            report=selection_report)
-        if selection_report:
-            # columns exist only under browser_models, so records of the other modes keep their shape
-            chosen = selection_report["chosen"]
-            record.update(icon_rule_version=selection_report["rule_version"],
-                          icon_chosen_chromium=_display_url(chosen["chromium"]) if chosen["chromium"] else None,
-                          icon_chosen_firefox=_display_url(chosen["firefox"]) if chosen["firefox"] else None,
-                          icon_chosen_spec=_display_url(chosen["spec"]) if chosen["spec"] else None,
-                          icon_models_differ=selection_report["differ"])
-        record.update(icon_declaration_facts(url, decls, resources))
-        record["favicon_candidates"] = len(resources)
-        image = next((r for r in resources if r.fingerprint and r.fingerprint.get("image_ok")), None)
-        first = image or (resources[0] if resources else None)
-        if first is None:
-            record["favicon_outcome"] = "none_declared"
-        else:
-            fp = first.fingerprint or {}
-            record.update(
-                favicon_url=_display_url(first.resolved_url), favicon_sha256=first.favicon_sha256, favicon_bytes=first.favicon_bytes,
-                favicon_content_type=first.content_type_claimed, favicon_decode_status=first.decode_status,
-                favicon_mmh3=fp.get("mmh3_hash"), favicon_md5=fp.get("md5_hex"),
-                favicon_is_image=image is not None,
-                favicon_file=icon_store.path_for(first.favicon_sha256) if icon_store is not None and image is not None else None,
-                favicon_outcome=_favicon_outcome(first, image),
-            )
+        fill_icon_fields(record, fetcher, url=url, ip=ip, declared=declared, max_icons=max_icons, icon_store=icon_store,
+                         selection=selection, fallback=fallback)
     except Exception as exc:   # one bad endpoint must never abort the stage
         record["error"] = f"{type(exc).__name__}: {exc}"[:300]
         record["favicon_outcome"] = "error"

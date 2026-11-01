@@ -7,6 +7,7 @@ candidate sites, so a single policy decides what counts as a favicon.
 from __future__ import annotations
 
 import base64
+import json
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import unquote_to_bytes, urljoin, urlsplit
@@ -23,7 +24,14 @@ FAVICON_POLICY: dict = {
     "data_uri": "decode_local",
 }
 
+
+def policy_for(javascript: bool) -> dict:
+    """The declaration policy of a run: manifest icons and JavaScript-set icons are read only when ``favicon.javascript`` is on."""
+    return {**FAVICON_POLICY, "manifest": bool(javascript), "javascript": bool(javascript)}
+
+
 MAX_HTML_CHARS = 2_000_000
+MAX_MANIFEST_CHARS = 1_000_000
 MAX_DATA_URI_SOURCE_CHARS = 8_000_000
 MAX_DATA_URI_BYTES = 5 * 1024 * 1024
 
@@ -207,4 +215,29 @@ def rank_icon_declarations(declarations: list[FaviconDeclaration]) -> list[Favic
     return sorted(chosen, key=lambda d: ("apple-touch" in (d.rel or ""), _type_penalty(d), _size_distance(d.sizes), -d.order))
 
 
-__all__ = ["FAVICON_POLICY", "parse_icon_declarations", "decode_data_uri", "rank_icon_declarations"]
+def manifest_icon_links(manifest_url: str, text: str, *, policy: dict | None = None, limit: int = FAVICON_POLICY["max_icons"]) -> list[dict[str, Any]]:
+    """The ``icons`` of a web app manifest as link dicts (``href`` resolved against the manifest, ``sizes``, ``type``).
+
+    Empty unless the policy enables manifest parsing (see ``policy_for``); malformed JSON gives an empty list.
+    """
+    if not (policy or FAVICON_POLICY).get("manifest"):
+        return []
+    try:
+        data = json.loads(text[:MAX_MANIFEST_CHARS])
+    except ValueError:
+        return []
+    icons = data.get("icons") if isinstance(data, dict) else None
+    out: list[dict[str, Any]] = []
+    for item in icons if isinstance(icons, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("src"), str):
+            continue
+        href = _safe_urljoin(manifest_url, item["src"].strip()) if not item["src"].lower().startswith("data:") else item["src"]
+        if href:
+            out.append({"href": href, "sizes": item.get("sizes") if isinstance(item.get("sizes"), str) else None,
+                        "type": item.get("type") if isinstance(item.get("type"), str) else None})
+        if len(out) >= limit:
+            break
+    return out
+
+
+__all__ = ["FAVICON_POLICY", "policy_for", "parse_icon_declarations", "decode_data_uri", "rank_icon_declarations", "manifest_icon_links"]

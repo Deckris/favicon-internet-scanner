@@ -25,6 +25,8 @@ BATCH_PER_SENDER = 40               # addresses in a port-pure batch per ZGrab2 
 OVERLAP_MIN_CORES = 4               # overlapping TLS with ZMap needs spare cores
 DEFAULT_OPEN_FILES = 8192           # assumed where the limit cannot be read
 DEFAULT_STAGE_MAX_SECONDS = 86400
+BROWSER_MEMORY_GB = 0.6             # resident memory of one headless browser with a page open
+MAX_BROWSERS = 16
 
 # The ranges config.py enforces; derived values stay inside them.
 RANGES: dict[str, tuple[int, int]] = {
@@ -57,6 +59,14 @@ def connection_budget(cores: int, memory_gb: float | None, open_files: int) -> i
     limits = [int(OPEN_FILE_FRACTION * open_files), max(1, cores) * PER_CORE_CONNECTIONS]
     if memory_gb is not None:
         limits.append(int(max(memory_gb - RESERVED_MEMORY_GB, 0.25) * 2**30 / PER_CONNECTION_BYTES))
+    return max(1, min(limits))
+
+
+def javascript_concurrency(cores: int, memory_gb: float | None) -> int:
+    """Headless browsers to run at once: half the cores, as many as fit in the RAM left after the reserve, at most ``MAX_BROWSERS``."""
+    limits = [max(1, int(cores) // 2), MAX_BROWSERS]
+    if memory_gb is not None:
+        limits.append(int(max(memory_gb - RESERVED_MEMORY_GB, 0.0) / BROWSER_MEMORY_GB))
     return max(1, min(limits))
 
 
