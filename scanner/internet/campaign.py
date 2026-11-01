@@ -153,7 +153,8 @@ def merge_summaries(summaries: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
-def _finish(cfg: Any, state: dict[str, Any], run_dirs: dict[int, Path]) -> None:
+def _finish(cfg: Any, state: dict[str, Any], run_dirs: dict[int, Path], span: range | None = None) -> None:
+    span = range(cfg.shards) if span is None else span
     summaries = []
     for i, d in sorted(run_dirs.items()):
         if state["shard_states"].get(str(i), {}).get("status") != "complete":
@@ -163,12 +164,27 @@ def _finish(cfg: Any, state: dict[str, Any], run_dirs: dict[int, Path]) -> None:
         except (OSError, ValueError):
             continue
     _write_json(campaign_dir(cfg) / "campaign_summary.json",
-                {"complete": all(state["shard_states"].get(str(i), {}).get("status") == "complete" for i in range(cfg.shards)),
+                {"complete": all(state["shard_states"].get(str(i), {}).get("status") == "complete" for i in span),
+                 "shard_range": [span.start, span.stop],
                  "shard_states": state["shard_states"], "merged": merge_summaries(summaries)})
 
 
+def shard_span(cfg: Any, shards_from: int = 0, shards_to: int | None = None) -> range:
+    """The shards one invocation covers: ``shards_from`` up to, but not including, ``shards_to`` (default: the end).
+
+    Several hosts can share one campaign definition (same checksum, same campaign directory name) and each take a
+    slice; the slices must be disjoint, which is up to the operator, since each host keeps its own state file.
+    """
+    hi = cfg.shards if shards_to is None else shards_to
+    if not 0 <= shards_from < hi <= cfg.shards:
+        raise ValueError(f"the shard range [{shards_from}, {hi}) must satisfy 0 <= from < to <= {cfg.shards}")
+    return range(shards_from, hi)
+
+
 def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: Callable[[str], None] = print,
-                 pipeline_depth: int = 1, config_path: Path | None = None, **run_kwargs: Any) -> dict[str, Any]:
+                 pipeline_depth: int = 1, config_path: Path | None = None, shards_from: int = 0, shards_to: int | None = None,
+                 **run_kwargs: Any) -> dict[str, Any]:
+    span = shard_span(cfg, shards_from, shards_to)
     lock = _acquire_lock(cfg)
     try:
         if pipeline_depth > 1:
@@ -179,8 +195,9 @@ def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: C
                 pipeline_depth = 1
         if pipeline_depth > 1:
             from scanner.internet import supervisor
-            return supervisor.run_overlapped(cfg, log=log, config_path=config_path, **run_kwargs)
-        return _run_campaign(cfg, run_fn, log, run_kwargs)
+            return supervisor.run_overlapped(cfg, log=log, config_path=config_path, shards_from=span.start, shards_to=span.stop,
+                                             **run_kwargs)
+        return _run_campaign(cfg, run_fn, log, run_kwargs, span)
     finally:
         lock.unlink(missing_ok=True)
 
@@ -370,21 +387,26 @@ def record_finished(entry: dict[str, Any], i: int, run_dir: Path) -> dict[str, A
     return {"shard": i, "reason": manifest.get("abort_reason") or "stage_errors", "detail": manifest.get("stage_errors")}
 
 
-def end_campaign(cfg: Any, state: dict[str, Any], run_dirs: dict[int, Path], stopped: dict[str, Any] | None) -> dict[str, Any]:
+def end_campaign(cfg: Any, state: dict[str, Any], run_dirs: dict[int, Path], stopped: dict[str, Any] | None,
+                 span: range | None = None) -> dict[str, Any]:
+    span = range(cfg.shards) if span is None else span
     path = campaign_dir(cfg) / "campaign.json"
     _write_json(path, state)
-    _finish(cfg, state, run_dirs)
-    done = sum(1 for e in state["shard_states"].values() if e["status"] == "complete")
-    return {"complete": done == cfg.shards, "shards_complete": done, "shards": cfg.shards, "stopped": stopped,
+    _finish(cfg, state, run_dirs, span)
+    done = sum(1 for i in span if state["shard_states"].get(str(i), {}).get("status") == "complete")
+    return {"complete": done == len(span), "shards_complete": done, "shards": cfg.shards, "shard_range": [span.start, span.stop],
+            "stopped": stopped,
             "state_file": str(path), "summary_file": str(campaign_dir(cfg) / "campaign_summary.json"), "finished_at": time.time()}
 
 
-def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], None], run_kwargs: dict[str, Any]) -> dict[str, Any]:
+def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], None], run_kwargs: dict[str, Any],
+                  span: range | None = None) -> dict[str, Any]:
+    span = range(cfg.shards) if span is None else span
     state = load_state(cfg)
     run_dirs: dict[int, Path] = {}
     stopped: dict[str, Any] | None = None
     path = campaign_dir(cfg) / "campaign.json"
-    for i in range(cfg.shards):
+    for i in span:
         action, run_id = begin_shard(cfg, state, i, log)
         entry = state["shard_states"][str(i)]
         if action == "complete":
@@ -413,4 +435,4 @@ def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], No
             _write_json(path, state)
         if stopped:
             break
-    return end_campaign(cfg, state, run_dirs, stopped)
+    return end_campaign(cfg, state, run_dirs, stopped, span)

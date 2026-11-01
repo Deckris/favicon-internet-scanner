@@ -217,7 +217,9 @@ def _settle(cfg: Any, state: dict[str, Any], child: _Child, rc: int, run_dirs: d
 
 
 def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path: Path | None = None, kwargs_factory: str | None = None,
-                   launcher: Callable[[int, str], list[str]] | None = None, poll: float = 0.2) -> dict[str, Any]:
+                   launcher: Callable[[int, str], list[str]] | None = None, poll: float = 0.2,
+                   shards_from: int = 0, shards_to: int | None = None) -> dict[str, Any]:
+    span = campaign.shard_span(cfg, shards_from, shards_to)
     check_overlap_safe(cfg)
     if launcher is None:
         if config_path is None:
@@ -255,7 +257,7 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
             if sig is not None:
                 previous[sig] = signal.signal(sig, on_signal)
     spawn_kw: dict[str, Any] = {"preexec_fn": _spawn_child} if sys.platform.startswith("linux") else {}
-    next_shard = 0
+    next_shard = span.start
     try:
         while True:
             for i, c in list(inflight.items()):
@@ -280,7 +282,7 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
                 kill_sent = True
                 terminate_children()
             a_free = all((phases / f"{c.run_id}.a-done").exists() for c in inflight.values())
-            while (not failures and halted is None and not terminating and next_shard < cfg.shards
+            while (not failures and halted is None and not terminating and next_shard < span.stop
                    and len(inflight) < DEPTH and a_free and not (switch and inflight)):
                 i = next_shard
                 action, run_id = campaign.begin_shard(cfg, state, i, log)
@@ -297,7 +299,7 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
                     break
                 inflight[i] = _Child(i, run_id, subprocess.Popen(launcher(i, run_id), **spawn_kw))
                 a_free = False
-            if not inflight and (failures or halted is not None or terminating or next_shard >= cfg.shards):
+            if not inflight and (failures or halted is not None or terminating or next_shard >= span.stop):
                 break
             time.sleep(poll)
     finally:
@@ -310,7 +312,7 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
     stopped = failures[min(failures)] if failures else halted
     if stopped is None and terminating:
         stopped = {"shard": None, "reason": "interrupt", "detail": "the campaign process was asked to stop"}
-    return campaign.end_campaign(cfg, state, run_dirs, stopped)
+    return campaign.end_campaign(cfg, state, run_dirs, stopped, span)
 
 
 if __name__ == "__main__":

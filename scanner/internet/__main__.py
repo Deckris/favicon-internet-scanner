@@ -144,6 +144,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="campaign: 2 runs the next shard's network stages while the previous shard works through its favicon stage")
     ap.add_argument("--allow-rerun", action="store_true",
                     help="run: permit a second run of an identical config (it re-probes the same sample)")
+
+    # campaign: which shards this invocation covers (several hosts can share one campaign definition)
+    ap.add_argument("--shards-from", type=int, default=0, metavar="N",
+                    help="campaign: first shard to run, 0-based, inclusive (default 0)")
+    ap.add_argument("--shards-to", type=int, default=None, metavar="N",
+                    help="campaign: end of the shard range, exclusive (default: all shards). "
+                         "`--shards-from 0 --shards-to 50` runs shards 0 to 49, `--shards-from 50` the rest")
     args = ap.parse_args(argv)
 
     if args.command in SETTINGS_COMMANDS:
@@ -272,7 +279,9 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         from scanner.internet.campaign import CampaignLocked, run_campaign
         try:
-            result = run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config) if args.pipeline > 1 else run_campaign(cfg)
+            span = {"shards_from": args.shards_from, "shards_to": args.shards_to}
+            result = (run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config, **span) if args.pipeline > 1
+                      else run_campaign(cfg, **span))
         except (CampaignLocked, ValueError) as exc:
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 2
