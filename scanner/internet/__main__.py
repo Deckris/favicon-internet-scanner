@@ -219,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="run: skip the requirement that a small completed pilot precedes a larger sample")
     ap.add_argument("--pipeline", type=int, choices=(1, 2), default=1,
                     help="campaign: 2 runs the next shard's network stages while the previous shard works through its favicon stage")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="run, campaign: start an interrupted shard from nothing; reuse no finished ZMap sweep, ZGrab2 or DNS batch "
+                         "and no favicon lookup of the earlier attempt")
     ap.add_argument("--allow-rerun", action="store_true",
                     help="run: permit a second run of an identical config (it re-probes the same sample)")
 
@@ -435,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
             span = {"shards_from": args.shards_from, "shards_to": args.shards_to}
             if args.stop_after_network:
                 span["network_only"] = True
+            if args.no_resume:
+                span["resume"] = False
             if args.archive_to is not None:
                 from scanner.internet.campaign import ArchivePolicy
                 span["archive"] = ArchivePolicy(args.archive_to, args.archive_remove_source, args.archive_when_free_gb_below)
@@ -465,7 +470,8 @@ def main(argv: list[str] | None = None) -> int:
               "pass --allow-rerun only if that is intended.", file=sys.stderr)
         return 2
     try:
-        run_dir = pipeline.run(cfg, run_id=args.run_id, **({"network_only": True} if args.stop_after_network else {}))
+        run_dir = pipeline.run(cfg, run_id=args.run_id, **({"network_only": True} if args.stop_after_network else {}),
+                               **({"resume": False} if args.no_resume else {}))
     except pre.PreflightFailed as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

@@ -41,6 +41,12 @@ class ZmapProgress:
             self.sweeps.append({"start": self._now(), "end": None, "obs": [], "path": status_path, "offset": 0,
                                 "col": None, "rest": ""})
 
+    def add_finished_sweep(self) -> None:
+        """A sweep an earlier attempt completed and this one takes over: it sent nothing now, and counts as ended just now."""
+        with self._lock:
+            t = self._now()
+            self.sweeps.append({"start": t, "end": t, "obs": [], "path": None, "offset": 0, "col": None, "rest": ""})
+
     def end_sweep(self) -> None:
         with self._lock:
             if self.sweeps and self.sweeps[-1]["end"] is None:

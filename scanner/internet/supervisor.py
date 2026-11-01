@@ -139,7 +139,8 @@ def child_main(argv: list[str] | None = None) -> int:
     ap.add_argument("--campaign-dir", type=Path, required=True)
     ap.add_argument("--kwargs-factory", help="module:function returning extra keyword arguments for pipeline.run")
     ap.add_argument("--supervisor-pid", type=int, help="pid of the supervisor that started this process")
-    ap.add_argument("--resume-from", type=Path, help="run directory of an earlier attempt whose favicon lookup records to reuse")
+    ap.add_argument("--resume-from", type=Path, help="run directory of an earlier attempt whose finished units and favicon lookup records to reuse")
+    ap.add_argument("--no-resume", action="store_true", help="start the shard from nothing, whatever an earlier attempt left")
     args = ap.parse_args(argv)
     if not _die_with_parent(args.supervisor_pid):
         print("the supervisor is gone; not starting", file=sys.stderr)
@@ -158,7 +159,7 @@ def child_main(argv: list[str] | None = None) -> int:
             return fail(EXIT_MISMATCH, "the configuration changed since the campaign started (checksum differs)")
         kwargs = _import_factory(args.kwargs_factory)() if args.kwargs_factory else {}
         run_dir = pipeline.run(replace(cfg, shard=args.shard), run_id=args.run_id, phase_gate=gate,
-                               resume_from=args.resume_from, **kwargs)
+                               resume_from=args.resume_from, **({"resume": False} if args.no_resume else {}), **kwargs)
     except PreflightFailed as exc:
         return fail(EXIT_REFUSED, str(exc))
     except KeyboardInterrupt as exc:
@@ -177,12 +178,14 @@ class _Child:
 
 
 def child_command(cfg: Any, config_path: Path, shard: int, run_id: str, kwargs_factory: str | None = None,
-                  resume_from: Path | None = None) -> list[str]:
+                  resume_from: Path | None = None, resume: bool = True) -> list[str]:
     cmd = [sys.executable, "-m", "scanner.internet.supervisor", "--child", "--config", str(config_path), "--shard", str(shard),
            "--run-id", run_id, "--checksum", cfg.checksum, "--campaign-dir", str(campaign.campaign_dir(cfg)),
            "--supervisor-pid", str(os.getpid())]
     if resume_from is not None:
         cmd += ["--resume-from", str(resume_from)]
+    if not resume:
+        cmd.append("--no-resume")
     if kwargs_factory:
         cmd += ["--kwargs-factory", kwargs_factory]
     return cmd
@@ -218,14 +221,14 @@ def _settle(cfg: Any, state: dict[str, Any], child: _Child, rc: int, run_dirs: d
 
 def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path: Path | None = None, kwargs_factory: str | None = None,
                    launcher: Callable[[int, str], list[str]] | None = None, poll: float = 0.2,
-                   shards_from: int = 0, shards_to: int | None = None, archive: Any = None) -> dict[str, Any]:
+                   shards_from: int = 0, shards_to: int | None = None, archive: Any = None, resume: bool = True) -> dict[str, Any]:
     span = campaign.shard_span(cfg, shards_from, shards_to)
     check_overlap_safe(cfg)
     if launcher is None:
         if config_path is None:
             raise ValueError("--pipeline 2 needs the configuration file path")
         launcher = lambda i, run_id: child_command(cfg, Path(config_path), i, run_id, kwargs_factory,    # noqa: E731
-                                                   campaign.resume_source(cfg, i, run_id))
+                                                   campaign.resume_source(cfg, i, run_id) if resume else None, resume)
     state = campaign.load_state(cfg)
     state["pipeline"] = DEPTH
     cdir = campaign.campaign_dir(cfg)
@@ -285,7 +288,7 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
             while (not failures and halted is None and not terminating and next_shard < span.stop
                    and len(inflight) < DEPTH and a_free and not (switch and inflight)):
                 i = next_shard
-                action, run_id = campaign.begin_shard(cfg, state, i, log, archive)
+                action, run_id = campaign.begin_shard(cfg, state, i, log, archive, resume)
                 next_shard += 1
                 entry = state["shard_states"][str(i)]
                 if action == "complete":

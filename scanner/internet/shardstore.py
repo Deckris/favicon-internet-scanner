@@ -176,6 +176,11 @@ CREATE TABLE IF NOT EXISTS favicon (ip TEXT NOT NULL, port INTEGER NOT NULL, hos
 CREATE INDEX IF NOT EXISTS favicon_first ON favicon (first_idx);
 CREATE TABLE IF NOT EXISTS ip_results (ipnum INTEGER NOT NULL, ip TEXT NOT NULL, data TEXT NOT NULL,
     PRIMARY KEY (ipnum, ip)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS meta (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS units (unit TEXT NOT NULL PRIMARY KEY, stage TEXT NOT NULL, port INTEGER, size INTEGER NOT NULL,
+    jobs TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS docs (ip TEXT NOT NULL, port INTEGER NOT NULL, data TEXT NOT NULL,
+    PRIMARY KEY (ip, port)) WITHOUT ROWID;
 """
 
 _SQL = {
@@ -192,6 +197,7 @@ _SQL = {
     "sni_skipped": "INSERT OR REPLACE INTO sni_skipped (ip, port, host, reason) VALUES (?,?,?,?)",
     # A dict assigned in job order keeps the position of the first assignment and the value of the last one.
     "ip_results": "INSERT OR REPLACE INTO ip_results (ipnum, ip, data) VALUES (?,?,?)",
+    "docs": "INSERT OR REPLACE INTO docs (ip, port, data) VALUES (?,?,?)",
     "favicon": ("INSERT INTO favicon (ip, port, host, first_idx, last_idx, outcome, data) VALUES (?,?,?,?,?,?,?) "
                 "ON CONFLICT (ip, port, host) DO UPDATE SET "
                 "first_idx = MIN(first_idx, excluded.first_idx), "
@@ -719,6 +725,91 @@ class ShardStore:
                 return
             for _n, ip, data in rows:
                 yield ip, json.loads(data)
+            last = (rows[-1][0], rows[-1][1])
+
+    # -------------------------------------------------------------- resume: identity, finished units, stored pages
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._transaction(lambda db: db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)", (key, value)))
+
+    def get_meta(self, key: str) -> str | None:
+        rows = self._query("SELECT value FROM meta WHERE key = ?", (key,))
+        return rows[0][0] if rows else None
+
+    def put_unit(self, unit: str, stage: str, port: int | None, size: int, jobs: str) -> bool:
+        """Record a finished unit of work. The rows it produced are flushed first and the record is its own
+        commit, so a unit that is on file always has all its rows. False (nothing recorded) when rows were lost."""
+        with self._lock:
+            self._flush_locked()
+            if self.dropped_rows or self.errors:
+                return False
+            self._transaction(lambda db: db.execute("INSERT OR REPLACE INTO units (unit, stage, port, size, jobs) VALUES (?,?,?,?,?)",
+                                                    (unit, stage, port, int(size), jobs)))
+        return True
+
+    def get_unit(self, unit: str) -> tuple[str, int | None, int, str] | None:
+        """(stage, port, size, jobs as JSON) of a finished unit, or None."""
+        rows = self._query("SELECT stage, port, size, jobs FROM units WHERE unit = ?", (unit,))
+        return tuple(rows[0]) if rows else None       # type: ignore[return-value]
+
+    def count_units(self) -> int:
+        return self._count("units")
+
+    def forget_unit(self, unit: str) -> None:
+        with self._lock:
+            self._transaction(lambda db: db.execute("DELETE FROM units WHERE unit = ?", (unit,)))
+
+    def clear_port(self, port: int) -> None:
+        """Drop what a ZMap sweep of ``port`` wrote (a sweep that did not finish), so its rerun replaces it."""
+        with self._lock:
+            self._flush_locked()
+            self._transaction(lambda db: [db.execute(f"DELETE FROM {t} WHERE port = ?", (int(port),))
+                                          for t in ("endpoints", "synack", "tarpit_ips")])
+
+    def reset_tarpits(self) -> None:
+        with self._lock:
+            self._flush_locked()
+            self._transaction(lambda db: db.execute("DELETE FROM tarpit_ips"))
+
+    def clear_for_resume(self) -> None:
+        """What a continuing attempt rebuilds: PTR send marks (an answer on file is kept), favicon records and spooled rows."""
+        with self._lock:
+            self._flush_locked()
+            self._transaction(lambda db: [db.execute(f"DELETE FROM {t}") for t in ("ptr_sent", "favicon", "ip_results")])
+
+    _KEYED = {"tls_direct": 2, "http_res": 2, "docs": 2, "sni_res": 3}
+
+    def delete_rows(self, table: str, keys: Iterable[tuple[Any, ...]]) -> None:
+        """Drop the rows a unit that is about to run again may have left: (ip, port) keys, plus the host for ``sni_res``."""
+        width = self._KEYED[table]
+        cols = "ip = ? AND port = ?" + (" AND host = ?" if width == 3 else "")
+        rows = [(_ip(k[0]), int(k[1]), *( [_hb(k[2])] if width == 3 else [] )) for k in keys]
+        with self._lock:
+            self._flush_locked()
+            self._transaction(lambda db: db.executemany(f"DELETE FROM {table} WHERE {cols}", rows))
+
+    def clear_names(self) -> None:
+        with self._lock:
+            self._flush_locked()
+            self._transaction(lambda db: [db.execute(f"DELETE FROM {t}") for t in ("names", "name_index")])
+
+    def prune_resolutions(self) -> None:
+        with self._lock:
+            self._flush_locked()
+            self._transaction(lambda db: db.execute("DELETE FROM resolutions WHERE host NOT IN (SELECT host FROM name_index)"))
+
+    def put_doc(self, ip: str, port: int, doc: Mapping[str, Any]) -> None:
+        self._add("docs", (_ip(ip), int(port), _dumps(doc)))
+
+    def iter_docs(self, *, page: int = 2000) -> Iterator[tuple[str, int, dict[str, Any]]]:
+        last: tuple[str, int] = ("", -1)
+        while True:
+            rows = self._query("SELECT ip, port, data FROM docs WHERE (ip, port) > (?, ?) ORDER BY ip, port LIMIT ?", (*last, page))
+            if not rows:
+                return
+            for ip, port, data in rows:
+                yield ip, port, json.loads(data)
             last = (rows[-1][0], rows[-1][1])
 
     # -------------------------------------------------------------- per-address groups

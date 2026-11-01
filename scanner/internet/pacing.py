@@ -500,17 +500,29 @@ class ContactLedger:
 
 def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedger,
                   run_batch: Callable[[list[T]], Any], *, batch_size: int, workers: int = 1,
-                  extra: Callable[[list[T]], Callable[[float], bool] | None] | None = None) -> list[Any]:
+                  extra: Callable[[list[T]], Callable[[float], bool] | None] | None = None,
+                  group_of: Callable[[T], Any] | None = None,
+                  reuse: Callable[[list[T]], Any] | None = None) -> list[Any]:
     """Like ``paced_rounds`` but each batch waits only for its own addresses, and up to ``workers`` run at once.
 
     Batches are the rounds of ``split_rounds`` cut into ``batch_size`` pieces, so their composition never depends
     on timing. Results come back in batch order. ``extra`` may add a per-batch admission check (see overlap.py).
     Stops starting new batches once a stop condition fires.
+
+    ``group_of`` keeps every batch within one group (the port, for ZGrab2): the groups are batched one after the other
+    in ascending order. ``reuse(batch)`` returns the stored result of a batch that was already run by an earlier
+    attempt, or None; such a batch contacts nothing, so it neither claims its addresses nor starts the pause clock.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     size = max(1, batch_size)
-    rounds = split_rounds(items, ip_of)
+    if group_of is None:
+        rounds = split_rounds(items, ip_of)
+    else:
+        by_group: dict[Any, list[T]] = {}
+        for item in items:
+            by_group.setdefault(group_of(item), []).append(item)
+        rounds = [r for key in sorted(by_group) for r in split_rounds(by_group[key], ip_of)]
     if ledger.limiter is not None:       # a batch holds at most `cap` addresses of one network, whatever the timing
         rounds = [g for r in rounds for g in split_by_network(r, ip_of, ledger.limiter.key_of, ledger.limiter.cap)]
     batches = [r[i:i + size] for r in rounds for i in range(0, len(r), size)]
@@ -530,6 +542,11 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
                     return
                 next_index[0] += 1
             batch = batches[i]
+            kept = reuse(batch) if reuse is not None else None
+            if kept is not None:
+                started[i] = True
+                results[i] = kept
+                continue
             ips = [ip_of(t) for t in batch]
             if not ledger.claim(ips, extra(batch) if extra else None):
                 return
