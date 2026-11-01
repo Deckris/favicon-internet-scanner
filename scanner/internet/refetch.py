@@ -23,7 +23,7 @@ from scanner.internet import outputs
 from scanner.internet import pacing
 from scanner.internet import pipeline
 from scanner.internet import preflight as pre
-from scanner.internet.config import ConfigError, ScanConfig
+from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds
 from scanner.internet.runner import ManagedExecutor
 from scanner.models import write_jsonl
 
@@ -158,7 +158,7 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
                 cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), {(j["ip"], j["port"]) for j in jobs},
                 exclusions=exclusions, killed=st.killed, state_path=run_dir / "offhost_state.json",
                 pacer=pacing.IpPacer(cfg.measurement.min_seconds_between_probes_per_ip, st.killed, poll=2.0))
-            deadline = time.monotonic() + cfg.favicon.stage_max_seconds
+            deadline = time.monotonic() + favicon_stage_seconds(cfg, len(jobs))
 
             def stop() -> bool:
                 return st.killed() or time.monotonic() > deadline

@@ -120,6 +120,20 @@ def sha256_file(path: Path) -> str:
         return h.hexdigest()
 
 
+STAGE_FLOOR_SECONDS = 7200          # favicon.stage_max_seconds when it is not set, for a shard of ordinary size
+STAGE_CAP_SECONDS = 86400           # the largest value favicon.stage_max_seconds accepts
+STAGE_MIN_JOBS_PER_SECOND = 180     # a third of the 540 lookups/s a tuned host is expected to sustain
+
+
+def favicon_stage_seconds(cfg: "ScanConfig", jobs: int) -> int:
+    """Time the favicon stage of one shard may take: ``favicon.stage_max_seconds`` when the config sets it, otherwise
+    derived from the number of lookups (at least ``STAGE_MIN_JOBS_PER_SECOND`` of them per second), between the floor and the cap."""
+    section = cfg.raw.get("favicon") if isinstance(cfg.raw, dict) else None
+    if isinstance(section, dict) and section.get("stage_max_seconds") is not None:
+        return cfg.favicon.stage_max_seconds
+    return int(min(STAGE_CAP_SECONDS, max(STAGE_FLOOR_SECONDS, -(-jobs // STAGE_MIN_JOBS_PER_SECOND))))
+
+
 MIN_PACE_SECONDS = 5.0      # the pause an approval is assumed to require when it does not state one
 
 
@@ -390,7 +404,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
             enabled=bool(fv["enabled"]), max_hostnames_per_endpoint=_int(fv["max_hostnames_per_endpoint"], "favicon.max_hostnames_per_endpoint", 0, 20),
             workers=_int(fv["workers"], "favicon.workers", 1, 8192), processes=procs, max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
             store_images=_bool(fv.get("store_images", True), "favicon.store_images"),
-            stage_max_seconds=_int(fv.get("stage_max_seconds", 7200), "favicon.stage_max_seconds", 1, 86400),
+            stage_max_seconds=_int(fv.get("stage_max_seconds", STAGE_FLOOR_SECONDS), "favicon.stage_max_seconds", 1, STAGE_CAP_SECONDS),
             max_unverified_names_per_endpoint=_int(fv.get("max_unverified_names_per_endpoint", 0), "favicon.max_unverified_names_per_endpoint", 0, 10),
             icon_selection=_choice(fv.get("icon_selection", "first_image"), "favicon.icon_selection", SELECTION_MODES),
             fallback=_choice(fv.get("fallback", "always_if_no_image"), "favicon.fallback", FALLBACK_MODES),

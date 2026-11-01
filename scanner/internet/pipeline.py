@@ -38,7 +38,7 @@ from scanner.internet import pacing
 from scanner.internet import population as pop
 from scanner.internet import preflight as pre
 from scanner.internet import tls as tlsmod
-from scanner.internet.config import ConfigError, ScanConfig, read_exclusions, sha256_file
+from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, sha256_file
 from scanner.internet.runner import ManagedExecutor
 from scanner.internet.shardstore import EndpointFacts, IpFacts, ShardStore
 from scanner.models import ToolJob, canonical_json, write_jsonl
@@ -892,7 +892,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         if not fjobs or not ledger.wait(job_ips):
             return
         fp = fav.fetch_policy(cfg, sorted(job_ips))
-        deadline = time.monotonic() + cfg.favicon.stage_max_seconds
+        stage_seconds = favicon_stage_seconds(cfg, len(fjobs))
+        counts["favicon_stage_max_seconds"] = stage_seconds
+        deadline = time.monotonic() + stage_seconds
 
         def stop() -> bool:
             return killed() or time.monotonic() > deadline
@@ -948,7 +950,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 st.errors["favicon_records_missing"] = f"{stored} favicon records stored for {expected} lookups"
             skipped = store.count_favicon_outcome("skipped_kill_switch")
             if time.monotonic() > deadline and skipped:
-                st.errors["favicon_deadline"] = f"stage cap of {cfg.favicon.stage_max_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"
+                st.errors["favicon_deadline"] = f"stage cap of {stage_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"
         finally:
             # each step on its own: one failing must neither replace the error being handled nor skip the others
             st.guard("favicon_records_close", record_log.close)
