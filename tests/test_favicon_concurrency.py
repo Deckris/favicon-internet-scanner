@@ -17,9 +17,9 @@ from tests.test_config import _rewrite
 class Clocked(FakeFetcher):
     """Records when each address was contacted and how many addresses are being worked on at once."""
 
-    def __init__(self, pacer) -> None:
+    def __init__(self, pacer, released=time.monotonic) -> None:
         super().__init__()
-        self.pacer, self.lock = pacer, threading.Lock()
+        self.pacer, self.released, self.lock = pacer, released, threading.Lock()
         self.times: dict[str, list[float]] = {}
         self.working = self.peak = 0
 
@@ -30,7 +30,7 @@ class Clocked(FakeFetcher):
         try:
             assert self.pacer.wait(connect_ip)
             with self.lock:
-                self.times.setdefault(connect_ip, []).append(time.monotonic())
+                self.times.setdefault(connect_ip, []).append(self.released())
             return super().fetch(url, connect_ip=connect_ip, kind=kind, context=context)
         finally:
             with self.lock:
@@ -39,14 +39,20 @@ class Clocked(FakeFetcher):
 
 def test_gap_per_address_holds_with_many_addresses_in_flight():
     interval = 0.3
-    pacer = pacing.IpPacer(interval, poll=0.05)
-    fetcher = Clocked(pacer)
+    local = threading.local()
+
+    def now() -> float:
+        local.last = time.monotonic()         # the instant the pacer compared against when it released this thread
+        return local.last
+
+    pacer = pacing.IpPacer(interval, now=now, poll=0.05)
+    fetcher = Clocked(pacer, released=lambda: local.last)
     jobs = [{"scheme": "http", "ip": f"198.51.100.{i}", "port": 80, "hostname": None} for i in range(1, 251)]
     jobs += [{"scheme": "https", "ip": jobs[i]["ip"], "port": 443, "hostname": None} for i in range(0, 250, 3)]
     out = fav.run_favicon_stage(fetcher, jobs, workers=300, max_icons=2)
     assert [(r["ip"], r["port"]) for r in out] == [(j["ip"], j["port"]) for j in jobs], "output order is preserved"
     gaps = [b - a for stamps in fetcher.times.values() for a, b in zip(stamps, stamps[1:])]
-    assert gaps and min(gaps) >= interval - 0.02, f"two requests to one address {min(gaps):.3f} s apart"
+    assert gaps and min(gaps) >= interval - 1e-9, f"two requests to one address {min(gaps):.3f} s apart"
 
 
 def test_more_addresses_than_the_old_worker_limit_are_in_flight_at_once():
