@@ -14,7 +14,7 @@ T = TypeVar("T")
 _SLICE = 0.5
 
 
-def _nap(seconds: float, sleep: Callable[[float], None], stop_event: threading.Event | None) -> None:
+def _nap(seconds: float, sleep: Callable[[float], None], stop_event: Any) -> None:
     """Sleep, but wake at once if ``stop_event`` is set."""
     if stop_event is None:
         sleep(seconds)
@@ -23,7 +23,7 @@ def _nap(seconds: float, sleep: Callable[[float], None], stop_event: threading.E
 
 
 def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], float], sleep: Callable[[float], None],
-                 stop_event: threading.Event | None = None, slice_seconds: float = _SLICE) -> bool:
+                 stop_event: Any = None, slice_seconds: float = _SLICE) -> bool:
     """Sleep until ``deadline``; returns False if a stop condition fired first (checked every ``slice_seconds``)."""
     while True:
         if killed() or (stop_event is not None and stop_event.is_set()):
@@ -43,7 +43,7 @@ class IpPacer:
 
     def __init__(self, min_interval: float, killed: Callable[[], bool] = lambda: False,
                  now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 stop_event: threading.Event | None = None, poll: float = _SLICE) -> None:
+                 stop_event: Any = None, poll: float = _SLICE) -> None:
         self.min_interval = float(min_interval)
         self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self._poll = float(poll)       # how often a waiting caller looks at the stop condition; longer with many waiters
@@ -71,7 +71,7 @@ class Gap:
 
     def __init__(self, seconds: float, killed: Callable[[], bool] = lambda: False,
                  now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: Any = None) -> None:
         self.seconds = float(seconds)
         self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self._last: float | None = None
@@ -119,7 +119,7 @@ class ContactLedger:
 
     def __init__(self, seconds: float, killed: Callable[[], bool] = lambda: False,
                  now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: Any = None) -> None:
         self.seconds = float(seconds)
         self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self._all: float | None = None
