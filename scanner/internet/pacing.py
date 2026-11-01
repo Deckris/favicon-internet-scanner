@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, TypeVar
 
 T = TypeVar("T")
 _SLICE = 0.5
+_CHECK = 1.0               # longest sleep of a pacer waiter between looks at the kill switch
 _LIMIT_POLL = 0.25          # how often a caller blocked only by the network cap looks again
 _PRUNE_EVERY = 4096         # releases between sweeps for idle back-off records
 log = logging.getLogger(__name__)
@@ -93,20 +94,28 @@ def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], 
 class IpPacer:
     """Thread-safe: a request to an address is released at least ``min_interval`` after the previous release.
 
-    The slot is claimed when the caller is actually released, not when it starts waiting. A waiter that wakes late
-    (a busy CPU, a long poll) therefore pushes the next release back instead of shortening the gap after it.
+    A caller reserves its place in the address's queue when it arrives (slot = the later of now and the previous
+    reservation, which then moves ``min_interval`` on) and sleeps until that deadline in one wait, so thousands of
+    waiting threads do not wake in turn to look again. Wake-ups happen at the deadline, at a stop, and every
+    ``poll`` seconds to look at ``killed``.
+
+    The gap itself is measured from the actual previous release, which is checked again when the caller wakes. A
+    waiter that wakes late (a busy CPU) therefore pushes the next release back instead of shortening the gap
+    after it. A reservation that is never used because of a stop is simply skipped.
 
     With a ``limiter`` a release also needs a free connection slot for the address's network. The slot is held
-    until ``done`` is called, which also reports how the request went so the limiter can back off.
+    until ``done`` is called, which also reports how the request went so the limiter can back off. A caller held
+    only by a full network looks again every ``_LIMIT_POLL`` seconds, keeping its place in the queue.
     """
 
     def __init__(self, min_interval: float, killed: Callable[[], bool] = lambda: False,
                  now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 stop_event: Any = None, poll: float = _SLICE, limiter: "SubnetLimiter | None" = None) -> None:
+                 stop_event: Any = None, poll: float = _CHECK, limiter: "SubnetLimiter | None" = None) -> None:
         self.min_interval = float(min_interval)
         self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
-        self._poll = float(poll)       # how often a waiting caller looks at the stop condition; longer with many waiters
-        self._next: dict[str, float] = {}
+        self._poll = min(max(float(poll), 0.01), _CHECK)    # longest sleep between looks at the kill switch
+        self._next: dict[str, float] = {}       # first unreserved slot per address
+        self._last: dict[str, float] = {}       # when each address was actually released last
         self._lock = threading.Lock()
         self.limiter = limiter
         self._grants = 0
@@ -114,28 +123,40 @@ class IpPacer:
     def _prune(self, now: float) -> None:
         """Forget addresses whose pause has passed: an absent address is due at once."""
         self._next = {ip: due for ip, due in self._next.items() if due > now}
+        self._last = {ip: at for ip, at in self._last.items() if at + self.min_interval > now}
 
     def wait(self, ip: str) -> bool:
         """Block until a request to ``ip`` may start. False means a stop condition fired: do not send."""
         if self.min_interval <= 0 and self.limiter is None:
             return not (self._killed() or (self._stop is not None and self._stop.is_set()))
         counts = {self.limiter.key_of(ip): 1} if self.limiter is not None else None
+        slot: float | None = None
         while True:
             if self._killed() or (self._stop is not None and self._stop.is_set()):
                 return False
             with self._lock:
                 now = self._now()
-                due = self._next.get(ip, float("-inf"))
-                if now >= due and (counts is None or self.limiter.try_acquire(counts)):
-                    if due != float("-inf") and now - (due - self.min_interval) < self.min_interval - 1e-6:
-                        _violation(f"{ip} contacted again {now - (due - self.min_interval):.3f} s after its last contact")
+                if slot is None:
+                    slot = max(now, self._next.get(ip, float("-inf")))
                     if self.min_interval > 0:
-                        self._next[ip] = now + self.min_interval
+                        self._next[ip] = slot + self.min_interval
+                last = self._last.get(ip, float("-inf"))
+                earliest = max(slot, last + self.min_interval) if self.min_interval > 0 else slot
+                if now < earliest - 1e-9:
+                    delay = earliest - now
+                elif counts is not None and not self.limiter.try_acquire(counts):
+                    delay = _LIMIT_POLL
+                else:
+                    if last != float("-inf") and now - last < self.min_interval - 1e-6:
+                        _violation(f"{ip} contacted again {now - last:.3f} s after its last contact")
+                    if self.min_interval > 0:
+                        self._last[ip] = now
+                        self._next[ip] = max(self._next.get(ip, now), now + self.min_interval)
                         self._grants += 1
                         if self._grants % (1 << 16) == 0:
                             self._prune(now)
                     return True
-            _nap(min(self._poll, due - now) if now < due else min(self._poll, _LIMIT_POLL), self._sleep, self._stop)
+            _nap(min(self._poll, delay), self._sleep, self._stop)
 
     def done(self, ip: str, result: Any = None) -> None:
         """End of a request that ``wait`` released: give the network slot back and note how it went."""
