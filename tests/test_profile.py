@@ -186,3 +186,62 @@ def test_preflight_fails_when_the_plan_cannot_fit_the_open_files(tmp_path):
     def status(report):
         return {c["name"]: c["status"] for c in report["checks"]}["plan_fits_open_files"]
     assert status(few) == "fail" and status(many) == "pass"
+
+
+# ------------------------------------------------------------------ the shape of the derived network plan
+
+@pytest.mark.parametrize("cores, parallel, connections", [(2, 1, 500), (4, 2, 1000), (8, 4, 2000), (64, 32, 16000)])
+def test_the_derived_zgrab_plan_has_the_intended_shape_on_2_4_8_and_64_cores(cores, parallel, connections):
+    plan = prof.derive(cores, cores * 2.0, 1 << 20)
+    assert plan["zgrab_senders"] == prof.SENDERS_PER_PROCESS == 500
+    assert plan["zgrab_parallel_batches"] == parallel
+    assert plan["zgrab_batch_size"] == 20000
+    assert plan["zgrab_senders"] * plan["zgrab_parallel_batches"] == connections
+    assert plan["overlap_tls_with_zmap"] is (cores >= prof.OVERLAP_MIN_CORES)
+    _in_range(plan)
+
+
+def test_the_eight_core_plan_is_what_the_plan_asked_for():
+    plan = prof.derive(8, 16, 65536)
+    assert (plan["zgrab_senders"], plan["zgrab_parallel_batches"], plan["zgrab_batch_size"]) == (500, 4, 20000)
+
+
+def test_batches_are_large_relative_to_the_senders_whenever_the_budget_allows_it():
+    for cores in (1, 2, 4, 8, 16, 64, 256):
+        plan = prof.derive(cores, 4 * cores, 1 << 20)
+        assert plan["zgrab_batch_size"] == plan["zgrab_senders"] * prof.BATCH_PER_SENDER
+        assert plan["zgrab_batch_size"] >= 20 * plan["zgrab_senders"]
+
+
+@pytest.mark.parametrize("cores", [1, 2, 4, 8, 16, 64])
+@pytest.mark.parametrize("memory", [1, 4, 64, None])
+@pytest.mark.parametrize("files", [1024, 4096, 65536, 1 << 20])
+def test_processes_times_senders_never_exceed_the_open_file_budget(cores, memory, files):
+    plan = prof.derive(cores, memory, files)
+    assert plan["zgrab_senders"] * plan["zgrab_parallel_batches"] <= prof.OPEN_FILE_FRACTION * files
+    assert prof.fits_open_files(plan, files)
+    _in_range(plan)
+
+
+def test_a_small_budget_gives_fewer_senders_not_a_larger_batch_per_sender():
+    plan = prof.derive(1, 2, 400)
+    assert plan["zgrab_senders"] < prof.SENDERS_PER_PROCESS
+    assert plan["zgrab_batch_size"] == plan["zgrab_senders"] * prof.BATCH_PER_SENDER
+
+
+def test_the_overlap_batch_never_exceeds_the_senders_and_the_sequential_one_is_the_configured_size():
+    assert pipeline.overlap_batch_size(20000, 500) == 500
+    assert pipeline.overlap_batch_size(100, 500) == 100
+    assert pipeline.overlap_batch_size(1, 1) == 1
+
+
+def test_the_tool_timeout_of_a_batch_covers_its_drain_and_stays_finite():
+    from types import SimpleNamespace
+    from scanner.internet.runner import ManagedExecutor
+    m = SimpleNamespace(zgrab_senders=500, zgrab_target_timeout=8.0, zgrab_connect_timeout=4.0)
+    holder = SimpleNamespace(cfg=SimpleNamespace(measurement=m))
+    text = "".join(f"10.0.{i // 250}.{i % 250},,,443\n" for i in range(20000))
+    limit = ManagedExecutor.timeout_for(holder, "zgrab2", ["zgrab2", "tls"], text)
+    rounds = 20000 // 500
+    assert limit >= rounds * (m.zgrab_connect_timeout + m.zgrab_target_timeout)       # every sender busy to the end of every round
+    assert limit < 3600                                                                # a hung batch is killed within the hour

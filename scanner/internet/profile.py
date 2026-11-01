@@ -13,14 +13,15 @@ from pathlib import Path
 from typing import Any
 
 # Starting values, to be replaced by what the pilot measures on the scanning host.
-PER_CORE_CONNECTIONS = 250          # simultaneous connections one core can serve (TLS handshakes dominate)
+PER_CORE_CONNECTIONS = 500          # simultaneous connections one core can serve (most are waiting; the handshakes cost the CPU)
 PER_CONNECTION_BYTES = 256 * 1024   # memory held per simultaneous connection (buffers, goroutine or thread stack, state)
 OPEN_FILE_FRACTION = 0.8            # share of the open-file limit the connections may use; the rest is for files and pipes
 RESERVED_MEMORY_GB = 1.0            # left to the operating system, ZMap and the pipeline itself
 NETWORK_SHARE = 0.6                 # share of the connections given to ZGrab2 when the stages can overlap
 DNS_THREADS_PER_CORE = 16
 DNS_MAX_CONNECTION_SHARE = 8        # DNS threads never exceed connections divided by this
-MAX_PARALLEL_BATCHES = 8            # ZGrab2 processes at once; one per two cores up to this
+MAX_PARALLEL_BATCHES = 32           # ZGrab2 processes at once; one per two cores up to this
+SENDERS_PER_PROCESS = 500           # connections one ZGrab2 process is given; more connections come from more processes
 BATCH_PER_SENDER = 40               # addresses in a port-pure batch per ZGrab2 sender
 OVERLAP_MIN_CORES = 4               # overlapping TLS with ZMap needs spare cores
 DEFAULT_OPEN_FILES = 8192           # assumed where the limit cannot be read
@@ -87,8 +88,9 @@ def derive(cores: int, memory_gb: float | None, open_files: int, *, offhost_icon
     network = max(1, round(remaining * NETWORK_SHARE))
     favicon_active = remaining - network
 
-    parallel = given.get("zgrab_parallel_batches") or _clamp(min(cores // 2, MAX_PARALLEL_BATCHES), "zgrab_parallel_batches")
-    senders = given.get("zgrab_senders") or _clamp(network // parallel, "zgrab_senders")
+    wanted = -(-network // SENDERS_PER_PROCESS)           # processes it takes to use the network share at the usual size
+    parallel = given.get("zgrab_parallel_batches") or _clamp(min(cores // 2, wanted, MAX_PARALLEL_BATCHES), "zgrab_parallel_batches")
+    senders = given.get("zgrab_senders") or _clamp(min(SENDERS_PER_PROCESS, network // parallel), "zgrab_senders")
     batch = given.get("zgrab_batch_size") or _clamp(senders * BATCH_PER_SENDER, "zgrab_batch_size")
 
     active = given.get("favicon_max_active_requests") or _clamp(favicon_active, "favicon_max_active_requests")
