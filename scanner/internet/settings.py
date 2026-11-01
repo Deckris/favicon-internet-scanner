@@ -47,6 +47,7 @@ scope:
   rate_pps: {rate_pps}              # ZMap packets per second
   min_seconds_between_probes_per_ip: {pace}   # pause between any two requests to the same address
   overlap_tls_with_zmap: {overlap}   # true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
+  # max_connections_per_subnet: 4   # connections open at once to one /24 (IPv6 /48), 1 to 64; backs off on timeouts, 429 and 503
   dns_resolver: {dns_resolver}      # resolver for PTR and name checks; it sees every scanned address
   favicon_processes: 1              # worker processes sharing the favicon requests (one per core; not with offhost_icons)
   try_unverified_names: false       # also request pages under certificate names that did not verify
@@ -244,6 +245,9 @@ def apply(workdir: Path) -> dict[str, Any]:
     overlap = scope.get("overlap_tls_with_zmap", False)
     if not isinstance(overlap, bool):
         raise SettingsError("scope.overlap_tls_with_zmap must be true or false")
+    subnet_cap = scope.get("max_connections_per_subnet")
+    if subnet_cap is not None and (not isinstance(subnet_cap, int) or isinstance(subnet_cap, bool) or not 1 <= subnet_cap <= 64):
+        raise SettingsError("scope.max_connections_per_subnet must be a whole number from 1 to 64")
     if appr["status"] not in ("blocked", "approved"):
         raise SettingsError("approval.status must be `blocked` or `approved`")
     excl_path = _resolve(workdir, scope["exclusions_file"])
@@ -282,6 +286,8 @@ def apply(workdir: Path) -> dict[str, Any]:
     m = base["measurement"]
     m.update(ports=[int(p) for p in scope["ports"]], zmap_rate=int(rate), zmap_probes=probes, zmap_max_runtime=runtime,
              min_seconds_between_probes_per_ip=pace, overlap_tls_with_zmap=overlap)
+    if subnet_cap is not None:
+        m["max_connections_per_subnet"] = subnet_cap
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     f = base["favicon"]

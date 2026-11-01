@@ -157,7 +157,8 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
             f = fetcher or fav.make_fetcher(
                 cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), {(j["ip"], j["port"]) for j in jobs},
                 exclusions=exclusions, killed=st.killed, state_path=run_dir / "offhost_state.json",
-                pacer=pacing.IpPacer(cfg.measurement.min_seconds_between_probes_per_ip, st.killed, poll=2.0))
+                pacer=pacing.IpPacer(cfg.measurement.min_seconds_between_probes_per_ip, st.killed, poll=2.0,
+                                      limiter=pacing.SubnetLimiter(cfg.measurement.max_connections_per_subnet)))
             deadline = time.monotonic() + cfg.favicon.stage_max_seconds
 
             def stop() -> bool:
