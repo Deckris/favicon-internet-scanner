@@ -300,5 +300,5 @@ class GuardedStubFactory:
             pass
         lim = FetchLimits(1.0, 1.0, 5.0, 1 << 16, 1 << 16, 5)
         endpoints = {e for e in self.endpoints if owned is None or e[0] in owned}
-        return Fetcher(TargetPolicy.for_tests(["198.51.100.0/24"]), None, user_agent="t", document_limits=lim, favicon_limits=lim,
+        return Fetcher(TargetPolicy.for_tests(["198.51.100.0/22"]), None, user_agent="t", document_limits=lim, favicon_limits=lim,
                        allowed_endpoints=endpoints, pacer=pacer, retry_statuses=(), max_retries=0)
