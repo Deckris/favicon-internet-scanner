@@ -17,7 +17,7 @@ import time
 from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
-from concurrent.futures import FIRST_COMPLETED, Future, wait
+from concurrent.futures import Future
 from urllib.parse import urlsplit
 from typing import Any
 
@@ -657,6 +657,7 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
     # Longest chains first, so the few addresses with many names do not set the tail of the stage.
     pending = iter(sorted(groups.values(), key=len, reverse=True))
     inflight: dict[Future, list[int]] = {}
+    finished: queue.SimpleQueue = queue.SimpleQueue()     # futures in completion order, filled by the workers' done callbacks
     failure: BaseException | None = None
 
     def note_failure(exc: BaseException) -> None:
@@ -665,10 +666,25 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
             failure = exc
 
     def collect(timeout: float) -> None:
+        """Wait up to ``timeout`` for one finished group, then take every other one that is already done.
+
+        Blocking on a queue costs the same with 4,000 groups in flight as with one; ``concurrent.futures.wait`` over
+        all of them registers a waiter on each future every call, which at thousands of workers took a large share
+        of the interpreter's time.
+        """
         nonlocal failure
-        finished, _ = wait(list(inflight), timeout=timeout, return_when=FIRST_COMPLETED)
-        for fut in finished:
-            del inflight[fut]
+        try:
+            batch = [finished.get(timeout=timeout)]
+        except queue.Empty:
+            return
+        while True:
+            try:
+                batch.append(finished.get_nowait())
+            except queue.Empty:
+                break
+        for fut in batch:
+            if inflight.pop(fut, None) is None:       # cancelled by wind_down, already accounted for
+                continue
             exc = fut.exception()
             if exc is not None and failure is None:
                 failure = exc
@@ -703,7 +719,9 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
                 indexes = next(pending, None)
                 if indexes is None:
                     break
-                inflight[pool.submit(run_group, indexes)] = indexes
+                fut = pool.submit(run_group, indexes)
+                inflight[fut] = indexes
+                fut.add_done_callback(finished.put)
             if not inflight:
                 break
             collect(_POLL_SECONDS)

@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from scanner import asn_context
 from scanner.internet import candidates as cand
@@ -146,6 +146,7 @@ class _Stages:
         self.stall_seconds = float(getattr(cfg, "stall_minutes", 30)) * 60
         self._progress = 0
         self._last_progress = (0, now)
+        self._queued = 0                         # phases this run is waiting to enter; a deliberate wait is not a stall
         self._monitor: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
         self._monitor_done = threading.Event()
@@ -155,6 +156,16 @@ class _Stages:
     def progress(self) -> None:
         """Called whenever a stage gets a result; a run that stops calling it for ``stall_minutes`` is aborted."""
         self._progress += 1
+
+    @contextlib.contextmanager
+    def queued(self) -> Iterator[None]:
+        """Mark the block as a wait for another shard (the phase lock). The stall clock restarts when the wait ends."""
+        self._queued += 1
+        try:
+            yield
+        finally:
+            self._queued -= 1
+            self.progress()
 
     def request_stop(self, reason: str) -> None:
         """Set the stop reason and wake every waiting thread. Not for signal handlers: ``Event.set`` takes a lock (see ``flag_stop``)."""
@@ -265,8 +276,8 @@ class _Stages:
         if self.stall_seconds <= 0:
             return None
         now = time.monotonic()
-        if self._progress != self._last_progress[0] or getattr(self.executor, "active_tools", 0):
-            self._last_progress = (self._progress, now)       # a running tool is progress of its own
+        if self._queued or self._progress != self._last_progress[0] or getattr(self.executor, "active_tools", 0):
+            self._last_progress = (self._progress, now)       # a running tool is progress of its own; so is a queued phase
             return None
         return "stalled" if now - self._last_progress[1] >= self.stall_seconds else None
 
@@ -305,7 +316,8 @@ class _Stages:
         if name == "favicon" and self.phase_gate is not None:
             self.phases.close()                  # phase A ends here; phase B (favicon and write-out) waits for its slot
             try:
-                self.phases.enter_context(self.phase_gate("b"))
+                with self.queued():
+                    self.phases.enter_context(self.phase_gate("b"))
             except KeyboardInterrupt as exc:
                 self.interrupted = True
                 self.errors[name] = f"interrupted: {exc}"[:200]
@@ -428,7 +440,8 @@ def run(
     try:
         if phase_gate is not None:
             st.phase_gate = phase_gate
-            st.phases.enter_context(phase_gate("a"))
+            with st.queued():
+                st.phases.enter_context(phase_gate("a"))
         report = pre.run_preflight(cfg, splan, run_dir=run_dir, executor=executor, offline=offline_preflight)
         (run_dir / "preflight.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         if not report["ok"] and not skip_preflight:

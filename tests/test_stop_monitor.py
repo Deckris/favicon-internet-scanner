@@ -223,3 +223,67 @@ def test_empty_stack_file_is_removed_at_the_end(tmp_path):
     release = pipeline._register_stack_dump(tmp_path)
     release()
     assert not (tmp_path / "raw" / "stacks.txt").exists()
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _clocked(tmp_path, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(pipeline.time, "monotonic", clock)
+    cfg, st = _stages(tmp_path)
+    st.stall_seconds = 1800
+    st.executor = SimpleNamespace(active_tools=0)
+    return clock, st
+
+
+def test_waiting_for_the_phase_lock_is_not_a_stall(tmp_path, monkeypatch):
+    clock, st = _clocked(tmp_path, monkeypatch)
+    with st.queued():
+        for _ in range(100):                    # 100 minutes queued behind another shard
+            clock.now += 60
+            assert st._stalled() is None
+    assert st._stalled() is None                # the clock restarts when the wait ends
+    clock.now += 1799
+    assert st._stalled() is None
+    clock.now += 2
+    assert st._stalled() == "stalled"
+
+
+def test_a_stuck_stage_still_stalls_after_the_lock_wait(tmp_path, monkeypatch):
+    clock, st = _clocked(tmp_path, monkeypatch)
+    with st.queued():
+        clock.now += 7200
+        assert st._stalled() is None
+    clock.now += 100
+    assert st._stalled() is None
+    clock.now += 1799
+    assert st._stalled() is None
+    clock.now += 2
+    assert st._stalled() == "stalled"
+
+
+def test_the_phase_gate_wait_is_queued_and_the_stage_then_runs(tmp_path, monkeypatch):
+    clock, st = _clocked(tmp_path, monkeypatch)
+    seen = {}
+
+    @pipeline.contextlib.contextmanager
+    def gate(phase):
+        clock.now += 3000                       # longer than the stall limit
+        seen["queued"] = st._queued
+        seen["stalled"] = st._stalled()
+        yield
+    st.phase_gate = gate
+    assert st.run("favicon", lambda: "ok", None) == "ok"
+    assert seen == {"queued": 1, "stalled": None} and st.reason is None and st._queued == 0
+
+
+def test_stalled_has_an_explicit_campaign_exit_code():
+    from scanner.internet import __main__ as cli
+    assert cli.CAMPAIGN_EXIT["stalled"] == cli.EXIT_STOPPED == 5
+    assert (cli.CAMPAIGN_EXIT["preflight_failed"], cli.CAMPAIGN_EXIT["zero_responsive"], cli.CAMPAIGN_EXIT["drain"]) == (2, 4, 0)

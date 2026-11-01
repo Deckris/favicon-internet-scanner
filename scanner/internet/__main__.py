@@ -38,6 +38,12 @@ def _prior_runs(cfg) -> list[str]:
 
 PILOT_MAX_TARGETS_PER_PORT = 5000
 
+# Exit codes of an incomplete campaign, by the reason it stopped. Every reason that is not listed (crashed,
+# stage_errors, kill_switch, stalled, egress_changed, ...) is a stop that needs a look: exit 5, the same as an
+# incomplete `run`. `stalled` is listed on purpose: a shard made no progress for operations.stall_minutes.
+EXIT_STOPPED = 5
+CAMPAIGN_EXIT = {"preflight_failed": 2, "zero_responsive": 4, "drain": 0, "stalled": EXIT_STOPPED}
+
 
 def _anonymous_refusal(cfg, args) -> str | None:
     if cfg.transparency.anonymous:
@@ -251,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, default=str))
         if result["complete"]:
             return 0
-        return {"preflight_failed": 2, "zero_responsive": 4, "drain": 0}.get((result["stopped"] or {}).get("reason"), 5)
+        return CAMPAIGN_EXIT.get((result["stopped"] or {}).get("reason"), EXIT_STOPPED)
     if cfg.shards > 1:
         if args.shard is None or not 0 <= args.shard < cfg.shards:
             print(f"REFUSED: this config has {cfg.shards} shards; use `campaign`, or `run --shard N` with 0 <= N < {cfg.shards}", file=sys.stderr)
