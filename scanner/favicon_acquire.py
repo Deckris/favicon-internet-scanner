@@ -138,8 +138,14 @@ def acquire_favicons(
         return resource
 
     if selection == "browser_models":
-        by_order = {decl.order: decl for decl in selected}
-        candidates = [IconCandidate.from_declaration(decl) for decl in selected]
+        # A repeated URL is ranked at every position it was declared in (the models break ties by position and size)
+        # and fetched once, as the declaration that came first.
+        ranked_decls = [decl for decl in declarations if decl.policy_status in ("selected", "duplicate") and decl.resolved_url]
+        by_order = {decl.order: decl for decl in ranked_decls}
+        first_by_url: dict[str, FaviconDeclaration] = {}
+        for decl in ranked_decls:
+            first_by_url.setdefault(decl.resolved_url, decl)
+        candidates = [IconCandidate.from_declaration(decl) for decl in ranked_decls]
         chosen: dict[str, str | None] = {}
         for model in MODELS:
             chosen[model] = None
@@ -149,7 +155,7 @@ def acquire_favicons(
                 if decl.resolved_url in index_by_url:
                     resource = resources[index_by_url[decl.resolved_url]]
                 else:
-                    resource = acquire(decl)
+                    resource = acquire(first_by_url[decl.resolved_url])
                 if _resource_has_image(resource):
                     chosen[model] = decl.resolved_url
                     break
@@ -187,6 +193,11 @@ def acquire_favicons(
             page_url=page_url, order=order, rel=None, kind="fallback", sizes=None, type=None, media=None,
             declared_href=FAVICON_POLICY["fallback"], resolved_url=fallback_url, policy_status=policy_status,
         )]
+        if report is not None and "chosen" in report and _resource_has_image(resources[index_by_url[fallback_url]]):
+            chosen = report["chosen"]            # a model with no icon of its own shows what /favicon.ico gave
+            for model in chosen:
+                chosen[model] = chosen[model] or fallback_url
+            report["differ"] = len(set(chosen.values())) > 1
 
     return declarations, resources
 

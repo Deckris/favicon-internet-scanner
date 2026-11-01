@@ -453,6 +453,12 @@ def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], No
         return "complete", None
     if entry["status"] == "network_done" and entry.get("run_id") and _network_done(Path(cfg.output_dir) / entry["run_id"]):
         return "network_done", None                # waiting for its favicon stage; neither repeated nor counted as finished
+    if entry["status"] == "network_done" and entry.get("run_id"):
+        run_dir = Path(cfg.output_dir) / entry["run_id"]
+        if not _manifest(run_dir).get("complete"):
+            raise ValueError(f"shard {i + 1}/{cfg.shards} is recorded as network_done but {run_dir.name} no longer holds its "
+                             "work/facts.sqlite or a manifest that says so; the shard is not scanned again. Restore the run "
+                             "directory, or edit its entry in campaign.json to start the shard over on purpose")
     if (campaign_dir(cfg) / "DRAIN").exists():
         log(f"[campaign] {campaign_dir(cfg) / 'DRAIN'} exists: stopping before shard {i + 1}/{cfg.shards}")
         return "drain", None

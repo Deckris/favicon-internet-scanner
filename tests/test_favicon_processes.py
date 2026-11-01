@@ -7,7 +7,7 @@ import time
 import pytest
 
 from scanner.internet import favicon as fav
-from scanner.internet import icon_store, pipeline
+from scanner.internet import icon_store, pacing, pipeline
 from scanner.internet.config import ConfigError, load_config
 from scanner.safety import TargetPolicy
 from tests.helpers import FakeFetcher, GuardedStubFactory, ProcessFetcherFactory, make_png, write_config
@@ -18,7 +18,7 @@ from tests.test_pipeline import tools
 def make_jobs(addresses: int = 24, hostnames: bool = True) -> list[dict]:
     jobs = []
     for i in range(1, addresses + 1):
-        ip = f"198.51.100.{i}"
+        ip = f"198.51.{100 + i % 5}.{i}"       # several /24 networks, so there is more than one unit to partition
         jobs.append({"scheme": "http", "ip": ip, "port": 80, "hostname": None})
         if i % 3 == 0:
             jobs.append({"scheme": "https", "ip": ip, "port": 443, "hostname": None})
@@ -47,10 +47,22 @@ def test_partition_never_splits_an_address_and_covers_every_job():
         assert fav.partition_by_ip(jobs, parts) == split
 
 
+def test_partition_keeps_a_network_in_one_part():
+    jobs = [{"scheme": "http", "ip": f"203.0.{n}.{i}", "port": 80, "hostname": None} for n in (1, 2, 3) for i in range(1, 9)]
+    jobs += [{"scheme": "http", "ip": f"2001:db8:{n}::{i}", "port": 80, "hostname": None} for n in (1, 2) for i in range(1, 5)]
+    split = fav.partition_by_ip(jobs, 4)
+    owner = {}
+    for n, p in enumerate(split):
+        for i in p:
+            assert owner.setdefault(pacing.network_key(jobs[i]["ip"]), n) == n, "a network landed in two partitions"
+    assert len(split) == 4 and max(map(len, split)) <= 8
+
+
 def test_partition_balances_and_never_makes_empty_parts():
     jobs = make_jobs(40)
     sizes = [len(p) for p in fav.partition_by_ip(jobs, 2)]
-    assert abs(sizes[0] - sizes[1]) <= 3
+    largest = max(len([j for j in jobs if pacing.network_key(j["ip"]) == k]) for k in {pacing.network_key(j["ip"]) for j in jobs})
+    assert abs(sizes[0] - sizes[1]) <= largest        # a network is never cut, so the greedy placement is off by at most one network
     assert len(fav.partition_by_ip(jobs[:1], 4)) == 1
     assert fav.partition_by_ip([], 2) == []
 
@@ -106,7 +118,7 @@ def test_concurrent_saves_of_one_image_through_separate_stores_are_safe(tmp_path
 
 def test_stored_documents_reach_the_process_that_owns_the_address():
     from tests.test_http_document_reuse import stored
-    jobs = [{"scheme": "http", "ip": f"198.51.100.{i}", "port": 80, "hostname": None} for i in range(1, 7)]
+    jobs = [{"scheme": "http", "ip": f"198.51.{100 + i % 3}.{i}", "port": 80, "hostname": None} for i in range(1, 7)]
     docs = {(j["ip"], 80): stored() for j in jobs}
     single = fav.run_favicon_stage(FakeFetcher(), jobs, workers=2, max_icons=4, documents=docs, max_document_bytes=1 << 20)
     multi = run(jobs, 2, max_icons=4, documents=docs, max_document_bytes=1 << 20)
@@ -243,7 +255,7 @@ def test_pipeline_outputs_match_between_one_and_two_processes(tmp_path):
 
 
 def test_a_redirect_into_another_partition_is_refused_before_any_connection(tmp_path):
-    a, b = "198.51.100.1", "198.51.100.2"
+    a, b = "198.51.100.1", "198.51.101.2"
     jobs = [{"scheme": "http", "ip": a, "port": 80, "hostname": None}, {"scheme": "http", "ip": b, "port": 80, "hostname": None}]
     assert len(fav.partition_by_ip(jobs, 2)) == 2
     log = tmp_path / "contacts.log"

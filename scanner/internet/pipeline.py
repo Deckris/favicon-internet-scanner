@@ -7,6 +7,7 @@ The manifest is written even when the run ends early (kill switch, error).
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import csv
 import dataclasses
@@ -892,7 +893,12 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 st.skipped.append(f"tls_direct:{port}")
                 continue
             # Tarpits seen on the ports swept so far are left alone; one flagged only on a later port is counted below.
-            skip = store.rejected_ips()
+            try:
+                skip = store.tarpit_ips(tiny)
+            except Exception as exc:           # without the list nothing is probed on this port
+                st.errors.setdefault("store:tarpit_ips", f"{type(exc).__name__}: {exc}"[:500])
+                st.skipped.append(f"tls_direct:{port}")
+                continue
             # ZMap's own order: neighbours in a batch become due together
             items = sorted(((ip, port, None) for ip, _ in store.iter_endpoints(port) if ip not in skip),
                            key=lambda t: (send_order.get(t[0], 1 << 62), t[0]))
@@ -931,7 +937,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     # If the list cannot be read it stays None, and nothing more is sent to the sampled addresses on the strength of it.
     def recheck_tarpits() -> set[str]:
         store.flag_tarpits(tiny)                     # the whole table, whatever the incremental calls saw
-        return store.rejected_ips()
+        return store.tarpit_ips(tiny)
     tarpit_ips = st.guard("store:tarpit_ips", recheck_tarpits)
     counts["tarpit_ips_not_probed"] = 0 if tarpit_ips is None else st.guard(
         "store:iter_ip_names", lambda: sum(1 for ip in store.iter_ip_names() if ip in tarpit_ips), 0)
@@ -1118,7 +1124,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         if not fjobs or not ledger.wait(job_ips):
             return
         fp = fav.fetch_policy(cfg, sorted(job_ips))
-        stage_seconds = favicon_stage_seconds(cfg, len(fjobs))
+        chains = collections.Counter(j["ip"] for j in fjobs)
+        stage_seconds = favicon_stage_seconds(cfg, len(fjobs), longest_chain=max(chains.values()))
         counts["favicon_stage_max_seconds"] = stage_seconds
         deadline = time.monotonic() + stage_seconds
 
@@ -1154,6 +1161,11 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             earlier[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
         if earlier:
             counts["favicon_lookups_resumed"] = len(earlier)
+            todo = [j for j in fjobs if (j["ip"], j["port"], j.get("hostname")) not in earlier]
+            stage_seconds = favicon_stage_seconds(cfg, len(fjobs), resumed=len(fjobs) - len(todo),
+                                                  longest_chain=max(collections.Counter(j["ip"] for j in todo).values(), default=0))
+            counts["favicon_stage_max_seconds"] = stage_seconds
+            deadline = time.monotonic() + stage_seconds
         reused_pages = [0]
 
         def sink(idx: int, rec: dict[str, Any]) -> None:

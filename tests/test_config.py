@@ -231,8 +231,7 @@ def _checksum(tmp_path, mutate=None):
 
 def test_checksum_ignores_host_derived_settings(tmp_path):
     def faster(d):
-        d["measurement"].update(zgrab_senders=99, zgrab_parallel_batches=8, zgrab_batch_size=1000,
-                                overlap_tls_with_zmap=True, max_connections_per_subnet=8)
+        d["measurement"].update(zgrab_senders=99, zgrab_parallel_batches=8, zgrab_batch_size=1000)
         d["dns"]["threads"] = 77
         d["favicon"].update(workers=64, processes=2, max_active_requests=900, stage_max_seconds=9000)
     base = _checksum(tmp_path)
@@ -247,6 +246,8 @@ def test_checksum_ignores_host_derived_settings(tmp_path):
     lambda d: d["sample"].update(shards=2),
     lambda d: d["measurement"].update(min_seconds_between_probes_per_ip=1),
     lambda d: d["measurement"].update(zmap_rate=50),
+    lambda d: d["measurement"].update(max_connections_per_subnet=8),
+    lambda d: d["measurement"].update(overlap_tls_with_zmap=True),
     lambda d: d["fetch"].update(read_timeout=9.0),
 ])
 def test_checksum_follows_measurement_settings(tmp_path, mutate):

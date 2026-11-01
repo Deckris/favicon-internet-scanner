@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import math
 import os
 import threading
 import time
+from collections import deque
 from typing import Any, Callable, Iterable, Mapping, TypeVar
 
 T = TypeVar("T")
@@ -188,14 +190,19 @@ class Gap:
 
 
 def network_key(ip: str) -> str:
-    """The /24 of an IPv4 address or the /48 of an IPv6 address, as a short string key."""
+    """The /24 of an IPv4 address or the /48 of an IPv6 address, as a short string key.
+
+    An IPv4-mapped IPv6 address (``::ffff:a.b.c.d``) takes the key of the IPv4 address, and a zone id is ignored."""
     if ":" not in ip:
         head, sep, _ = ip.rpartition(".")
         return head if sep else ip
     try:
-        return "6:" + ipaddress.IPv6Address(ip).packed[:6].hex()
+        addr = ipaddress.IPv6Address(ip.split("%", 1)[0])
     except ValueError:
         return ip
+    if addr.ipv4_mapped is not None:
+        return network_key(str(addr.ipv4_mapped))
+    return "6:" + addr.packed[:6].hex()
 
 
 class BackoffState:
@@ -254,8 +261,12 @@ class BackoffState:
     def throttled(self, now: float, retry_after: float | None = None) -> None:
         """A 429 or 503 from the network."""
         self._halve(now)
-        if retry_after is not None and retry_after > 0:
-            self._hold_until = max(self._hold_until, now + min(float(retry_after), self.max_hold))
+        try:
+            hold = float(retry_after) if retry_after is not None else 0.0
+        except (TypeError, ValueError):
+            hold = 0.0
+        if math.isfinite(hold) and hold > 0:
+            self._hold_until = max(self._hold_until, now + min(hold, self.max_hold))
 
     def answered(self, now: float) -> None:
         self._streak = 0
@@ -264,10 +275,12 @@ class BackoffState:
 class SubnetLimiter:
     """At most ``cap`` simultaneous connections per /24 (IPv4) or /48 (IPv6), lowered per network by back-off.
 
-    ``try_acquire`` takes slots for several networks at once or for none. A request for more slots than the
-    current limit is admitted when the network has nothing in flight, so a limit that fell after the work was
-    cut into batches slows it down without stalling it. Memory follows the networks in use: counters are
-    dropped when they reach zero and back-off records once the network has recovered.
+    ``try_acquire`` takes slots for several networks at once or for none, never above a network's current limit
+    (the back-off limit, not the configured cap). ``try_acquire_some`` takes as many of a list of addresses as
+    fit and leaves the rest to the caller. A caller that passes a ``ticket`` (from ``ticket``) and is refused
+    waits in line: until it is served, no later request touching one of its networks is admitted, so a claim for
+    several slots cannot starve behind a stream of single ones. Memory follows the networks in use: counters
+    are dropped when they reach zero and back-off records once the network has recovered.
     """
 
     def __init__(self, cap: int, *, now: Callable[[], float] = time.monotonic,
@@ -278,6 +291,25 @@ class SubnetLimiter:
         self._states: dict[str, BackoffState] = {}
         self._lock = threading.Lock()
         self._releases = 0
+        self._tickets = 0
+        self._waiting: dict[int, frozenset[str]] = {}       # ticket -> networks it is waiting for
+
+    def ticket(self) -> int:
+        """A place in line; later tickets are served after earlier ones on the networks they share."""
+        with self._lock:
+            self._tickets += 1
+            return self._tickets
+
+    def withdraw(self, ticket: int | None) -> None:
+        """Leave the line (served, gave up or stopped)."""
+        if ticket is not None:
+            with self._lock:
+                self._waiting.pop(ticket, None)
+
+    def _behind_locked(self, ticket: int | None, keys: Iterable[str]) -> bool:
+        wanted = set(keys)
+        return any((ticket is None or t < ticket) and t != ticket and not wanted.isdisjoint(ks)
+                   for t, ks in self._waiting.items())
 
     def counts(self, ips: Iterable[str]) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -303,33 +335,69 @@ class SubnetLimiter:
         with self._lock:
             return len(self._active), len(self._states)
 
-    def try_acquire(self, counts: Mapping[str, int]) -> bool:
-        """Take the slots without waiting; False (nothing taken) if any network is full or held."""
+    def try_acquire(self, counts: Mapping[str, int], ticket: int | None = None) -> bool:
+        """Take the slots without waiting; False (nothing taken) if any network is full, held or has earlier waiters."""
         with self._lock:
             now = self._now()
+            fits = not self._behind_locked(ticket, counts)
             for key, n in counts.items():
                 state = self._states.get(key)
-                if state is not None and state.held(now):
-                    return False
-                active = self._active.get(key, 0)
-                if active > 0 and active + n > self._limit_locked(key, now):
-                    return False
+                if fits and state is not None and state.held(now):
+                    fits = False
+                if fits and self._active.get(key, 0) + n > self._limit_locked(key, now):
+                    fits = False
+            if not fits:
+                if ticket is not None:
+                    self._waiting[ticket] = frozenset(counts)
+                return False
+            if ticket is not None:
+                self._waiting.pop(ticket, None)
             for key, n in counts.items():
                 total = self._active.get(key, 0) + n
                 self._active[key] = total
-                if total > max(self.cap, n):
+                if total > self.cap:
                     _violation(f"network {key} has {total} connections in flight, above the cap of {self.cap}")
             return True
+
+    def try_acquire_some(self, ips: list[str], ticket: int | None = None) -> list[str]:
+        """Take a slot for each address that fits under its network's current limit and return those addresses,
+        in order; the others are left to the caller. Empty (nothing taken) if no address fits."""
+        with self._lock:
+            now = self._now()
+            keys = [self.key_of(ip) for ip in ips]
+            taken: dict[str, int] = {}
+            got: list[str] = []
+            if not self._behind_locked(ticket, keys):
+                for ip, key in zip(ips, keys):
+                    state = self._states.get(key)
+                    if state is not None and state.held(now):
+                        continue
+                    if self._active.get(key, 0) + taken.get(key, 0) + 1 <= self._limit_locked(key, now):
+                        taken[key] = taken.get(key, 0) + 1
+                        got.append(ip)
+            if not got:
+                if ticket is not None:
+                    self._waiting[ticket] = frozenset(keys)
+                return []
+            if ticket is not None:
+                self._waiting.pop(ticket, None)
+            for key, n in taken.items():
+                self._active[key] = self._active.get(key, 0) + n
+            return got
 
     def acquire(self, counts: Mapping[str, int], killed: Callable[[], bool] = lambda: False, stop_event: Any = None,
                 sleep: Callable[[float], None] = time.sleep, poll: float = _LIMIT_POLL) -> bool:
         """Wait for the slots. False means a stop condition fired first."""
-        while True:
-            if killed() or (stop_event is not None and stop_event.is_set()):
-                return False
-            if self.try_acquire(counts):
-                return True
-            _nap(poll, sleep, stop_event)
+        ticket = self.ticket()
+        try:
+            while True:
+                if killed() or (stop_event is not None and stop_event.is_set()):
+                    return False
+                if self.try_acquire(counts, ticket):
+                    return True
+                _nap(poll, sleep, stop_event)
+        finally:
+            self.withdraw(ticket)
 
     def release(self, counts: Mapping[str, int]) -> None:
         with self._lock:
@@ -441,6 +509,7 @@ class ContactLedger:
         self._last: dict[str, float] = {}
         self._busy: set[str] = set()
         self._lock = threading.Lock()
+        self._releases = 0
 
     def mark_all(self, at: float | None = None) -> None:
         with self._lock:
@@ -463,25 +532,47 @@ class ContactLedger:
 
     def claim(self, ips: list[str], extra: Callable[[float], bool] | None = None) -> bool:
         """Block until every address is due and none is in flight, then mark them in flight. False on a stop."""
-        while True:
-            if self._killed() or (self._stop is not None and self._stop.is_set()):
-                return False
-            with self._lock:
-                now = self._now()
-                free = not any(ip in self._busy for ip in ips)
-                due = self.seconds <= 0 or max((self._due(ip) for ip in ips), default=float("-inf")) <= now
-                if (free and due and (extra is None or extra(now))
-                        and (self.limiter is None or self.limiter.try_acquire(self.limiter.counts(ips)))):
-                    for ip in ips:
-                        last = self._last.get(ip)
-                        if self.seconds > 0 and last is not None and now - last < self.seconds - 1e-6:
-                            _violation(f"{ip} contacted {now - last:.3f} s after its last contact, below the pause of {self.seconds:g} s")
-                        if ip in self._busy:
-                            _violation(f"{ip} claimed while already in flight")
-                    self._busy.update(ips)
-                    return True
-                wait = max((self._due(ip) for ip in ips), default=now) - now if free and not due else _SLICE
-            _nap(min(_SLICE, max(wait, 0.01)), self._sleep, self._stop)
+        return self._claim(ips, extra, partial=False) is not None
+
+    def claim_some(self, ips: list[str], extra: Callable[[float], bool] | None = None) -> list[str] | None:
+        """Like ``claim`` but takes only the addresses whose network has room under its current limit, and returns
+        them (never empty); the caller keeps the rest for a later claim. None on a stop."""
+        return self._claim(ips, extra, partial=True)
+
+    def _claim(self, ips: list[str], extra: Callable[[float], bool] | None, partial: bool) -> list[str] | None:
+        ticket = self.limiter.ticket() if self.limiter is not None else None
+        try:
+            while True:
+                if self._killed() or (self._stop is not None and self._stop.is_set()):
+                    return None
+                with self._lock:
+                    now = self._now()
+                    free = not any(ip in self._busy for ip in ips)
+                    due = self.seconds <= 0 or max((self._due(ip) for ip in ips), default=float("-inf")) <= now
+                    got: list[str] = []
+                    if free and due and (extra is None or extra(now)):
+                        if self.limiter is None:
+                            got = list(ips)
+                        elif partial:
+                            got = self.limiter.try_acquire_some(ips, ticket)
+                        elif self.limiter.try_acquire(self.limiter.counts(ips), ticket):
+                            got = list(ips)
+                    elif self.limiter is not None:
+                        self.limiter.withdraw(ticket)
+                    if got:
+                        for ip in got:
+                            last = self._last.get(ip)
+                            if self.seconds > 0 and last is not None and now - last < self.seconds - 1e-6:
+                                _violation(f"{ip} contacted {now - last:.3f} s after its last contact, below the pause of {self.seconds:g} s")
+                            if ip in self._busy:
+                                _violation(f"{ip} claimed while already in flight")
+                        self._busy.update(got)
+                        return got
+                    wait = max((self._due(ip) for ip in ips), default=now) - now if free and not due else _SLICE
+                _nap(min(_SLICE, max(wait, 0.01)), self._sleep, self._stop)
+        finally:
+            if self.limiter is not None:
+                self.limiter.withdraw(ticket)
 
     def release(self, ips: list[str]) -> None:
         with self._lock:
@@ -489,8 +580,15 @@ class ContactLedger:
             for ip in ips:
                 self._last[ip] = end
                 self._busy.discard(ip)
+            self._releases += 1
+            if self._releases % _PRUNE_EVERY == 0:
+                self._prune(end)
         if self.limiter is not None:
             self.limiter.release(self.limiter.counts(ips))
+
+    def _prune(self, now: float) -> None:
+        """Forget addresses whose pause has passed: an absent address is due at once."""
+        self._last = {ip: at for ip, at in self._last.items() if at + self.seconds > now or ip in self._busy}
 
     def observe(self, results: Iterable[Any]) -> None:
         """Pass finished ZGrab results to the limiter so a struggling network gets fewer connections."""
@@ -528,31 +626,44 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
     batches = [r[i:i + size] for r in rounds for i in range(0, len(r), size)]
     if not batches:
         return []
-    results: list[Any] = [None] * len(batches)
-    started: list[bool] = [False] * len(batches)
+    results: dict[tuple[int, int], Any] = {}        # (batch, part) -> result; a batch cut by back-off runs in parts
     take = threading.Lock()
-    next_index = [0]
+    pending = deque((i, 0, batch) for i, batch in enumerate(batches))
     failed = threading.Event()        # one batch raised: start nothing new, let the error reach the stage
 
     def worker() -> None:
         while not failed.is_set():
             with take:
-                i = next_index[0]
-                if i >= len(batches):
+                if not pending:
                     return
-                next_index[0] += 1
-            batch = batches[i]
-            kept = reuse(batch) if reuse is not None else None
-            if kept is not None:
-                started[i] = True
-                results[i] = kept
-                continue
+                i, part, batch = pending.popleft()
+            if part == 0 and reuse is not None:
+                kept = reuse(batch)
+                if kept is not None:
+                    results[(i, 0)] = kept
+                    continue
             ips = [ip_of(t) for t in batch]
-            if not ledger.claim(ips, extra(batch) if extra else None):
+            if ledger.limiter is None:
+                got = list(ips) if ledger.claim(ips, extra(batch) if extra else None) else None
+            else:
+                got = ledger.claim_some(ips, extra(batch) if extra else None)
+            if got is None:
                 return
-            started[i] = True
+            if len(got) < len(ips):         # the network's limit fell: run what fits now, the rest when there is room
+                rest = list(got)
+                head, tail = [], []
+                for t in batch:
+                    ip = ip_of(t)
+                    if ip in rest:
+                        rest.remove(ip)
+                        head.append(t)
+                    else:
+                        tail.append(t)
+                with take:
+                    pending.appendleft((i, part + 1, tail))
+                batch, ips = head, got
             try:
-                results[i] = run_batch(batch)
+                results[(i, part)] = run_batch(batch)
             except BaseException:
                 failed.set()
                 raise
@@ -566,4 +677,4 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for f in [pool.submit(worker) for _ in range(workers)]:
                 f.result()
-    return [r for i, r in enumerate(results) if started[i]]
+    return [results[key] for key in sorted(results)]

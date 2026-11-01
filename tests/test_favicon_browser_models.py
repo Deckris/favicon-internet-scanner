@@ -151,7 +151,17 @@ def test_no_declared_icon_falls_back_to_favicon_ico():
     site, decls, resources, report = run("<html></html>", {"/favicon.ico"})
     assert site.icon_urls() == [PAGE + "favicon.ico"]
     assert decls[-1].kind == "fallback" and report["differ"] is False
-    assert report["chosen"] == {"chromium": None, "firefox": None, "spec": None}
+    assert report["chosen"] == {"chromium": PAGE + "favicon.ico", "firefox": PAGE + "favicon.ico", "spec": PAGE + "favicon.ico"}
+
+
+def test_the_record_names_the_fallback_icon_instead_of_no_icon():
+    site = Site("<html></html>", {"/favicon.ico"})
+    rec = fav.probe_identity(site, scheme="https", ip="203.0.113.7", port=443, hostname="origin.test", max_icons=4, selection="browser_models")
+    assert rec["icon_chosen_chromium"].endswith("/favicon.ico") and rec["icon_chosen_firefox"].endswith("/favicon.ico")
+    assert rec["icon_models_differ"] is False
+    none = fav.probe_identity(Site("<html></html>", set()), scheme="https", ip="203.0.113.7", port=443, hostname="origin.test",
+                              max_icons=4, selection="browser_models")
+    assert none["icon_chosen_chromium"] is None
 
 
 def test_only_apple_touch_icons_count_as_undeclared_for_the_only_if_undeclared_fallback():
@@ -172,3 +182,43 @@ def test_other_modes_keep_the_old_record_columns():
     site = Site(TWO, {"/a.png"})
     rec = fav.probe_identity(site, scheme="https", ip="203.0.113.7", port=443, hostname="origin.test", max_icons=4, selection="first_image")
     assert "icon_rule_version" not in rec
+
+
+def test_a_repeated_url_counts_at_every_position_it_was_declared_in():
+    html = ('<link rel="icon" href="/u1.png" sizes="16x16"><link rel="icon" href="/u2.png" sizes="16x16">'
+            '<link rel="icon" href="/u1.png" sizes="16x16">')
+    site, decls, resources, report = run(html, {"/u1.png", "/u2.png"})
+    assert report["chosen"] == {"chromium": PAGE + "u1.png", "firefox": PAGE + "u1.png", "spec": PAGE + "u1.png"}
+    assert site.icon_urls() == [PAGE + "u1.png"] and len(resources) == 1
+
+
+def test_a_repeat_with_better_sizes_is_not_lost():
+    html = '<link rel="icon" href="/a.png" sizes="128x128"><link rel="icon" href="/b.png" sizes="16x16"><link rel="icon" href="/a.png" sizes="16x16">'
+    _, _, _, report = run(html, {"/a.png", "/b.png"})
+    assert report["chosen"]["spec"] == PAGE + "a.png" and report["chosen"]["chromium"] == PAGE + "b.png"
+
+
+def test_data_uri_svg_and_ico_icons_are_recognised():
+    from scanner.icon_selection import is_ico, is_svg
+    assert is_svg(cand(1, href="data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="))
+    assert is_svg(cand(1, href="DATA:image/svg+xml,%3Csvg/%3E"))
+    assert is_ico(cand(1, href="data:image/x-icon;base64,AAAB"))
+    assert not is_svg(cand(1, href="data:image/png;base64,AAAA"))
+    assert rank("firefox", [cand(1, sizes="16x16"), cand(2, href="data:image/svg+xml,%3Csvg/%3E")])[0].order == 2
+
+
+def test_hostile_sizes_attributes_are_ignored_without_raising():
+    import random
+
+    from scanner.icon_selection import parse_sizes, pixel_score
+    assert parse_sizes("16x16 ²x² ٣x٣ 0x16 1x" + "9" * 400 + " " + "9" * 5000 + "x1") == (False, [(16, 16)])
+    assert parse_sizes("any 16x16 " + "16x16 " * 500)[0] is True
+    assert pixel_score(cand(1, sizes="9" * 400 + "x" + "9" * 400)) == 1.0
+    rng = random.Random(7)
+    alphabet = "0123456789xX any\u00b2\u0663\uff11-+.e _\t\x00"
+    for _ in range(2000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 60)))
+        is_any, found = parse_sizes(text)
+        assert all(0 < w < 100000 and 0 < h < 100000 for w, h in found)
+        assert 0.0 < pixel_score(cand(1, sizes=text)) <= 1.0
+        rank("firefox", [cand(1, sizes=text), cand(2)])

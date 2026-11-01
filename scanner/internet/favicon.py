@@ -30,7 +30,7 @@ from scanner.internet import outputs
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from scanner.internet.icon_store import IconStore
 from scanner.internet.offhost_service import OffhostClient, OffhostService
-from scanner.internet.pacing import IpPacer, SubnetLimiter
+from scanner.internet.pacing import IpPacer, SubnetLimiter, network_key
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
 from scanner.favicon_discovery import parse_icon_declarations
@@ -816,14 +816,15 @@ _BACKSTOP_SECONDS = 10.0      # after the stage grace, how long a worker process
 
 
 def partition_by_ip(jobs: list[dict[str, Any]], parts: int) -> list[list[int]]:
-    """Indexes of ``jobs`` per partition, every address in exactly one. Deterministic.
+    """Indexes of ``jobs`` per partition, every /24 (IPv6 /48) network in exactly one, so an address and its
+    neighbours are only ever contacted from one process. Deterministic.
 
-    The longest chains are placed first, each on the partition holding the fewest jobs so far. Indexes inside a
-    partition keep the original job order.
+    The networks with the most jobs are placed first, each on the partition holding the fewest jobs so far. Indexes
+    inside a partition keep the original job order.
     """
     groups: dict[str, list[int]] = {}
     for idx, job in enumerate(jobs):
-        groups.setdefault(job["ip"], []).append(idx)
+        groups.setdefault(network_key(job["ip"]), []).append(idx)
     out: list[list[int]] = [[] for _ in range(max(1, parts))]
     for chain in sorted(groups.values(), key=lambda c: (-len(c), c[0])):
         min(out, key=len).extend(chain)
@@ -996,7 +997,7 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     stop = SharedFlag(ctx)
     settings = {"pace": pace, "workers": split_cap(workers, len(parts)), "max_icons": max_icons, "selection": selection,
                 "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace,
-                "subnet_cap": max(1, subnet_cap // len(parts)) if subnet_cap else 0}      # the cap is split over the processes
+                "subnet_cap": subnet_cap or 0}      # a network lives in one process, which may use the whole cap
     procs, conns, sends = [], [], []
     for i, indexes in enumerate(parts):
         recv_end, send_end = ctx.Pipe(duplex=False)

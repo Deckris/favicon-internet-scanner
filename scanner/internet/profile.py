@@ -6,6 +6,7 @@ open-file limit to the concurrency settings of the network and favicon stages, n
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -150,14 +151,66 @@ def raise_open_file_limit() -> int | None:
     return soft if soft != resource.RLIM_INFINITY else target
 
 
-def detect_cores() -> int:
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+_NO_LIMIT = 1 << 60                 # cgroup v1 reports "unlimited" as a number close to 2**63
+
+
+def _read(path: Path) -> str | None:
     try:
-        return max(1, len(os.sched_getaffinity(0)))
+        return path.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def cgroup_cpu_limit(root: Path = CGROUP_ROOT) -> float | None:
+    """CPUs the control group may use (v2 ``cpu.max``, v1 ``cpu.cfs_quota_us``), or None where there is no limit."""
+    try:
+        text = _read(root / "cpu.max")
+        if text:
+            quota, period = text.split()[:2]
+            return None if quota == "max" else int(quota) / int(period)
+        for base in (root / "cpu", root / "cpu,cpuacct"):
+            quota, period = _read(base / "cpu.cfs_quota_us"), _read(base / "cpu.cfs_period_us")
+            if quota is not None and period is not None:
+                return None if int(quota) <= 0 else int(quota) / int(period)
+    except (ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
+def cgroup_memory_limit_gb(root: Path = CGROUP_ROOT) -> float | None:
+    """Memory the control group may use (v2 ``memory.max``, v1 ``memory.limit_in_bytes``), or None where there is no limit."""
+    for path in (root / "memory.max", root / "memory" / "memory.limit_in_bytes"):
+        text = _read(path)
+        if text is None or text == "max":
+            continue
+        try:
+            value = int(text)
+        except ValueError:
+            continue
+        if 0 < value < _NO_LIMIT:
+            return value / 2**30
+    return None
+
+
+def detect_cores(cgroup_root: Path = CGROUP_ROOT) -> int:
+    try:
+        cores = max(1, len(os.sched_getaffinity(0)))
     except (AttributeError, OSError):
-        return max(1, os.cpu_count() or 1)
+        cores = max(1, os.cpu_count() or 1)
+    limit = cgroup_cpu_limit(cgroup_root)
+    return cores if limit is None else max(1, min(cores, math.ceil(limit)))
 
 
-def detect_memory_gb(meminfo: Path = Path("/proc/meminfo")) -> float | None:
+def detect_memory_gb(meminfo: Path = Path("/proc/meminfo"), cgroup_root: Path = CGROUP_ROOT) -> float | None:
+    total = _host_memory_gb(meminfo)
+    limit = cgroup_memory_limit_gb(cgroup_root)
+    if limit is None:
+        return total
+    return limit if total is None else min(total, limit)
+
+
+def _host_memory_gb(meminfo: Path) -> float | None:
     try:
         for line in meminfo.read_text(encoding="ascii", errors="replace").splitlines():
             if line.startswith("MemTotal"):
@@ -193,10 +246,30 @@ def detect_open_files() -> int:
         return DEFAULT_OPEN_FILES
 
 
+def _positive(value: Any, name: str, whole: bool) -> int | float | None:
+    """``value`` as a positive number (a whole one if ``whole``); None stays None. Anything else raises ValueError."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive number, not {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a positive number, not {value!r}") from None
+    if not math.isfinite(number) or number <= 0 or (whole and number != int(number)):
+        raise ValueError(f"{name} must be a positive {'whole ' if whole else ''}number, not {value!r}")
+    return int(number) if whole else number
+
+
 def detect(cores: int | None = None, memory_gb: float | None = None, open_files: int | None = None) -> Resources:
-    """The host's resources; a value given here (from a flag) replaces the detected one."""
-    if not open_files:
+    """The host's resources; a value given here (from a flag or settings.yaml) replaces the detected one.
+
+    A given value that is not a positive number raises ``ValueError``; it is never taken for "not given"."""
+    cores = _positive(cores, "cores", True)
+    memory_gb = _positive(memory_gb, "memory_gb", False)
+    open_files = _positive(open_files, "max_open_files", True)
+    if open_files is None:
         raise_open_file_limit()
-    return Resources(cores=int(cores) if cores else detect_cores(),
-                     memory_gb=float(memory_gb) if memory_gb else detect_memory_gb(),
-                     open_files=int(open_files) if open_files else detect_open_files())
+    return Resources(cores=cores if cores is not None else detect_cores(),
+                     memory_gb=float(memory_gb) if memory_gb is not None else detect_memory_gb(),
+                     open_files=open_files if open_files is not None else detect_open_files())

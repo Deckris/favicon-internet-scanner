@@ -304,3 +304,61 @@ def test_cli_export_commands(tmp_path):
     assert main(["export-network", str(net), str(tmp_path / "ship")]) == 0
     assert main(["export-network", str(net), str(tmp_path / "ship")]) == 2
     assert main(["export-shard", str(net), str(tmp_path / "disk2"), "--remove-source"]) == 2
+
+
+def test_a_network_done_shard_that_lost_its_fact_store_is_refused_not_rescanned(tmp_path):
+    cfg = _two_shards(tmp_path)
+    calls = []
+    campaign.run_campaign(cfg, run_fn=_network_run_fn(calls), log=lambda *_: None, network_only=True)
+    state = json.loads((campaign.campaign_dir(cfg) / "campaign.json").read_text())
+    (Path(state["shard_states"]["0"]["run_dir"]) / "work" / "facts.sqlite").unlink()
+    with pytest.raises(ValueError, match="network_done"):
+        campaign.run_campaign(cfg, run_fn=_network_run_fn(calls), log=lambda *_: None, network_only=True)
+    assert len(calls) == 2
+
+
+def _shipped(tmp_path):
+    cfg = _cfg_at(tmp_path, "main")
+    run_dir = _network_run(cfg)
+    ship = tmp_path / "ship"
+    split.export_network(run_dir, ship)
+    pipeline.run_favicon_only(_cfg_at(tmp_path, "remote"), ship, executor=tools(), fetcher=FakeFetcher())
+    return run_dir, ship
+
+
+@pytest.mark.parametrize("damage", ["incomplete", "stage_error", "other_config"])
+def test_import_needs_a_complete_error_free_run_of_the_same_configuration(tmp_path, damage):
+    run_dir, ship = _shipped(tmp_path)
+    manifest = json.loads((ship / "manifest.json").read_text())
+    if damage == "incomplete":
+        manifest["complete"] = False
+    elif damage == "stage_error":
+        manifest["stage_errors"] = {"favicon_deadline": "stage cap reached"}
+    else:
+        snap = json.loads((ship / "config.snapshot.json").read_text())
+        snap["measurement"]["ports"] = [8080]
+        (ship / "config.snapshot.json").write_text(json.dumps(snap))
+    (ship / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ConfigError):
+        split.import_favicons(run_dir, ship)
+    assert not (run_dir / "favicon_import.json").exists() and not (run_dir / "favicons").exists()
+
+
+def test_export_folds_the_write_ahead_log_into_the_copied_store(tmp_path):
+    import sqlite3
+    run_dir = _network_run(_cfg_at(tmp_path, "main"))
+    store = run_dir / "work" / "facts.sqlite"
+    db = sqlite3.connect(store)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA wal_autocheckpoint=0")
+    db.execute("CREATE TABLE late (x)")
+    db.execute("INSERT INTO late VALUES (1)")
+    db.commit()
+    wal = store.with_name(store.name + "-wal")
+    assert wal.stat().st_size > 0
+    ship = tmp_path / "ship"
+    split.export_network(run_dir, ship)
+    db.close()
+    copy = sqlite3.connect(ship / "work" / "facts.sqlite")
+    assert copy.execute("SELECT x FROM late").fetchall() == [(1,)]
+    copy.close()

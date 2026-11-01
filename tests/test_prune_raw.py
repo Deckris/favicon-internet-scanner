@@ -270,7 +270,9 @@ def test_the_option_is_off_by_default_and_validated(tmp_path):
 def test_a_config_without_the_key_keeps_its_checksum(tmp_path):
     cfg = load_config(write_config(tmp_path, output={"dir": str(tmp_path / "out")}))
     assert "prune_raw_keep_every" not in cfg.raw["output"]
-    assert cfg.checksum == hashlib.sha256(json.dumps(cfg.raw, sort_keys=True, default=str).encode()).hexdigest()
+    from scanner.internet.config import _without_host_derived
+    digest = lambda raw: hashlib.sha256(json.dumps(_without_host_derived(raw), sort_keys=True, default=str).encode()).hexdigest()
+    assert cfg.checksum == digest(cfg.raw)
     without = {k: v for k, v in cfg.raw.items()}
     without["output"] = {**cfg.raw["output"], "prune_raw_keep_every": 0}      # only a key that is written changes the checksum
-    assert hashlib.sha256(json.dumps(without, sort_keys=True, default=str).encode()).hexdigest() != cfg.checksum
+    assert digest(without) != cfg.checksum

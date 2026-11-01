@@ -113,6 +113,24 @@ def test_an_explicit_stage_cap_wins_over_the_derived_one(tmp_path):
     from scanner.internet.config import favicon_stage_seconds
     cfg = _scale_cfg(tmp_path, 100, stage_max_seconds=900)
     assert favicon_stage_seconds(cfg, 10**9) == 900
+    assert favicon_stage_seconds(cfg, 10**9, longest_chain=10**6, resumed=5) == 900
+
+
+def test_the_stage_cap_allows_for_the_pause_between_requests_to_one_address(tmp_path):
+    from scanner.internet.config import favicon_stage_seconds
+    cfg = _scale_cfg(tmp_path, 1000)
+    icons = cfg.favicon.max_icons_per_page
+    pause = cfg.measurement.min_seconds_between_probes_per_ip
+    chain = 1000                                     # one address with many hostnames: slow by pace, not by volume
+    assert favicon_stage_seconds(cfg, chain, longest_chain=chain) == chain * (1 + icons) * pause > 7200
+    assert favicon_stage_seconds(cfg, chain, longest_chain=1) == 7200
+
+
+def test_lookups_an_earlier_attempt_holds_do_not_count_toward_the_stage_cap(tmp_path):
+    from scanner.internet.config import favicon_stage_seconds
+    cfg = _scale_cfg(tmp_path, 100)
+    assert favicon_stage_seconds(cfg, 1_700_000, resumed=1_700_000 - 1000) == 7200
+    assert favicon_stage_seconds(cfg, 1_700_000, resumed=0) == -(-1_700_000 // 180)
 
 
 def test_tool_timeouts_cover_a_shard_ten_times_larger(tmp_path):

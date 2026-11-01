@@ -205,13 +205,14 @@ class _Watch:
 
 
 class _WatchdogService:
-    """One thread that enforces the wall-clock cap and the kill switch of every request in flight.
+    """One thread that enforces the wall-clock cap of every request in flight.
 
     A thread per request costs a thread start and stop on each fetch; here the requests register a deadline and an
-    ``expire`` callback instead. The thread wakes at the earliest deadline or every ``TICK`` seconds, whichever is
-    sooner, so a deadline is met to within a tick and the kill switch is noticed within one. It ends after ``IDLE``
-    seconds without a request and is started again by the next one. A kill switch is asked once per tick however
-    many requests share it, and one that raises counts as not set.
+    ``expire`` callback instead. The thread sleeps until the earliest deadline (a request with an earlier one wakes
+    it), so a deadline is met on time. A second thread asks the kill switches once per ``TICK`` seconds, however
+    many requests share one, so a switch that is slow to answer delays only the kill check, never a deadline; one
+    that raises counts as not set. Both end after ``IDLE`` seconds without a request and are started again by the
+    next one.
     """
 
     TICK = 0.25
@@ -224,7 +225,9 @@ class _WatchdogService:
         self._cond = threading.Condition()
         self._entries: set[_Watch] = set()
         self._thread: threading.Thread | None = None
+        self._kill_thread: threading.Thread | None = None
         self._sleeping_idle = False
+        self._wake_at = float("inf")            # when the deadline thread next looks, if it is asleep
 
     def watch(self, deadline: float, killed: Callable[[], bool], expire: Callable[[], None]) -> _Watch:
         """Registers a request; raises ``RuntimeError`` when the service thread cannot be started."""
@@ -234,8 +237,12 @@ class _WatchdogService:
                 thread = threading.Thread(target=self._run, daemon=True)
                 thread.start()
                 self._thread = thread
+            if self._kill_thread is None or not self._kill_thread.is_alive():
+                kill_thread = threading.Thread(target=self._run_kills, daemon=True)
+                kill_thread.start()
+                self._kill_thread = kill_thread
             self._entries.add(entry)
-            if self._sleeping_idle:
+            if self._sleeping_idle or entry.deadline < self._wake_at:
                 self._cond.notify()
         return entry
 
@@ -259,27 +266,58 @@ class _WatchdogService:
                         return
                 entries = list(self._entries)
             now = time.monotonic()
+            for entry in entries:
+                if now >= entry.deadline:
+                    entry.fire()
+                    self.forget(entry)
+            soonest = min((e.deadline for e in entries if not e.fired.is_set()), default=now + self.TICK)
+            delay = max(0.0, min(self.TICK, soonest - time.monotonic()))
+            with self._cond:
+                self._wake_at = time.monotonic() + delay
+                try:
+                    self._cond.wait(delay)
+                finally:
+                    self._wake_at = float("inf")
+
+    def _run_kills(self) -> None:
+        me = threading.current_thread()
+        while True:
+            with self._cond:
+                entries = list(self._entries)
+                if not entries:
+                    if self._kill_thread is me:
+                        self._kill_thread = None
+                    return
             stops: dict[int, bool] = {}
             for entry in entries:
-                if now < entry.deadline:
-                    key = id(entry.killed)
-                    if key not in stops:
-                        try:
-                            stops[key] = bool(entry.killed())
-                        except Exception:
-                            stops[key] = False
-                    if not stops[key]:
-                        continue
-                entry.fire()
-                self.forget(entry)
-            soonest = min((e.deadline for e in entries if not e.fired.is_set()), default=now + self.TICK)
-            time.sleep(max(0.0, min(self.TICK, soonest - time.monotonic())))
+                if entry.fired.is_set():
+                    continue
+                key = id(entry.killed)
+                if key not in stops:
+                    try:
+                        stops[key] = bool(entry.killed())
+                    except Exception:
+                        stops[key] = False
+                if stops[key]:
+                    entry.fire()
+                    self.forget(entry)
+            time.sleep(self.TICK)
 
 
 _WATCHDOG = _WatchdogService()
+
+
+def _after_fork_in_child() -> None:
+    """A forked favicon process keeps neither the watchdog threads, nor a lock another thread held at the fork, nor
+    the forking thread's client."""
+    global _SSL_LOCK
+    _WATCHDOG._reset()
+    _SSL_LOCK = threading.Lock()
+    _LOCAL.__dict__.clear()
+
+
 if hasattr(os, "register_at_fork"):
-    # a forked favicon process keeps neither the thread nor a lock another thread held at the fork
-    os.register_at_fork(after_in_child=lambda: _WATCHDOG._reset())
+    os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 _SLICE = 0.25
@@ -427,11 +465,13 @@ def _request_client(guard: _SocketGuard):
     client = getattr(_LOCAL, "client", None)
     if client is None:
         client = _LOCAL.client = _thread_client()
+    client.cookies.clear()          # the client outlives the request: no cookie may carry over to another host or port
     _LOCAL.guard = guard
     try:
         yield client
     finally:
         _LOCAL.guard = None
+        client.cookies.clear()
         pool = client._transport._pool
         if pool.connections:
             pool.close()

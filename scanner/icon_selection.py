@@ -55,17 +55,32 @@ class IconCandidate:
         return cls(href=decl.resolved_url or decl.declared_href, order=decl.order, rel=decl.rel, type=decl.type, sizes=decl.sizes)
 
 
+_MAX_SIZE_DIGITS = 5            # a side of 99999 px is far beyond any icon
+_MAX_SIZE_TOKENS = 64
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def _side(text: str) -> int | None:
+    if not 0 < len(text) <= _MAX_SIZE_DIGITS or not set(text) <= _ASCII_DIGITS:
+        return None
+    return int(text) or None
+
+
 def parse_sizes(sizes: str | None) -> tuple[bool, list[tuple[int, int]]]:
-    """``(any, [(width, height), ...])`` from a ``sizes`` attribute; tokens that do not parse are ignored."""
+    """``(any, [(width, height), ...])`` from a ``sizes`` attribute; tokens that do not parse are ignored.
+
+    Only ASCII digits of at most ``_MAX_SIZE_DIGITS`` places count, and only the first ``_MAX_SIZE_TOKENS`` tokens
+    are read, so a hostile attribute cannot raise or cost more than a bounded amount of work."""
     is_any = False
     found: list[tuple[int, int]] = []
-    for token in (sizes or "").lower().split():
+    for token in (sizes or "")[:2048].lower().split()[:_MAX_SIZE_TOKENS]:
         if token == "any":
             is_any = True
             continue
         width, sep, height = token.partition("x")
-        if sep and width.isdigit() and height.isdigit() and int(width) > 0 and int(height) > 0:
-            found.append((int(width), int(height)))
+        w, h = (_side(width), _side(height)) if sep else (None, None)
+        if w is not None and h is not None:
+            found.append((w, h))
     return is_any, found
 
 
@@ -83,13 +98,20 @@ def _path(cand: IconCandidate) -> str:
     return cand.href.split("#")[0].split("?")[0].lower()
 
 
+def _data_mime(cand: IconCandidate) -> str:
+    """The media type named by a ``data:`` URI, or an empty string for any other address."""
+    if cand.href[:5].lower() != "data:":
+        return ""
+    return cand.href[5:].split(",", 1)[0].split(";")[0].strip().lower()
+
+
 def is_svg(cand: IconCandidate) -> bool:
-    mime = _mime(cand)
+    mime = _mime(cand) or _data_mime(cand)
     return mime == "image/svg+xml" or (not mime and _path(cand).endswith(".svg"))
 
 
 def is_ico(cand: IconCandidate) -> bool:
-    mime = _mime(cand)
+    mime = _mime(cand) or _data_mime(cand)
     return mime in _ICO_TYPES or (not mime and _path(cand).endswith(".ico"))
 
 
