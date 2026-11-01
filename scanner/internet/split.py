@@ -11,12 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
 from scanner.internet import outputs
-from scanner.internet.config import ConfigError
+from scanner.internet.config import ConfigError, shared_config_checksum
 
 EXPORT_MANIFEST = "export_manifest.json"
 IMPORT_RECORD = "favicon_import.json"
@@ -69,6 +70,7 @@ def export_network(run_dir: Path, out_dir: Path) -> dict[str, Any]:
     manifest = pipeline.read_network_manifest(run_dir)
     if out_dir.exists() and any(out_dir.iterdir()):
         raise ConfigError(f"{out_dir} is not empty")
+    _fold_journal(run_dir / "work" / "facts.sqlite")
     wanted = ["manifest.json", "config.snapshot.json", "scanned_ips.txt", "work/facts.sqlite",
               "normalized/tool_jobs.jsonl", "normalized/http_documents.jsonl"]
     files: dict[str, dict[str, Any]] = {}
@@ -85,6 +87,24 @@ def export_network(run_dir: Path, out_dir: Path) -> dict[str, Any]:
               "shard": manifest.get("shard"), "files": files}
     _write_json(out_dir / EXPORT_MANIFEST, record)
     return record
+
+
+def _fold_journal(store: Path) -> None:
+    """Move what the write-ahead log of ``store`` still holds into the database file, which is all that is copied.
+
+    A log that stays non-empty (the checkpoint failed or a reader holds it) refuses the export: the copy would lack
+    the last transactions and still match its own checksums."""
+    wal = store.with_name(store.name + "-wal")
+    if not wal.is_file() or wal.stat().st_size == 0:
+        return
+    try:
+        with sqlite3.connect(store, timeout=30) as db:
+            db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        db.close()
+    except sqlite3.Error:
+        pass
+    if wal.is_file() and wal.stat().st_size > 0:
+        raise ConfigError(f"{wal} still holds transactions that are not in {store.name}; close whatever uses the store and retry")
 
 
 def verify_export(run_dir: Path) -> list[str]:
@@ -125,6 +145,15 @@ def import_favicons(run_dir: Path, source: Path) -> dict[str, Any]:
         raise ConfigError(f"{source} has no readable manifest ({exc})") from exc
     if theirs.get("run_id") != target.get("run_id") or (theirs.get("shard") or {}).get("index") != (target.get("shard") or {}).get("index"):
         raise ConfigError("the favicon run belongs to a different shard run than the directory it is imported into")
+    if not theirs.get("complete") or theirs.get("stage_errors"):
+        raise ConfigError(f"the favicon run in {source} did not complete without stage errors; its lookups are not imported")
+    try:
+        mine = json.loads((run_dir / "config.snapshot.json").read_text(encoding="utf-8"))
+        other = json.loads((source / "config.snapshot.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"a config snapshot is missing or unreadable ({exc})") from exc
+    if shared_config_checksum(mine) != shared_config_checksum(other):
+        raise ConfigError("the favicon run was made under a different configuration than the shard it is imported into")
     declared = _declared(theirs)
     if not any(rel.startswith("raw/favicon_records") for rel in declared):
         raise ConfigError(f"the manifest of {source} lists no favicon record file")
