@@ -293,6 +293,34 @@ def test_max_connections_per_subnet_round_trips_and_is_checked(tmp_path):
         st.apply(tmp_path)
 
 
+def test_subnet_timing_settings_round_trip_and_are_checked(tmp_path):
+    path = _new_workdir(tmp_path)
+    st.apply(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.measurement.retry_after_max_hold_seconds == 30 and cfg.measurement.subnet_wait_max_seconds == 120
+    base = cfg.checksum
+    _set_scope(path, retry_after_max_hold_seconds=10, subnet_wait_max_seconds=60)
+    st.apply(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.measurement.retry_after_max_hold_seconds == 10 and cfg.measurement.subnet_wait_max_seconds == 60
+    assert cfg.checksum != base
+    for key, bad in (("retry_after_max_hold_seconds", 901), ("retry_after_max_hold_seconds", -1), ("subnet_wait_max_seconds", 0),
+                     ("subnet_wait_max_seconds", 3601), ("subnet_wait_max_seconds", "soon")):
+        _set_scope(path, **{key: bad})
+        with pytest.raises(st.SettingsError, match=key):
+            st.apply(tmp_path)
+        _set_scope(path, **{key: 30})
+
+
+def test_subnet_timing_flags_in_init_are_written_to_settings(tmp_path):
+    path = _new_workdir(tmp_path, "--retry-after-max-hold-seconds", "5", "--subnet-wait-max-seconds", "45")
+    scope = yaml.safe_load(path.read_text(encoding="utf-8"))["scope"]
+    assert scope["retry_after_max_hold_seconds"] == 5 and scope["subnet_wait_max_seconds"] == 45
+    st.apply(tmp_path)
+    m = load_config(tmp_path / "config.yaml").measurement
+    assert m.retry_after_max_hold_seconds == 5 and m.subnet_wait_max_seconds == 45
+
+
 def test_icon_settings_change_the_checksum_but_hardware_settings_do_not(tmp_path):
     path = _new_workdir(tmp_path)
     st.apply(tmp_path)

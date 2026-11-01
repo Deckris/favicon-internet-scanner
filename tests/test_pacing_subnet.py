@@ -215,6 +215,30 @@ def test_subnet_cap_config_default_and_range(tmp_path):
     assert load_config(p).measurement.max_connections_per_subnet == 2
 
 
+def test_subnet_timing_config_defaults_and_ranges(tmp_path):
+    import yaml
+    from scanner.internet.config import HOST_DERIVED_KEYS, ConfigError, load_config
+    from tests.helpers import write_config
+
+    p = write_config(tmp_path)
+    m = load_config(p).measurement
+    assert m.retry_after_max_hold_seconds == 30 and m.subnet_wait_max_seconds == 120
+    assert "retry_after_max_hold_seconds" not in HOST_DERIVED_KEYS["measurement"]
+    assert "subnet_wait_max_seconds" not in HOST_DERIVED_KEYS["measurement"]
+    d = yaml.safe_load(p.read_text())
+    for key, bad in (("retry_after_max_hold_seconds", -1), ("retry_after_max_hold_seconds", 901),
+                     ("subnet_wait_max_seconds", 0.5), ("subnet_wait_max_seconds", 3601)):
+        d["measurement"][key] = bad
+        p.write_text(yaml.safe_dump(d))
+        with pytest.raises(ConfigError, match=key):
+            load_config(p)
+        d["measurement"].pop(key)
+    d["measurement"].update(retry_after_max_hold_seconds=0, subnet_wait_max_seconds=3600)
+    p.write_text(yaml.safe_dump(d))
+    m = load_config(p).measurement
+    assert pacing.limiter_for(m)._backoff == {"max_hold": 0.0}
+
+
 class Tick:
     def __init__(self, t=1000.0):
         self.t = t

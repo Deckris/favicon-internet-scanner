@@ -671,8 +671,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             return None
         return st.run(name, fn, None)
     gap = pacing.Gap(pace, killed, stop_event=st.stop)             # pause between ZMap port runs
-    limiter = pacing.SubnetLimiter(cfg.measurement.max_connections_per_subnet)     # simultaneous connections per /24, all stages
-    ledger = pacing.ContactLedger(pace, killed, stop_event=st.stop, limiter=limiter)    # last contact per address, shared by every target-facing step
+    limiter = pacing.limiter_for(cfg.measurement)     # simultaneous connections per /24, all stages
+    wait_max = cfg.measurement.subnet_wait_max_seconds
+    ledger = pacing.ContactLedger(pace, killed, stop_event=st.stop, limiter=limiter, max_wait=wait_max)    # last contact per address, shared by every target-facing step
     attempt = re.search(r"-a(\d+)$", run_id)
     if (resume_from is not None or continued or (attempt is not None and int(attempt[1]) > 1)) and st.replay is None:
         # The contacts of a lost attempt are not on file, so no address is contacted before one full pause has passed.
@@ -849,6 +850,20 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 book.commit(zmap_unit(port), "zmap", [job], port=port, size=len(ips))
             after_sweep(port, ips)
 
+    busy_lock = threading.Lock()
+
+    def on_busy(stage: str, ip_of: Callable[[Any], str], port_of: Callable[[Any], Any]) -> Callable[[list], None]:
+        """Record the targets of a batch given up on because their network stayed full or held: counted, and listed in
+        raw/skipped_network_busy.jsonl with the stage, so nothing disappears without a trace."""
+        def skip(batch: list) -> None:
+            lines = "".join(json.dumps({"stage": stage, "ip": ip_of(t), "port": port_of(t), "outcome": "skipped_network_busy"}) + "\n"
+                            for t in batch)
+            with busy_lock:
+                counts["skipped_network_busy_zgrab"] = counts.get("skipped_network_busy_zgrab", 0) + len(batch)
+                with (run_dir / "raw" / "skipped_network_busy.jsonl").open("a", encoding="utf-8", newline="\n") as fh:
+                    fh.write(lines)
+        return skip
+
     # ---- Stage 2: TLS first, direct IP (no SNI) ---------------------------------------------
     tls_jobs: list[ToolJob] = []
     # With overlap a batch must end by a known time: the gate leaves room for that, and the executor enforces it.
@@ -879,7 +894,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         items = [(ip, port, None) for ip, port in store.iter_endpoints() if ip not in tarpit_ips]
         collect_tls(pacing.paced_batches(items, lambda t: t[0], ledger, tls_runner(), batch_size=m.zgrab_batch_size,
                                          workers=m.zgrab_parallel_batches, group_of=lambda t: t[1],
-                                         reuse=lambda b: book.reuse(tls_unit(b))))
+                                         reuse=lambda b: book.reuse(tls_unit(b)),
+                                         on_skip=on_busy("tls_direct", lambda t: t[0], lambda t: t[1])))
 
     def tls_overlap_stage() -> None:
         assert gate is not None
@@ -904,6 +920,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                            key=lambda t: (send_order.get(t[0], 1 << 62), t[0]))
             collect_tls(pacing.paced_batches(items, lambda t: t[0], ledger, tls_runner(tls_limit), batch_size=size,
                                              workers=m.zgrab_parallel_batches, reuse=lambda b: book.reuse(tls_unit(b)),
+                                             on_skip=on_busy("tls_direct", lambda t: t[0], lambda t: t[1]),
                                              extra=lambda b: gate.admit([t[0] for t in b], tls_limit + 10)))
             del items
 
@@ -993,7 +1010,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             return batch_jobs
         for batch_jobs in pacing.paced_batches(targets, lambda t: t.ip, ledger, one, batch_size=m.zgrab_batch_size,
                                                workers=m.zgrab_parallel_batches, group_of=lambda t: t.port,
-                                               reuse=lambda b: book.reuse(http_unit(b))):
+                                               reuse=lambda b: book.reuse(http_unit(b)),
+                                               on_skip=on_busy("http_direct", lambda t: t.ip, lambda t: t.port)):
             jobs.extend(batch_jobs)
 
     def tarpits_known(name: str, fn: Callable[[], Any]) -> Any:
@@ -1099,7 +1117,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             return batch_jobs
         for batch_jobs in pacing.paced_batches(targets, lambda t: t[0], ledger, one, batch_size=m.zgrab_batch_size,
                                                workers=m.zgrab_parallel_batches, group_of=lambda t: t[1],
-                                               reuse=lambda b: book.reuse(sni_unit(b))):
+                                               reuse=lambda b: book.reuse(sni_unit(b)),
+                                               on_skip=on_busy("sni_confirm", lambda t: t[0], lambda t: t[1])):
             jobs.extend(batch_jobs)
 
     tarpits_known("sni_confirm", sni_stage)
@@ -1142,13 +1161,13 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 service = fav.OffhostService(fav.make_offhost_fetcher(
                     cfg, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), exclusions, killed=stop,
                     state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json",
-                    pacer=pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter)),
+                    pacer=pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter, max_wait=wait_max)),
                     threads=min(64, cfg.favicon.workers))
             factory = fetcher_factory or fav.FetcherFactory(
                 cfg, sorted(job_ips), job_endpoints, max_active_requests=fav.split_cap(cfg.favicon.max_active_requests, cfg.favicon.processes))
             f = None
         else:
-            pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter)     # pause between HTTP requests to one address
+            pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter, max_wait=wait_max)     # pause between HTTP requests to one address
             f = fetcher or fav.make_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
                                             job_endpoints, exclusions=exclusions, killed=stop,
                                             state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json", pacer=pacer)
@@ -1182,6 +1201,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 worker_failures: list[tuple[str, int]] = []
                 fav.run_favicon_stage_processes(factory, fjobs, processes=cfg.favicon.processes, pace=pace,
                                                 subnet_cap=cfg.measurement.max_connections_per_subnet,
+                                                retry_after_max_hold=cfg.measurement.retry_after_max_hold_seconds,
+                                                subnet_wait_max=wait_max,
                                                 on_failure=lambda why, lost: worker_failures.append((why, lost)),
                                                 offhost_service=service, **common)
                 if worker_failures:
@@ -1194,7 +1215,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 nonlocal pacer
                 jf = f
                 if jf is None:       # several processes: the browser stage runs here, with a fetcher and pacer of its own
-                    pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter)
+                    pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter, max_wait=wait_max)
                     jf = fav._make_local_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), job_endpoints, pacer, stop)
                     if service is not None:
                         jf = fav.RoutingFetcher(jf, service.fetcher)
@@ -1210,6 +1231,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             if stored < expected:
                 st.errors["favicon_records_missing"] = f"{stored} favicon records stored for {expected} lookups"
             skipped = store.count_favicon_outcome("skipped_kill_switch")
+            busy = store.count_favicon_outcome("skipped_network_busy")
+            if busy:
+                counts["skipped_network_busy"] = busy       # lookups given up because their network stayed full or held
             if time.monotonic() > deadline and skipped:
                 st.errors["favicon_deadline"] = f"stage cap of {stage_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"
         finally:

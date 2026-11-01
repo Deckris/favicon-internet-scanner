@@ -247,6 +247,8 @@ def test_checksum_ignores_host_derived_settings(tmp_path):
     lambda d: d["measurement"].update(min_seconds_between_probes_per_ip=1),
     lambda d: d["measurement"].update(zmap_rate=50),
     lambda d: d["measurement"].update(max_connections_per_subnet=8),
+    lambda d: d["measurement"].update(retry_after_max_hold_seconds=300),
+    lambda d: d["measurement"].update(subnet_wait_max_seconds=600),
     lambda d: d["measurement"].update(overlap_tls_with_zmap=True),
     lambda d: d["fetch"].update(read_timeout=9.0),
 ])

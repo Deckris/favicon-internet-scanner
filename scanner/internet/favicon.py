@@ -30,7 +30,7 @@ from scanner.internet import outputs
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from scanner.internet.icon_store import IconStore
 from scanner.internet.offhost_service import OffhostClient, OffhostService
-from scanner.internet.pacing import IpPacer, SubnetLimiter, network_key
+from scanner.internet.pacing import DEFAULT_RETRY_AFTER_MAX_HOLD, DEFAULT_SUBNET_WAIT_MAX, IpPacer, SubnetLimiter, network_key
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
 from scanner.favicon_discovery import parse_icon_declarations
@@ -123,6 +123,17 @@ def _limits(cfg: Any, max_bytes: int) -> FetchLimits:
     )
 
 
+_SKIPS = {"stopped": "skipped_kill_switch", "network_busy": "skipped_network_busy"}
+
+
+def _admit(pacer: Any, ip: str) -> str:
+    """Wait for the pacer to release a request to ``ip``: ``ok``, ``stopped`` or ``network_busy`` (nothing may be sent)."""
+    admit = getattr(pacer, "admit", None)
+    if admit is not None:
+        return admit(ip)
+    return "ok" if pacer.wait(ip) else "stopped"
+
+
 class GuardedFetcher(WebFetcher):
     """WebFetcher confined to (ip, port) pairs that actually answered the ZMap scan.
 
@@ -150,8 +161,10 @@ class GuardedFetcher(WebFetcher):
     def _one_request(self, parts, hostname, port, connect_ip, limits, timeout, deadline):   # type: ignore[override]
         if (connect_ip, port) not in self.allowed_endpoints:
             return self._outcome("policy_refused", connect_ip, hostname, port, parts.scheme)
-        if self.pacer is not None and not self.pacer.wait(connect_ip):
-            return self._outcome("skipped_kill_switch", connect_ip, hostname, port, parts.scheme)
+        if self.pacer is not None:
+            verdict = _admit(self.pacer, connect_ip)
+            if verdict != "ok":
+                return self._outcome(_SKIPS[verdict], connect_ip, hostname, port, parts.scheme)
         result = None
         try:
             if self._active is None:
@@ -302,8 +315,10 @@ class OffhostIconFetcher(WebFetcher):
             if seen >= self.max_per_host * 2:
                 return GuardedFetcher._outcome("policy_refused", connect_ip, hostname, port, parts.scheme)
             self._per_ip[connect_ip] = seen + 1
-        if self.pacer is not None and not self.pacer.wait(connect_ip):
-            return GuardedFetcher._outcome("skipped_kill_switch", connect_ip, hostname, port, parts.scheme)
+        if self.pacer is not None:
+            verdict = _admit(self.pacer, connect_ip)
+            if verdict != "ok":
+                return GuardedFetcher._outcome(_SKIPS[verdict], connect_ip, hostname, port, parts.scheme)
         result = None
         try:
             result = super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
@@ -529,6 +544,9 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
                 html = body.decode("utf-8", errors="replace")
             record.update(document_facts(html, body))
             body = None         # the raw bytes are not needed once the page facts are taken
+            if result.outcome == "skipped_network_busy":
+                record["favicon_outcome"] = "skipped_network_busy"      # nothing was sent; a later refetch can redo it
+                return record
             if result.outcome not in ("ok", "http_status") and result.http_status is None:
                 record["favicon_outcome"] = "document_failed"
                 return record
@@ -913,8 +931,10 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
             conn.send(message)
     try:
         stopped = stop.is_set
-        limiter = SubnetLimiter(settings["subnet_cap"]) if settings.get("subnet_cap") else None
-        pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0, limiter=limiter)
+        limiter = (SubnetLimiter(settings["subnet_cap"], max_hold=settings["retry_after_max_hold"])
+                   if settings.get("subnet_cap") else None)
+        pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0, limiter=limiter,
+                        max_wait=settings["subnet_wait_max"])
         store = IconStore(store_root) if store_root is not None else None
         fetcher = factory(pacer, frozenset(j["ip"] for j in jobs), stopped)
         if offhost_conn is not None:       # icons on other hosts are fetched by the parent's service, once for all processes
@@ -938,7 +958,9 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                                 max_document_bytes: int = 0, on_record: Any = None,
                                 done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None,
                                 grace: float = STOP_GRACE_SECONDS, record_sink: Any = None,
-                                on_failure: Any = None, subnet_cap: int = 0, offhost_service: Any = None) -> list[dict[str, Any]]:
+                                on_failure: Any = None, subnet_cap: int = 0, offhost_service: Any = None,
+                                retry_after_max_hold: float = DEFAULT_RETRY_AFTER_MAX_HOLD,
+                                subnet_wait_max: float = DEFAULT_SUBNET_WAIT_MAX) -> list[dict[str, Any]]:
     """Like ``run_favicon_stage`` but over ``processes`` worker processes; one record per job, original order.
 
     ``factory(pacer, owned, killed)`` returns the fetcher (``owned``: the addresses of the process) and must be
@@ -997,7 +1019,7 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     stop = SharedFlag(ctx)
     settings = {"pace": pace, "workers": split_cap(workers, len(parts)), "max_icons": max_icons, "selection": selection,
                 "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace,
-                "subnet_cap": subnet_cap or 0}      # a network lives in one process, which may use the whole cap
+                "subnet_cap": subnet_cap or 0, "retry_after_max_hold": retry_after_max_hold, "subnet_wait_max": subnet_wait_max}      # a network lives in one process, which may use the whole cap
     procs, conns, sends = [], [], []
     for i, indexes in enumerate(parts):
         recv_end, send_end = ctx.Pipe(duplex=False)

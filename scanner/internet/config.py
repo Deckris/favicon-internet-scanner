@@ -124,7 +124,8 @@ def sha256_file(path: Path) -> str:
 # Settings that profile.derive sizes from the host's cores, memory and open-file limit, plus the time limit of the favicon
 # stage. They change how fast a run goes, not what it measures. They stay in the stored config and the snapshots; only
 # the checksum leaves them out, so that two hosts with different hardware get the same campaign directory and run ids.
-# Politeness limits (max_connections_per_subnet, min_seconds_between_probes_per_ip) and overlap_tls_with_zmap, which
+# Politeness limits (max_connections_per_subnet, retry_after_max_hold_seconds, subnet_wait_max_seconds,
+# min_seconds_between_probes_per_ip) and overlap_tls_with_zmap, which
 # changes the traffic pattern, stay in the checksum: raising one needs a new approval. Hosts of one campaign that
 # derive overlap_tls_with_zmap differently set it explicitly in the settings so that it is the same on all of them.
 HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
@@ -317,7 +318,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         "ports", "zmap_rate", "zmap_max_runtime", "zmap_cooldown", "zmap_probes",
         "zgrab_connect_timeout", "zgrab_target_timeout", "zgrab_senders", "zgrab_batch_size"}
     m = _section(raw, "measurement", measurement_keys | {"zmap_version", "min_seconds_between_probes_per_ip", "zgrab_parallel_batches",
-                                                         "max_connections_per_subnet",
+                                                         "max_connections_per_subnet", "retry_after_max_hold_seconds",
+                                                         "subnet_wait_max_seconds",
                                                          "overlap_tls_with_zmap"}, measurement_keys)
     zmap_version = str(m.get("zmap_version", "2.1.1"))
     if not supported(zmap_version):
@@ -348,6 +350,10 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         zgrab_parallel_batches=_int(m.get("zgrab_parallel_batches", 1), "measurement.zgrab_parallel_batches", 1, 64),
         # Connections open at once to one /24 (IPv6: /48), over all stages of a process. Back-off can only lower it.
         max_connections_per_subnet=_int(m.get("max_connections_per_subnet", 4), "measurement.max_connections_per_subnet", 1, 64),
+        # A 429/503 with Retry-After stops new connections to the network for that long, at most this many seconds.
+        retry_after_max_hold_seconds=_float(m.get("retry_after_max_hold_seconds", 30), "measurement.retry_after_max_hold_seconds", 0, 900),
+        # Longest a request waits for room in its network before it is skipped (`skipped_network_busy`) without being sent.
+        subnet_wait_max_seconds=_float(m.get("subnet_wait_max_seconds", 120), "measurement.subnet_wait_max_seconds", 1, 3600),
         # Start direct-IP TLS while ZMap sweeps the remaining ports. Outbound traffic is then the ZMap rate plus
         # the concurrent ZGrab2 connections; the approval rate still caps ZMap alone.
         overlap_tls_with_zmap=_bool(m.get("overlap_tls_with_zmap", False), "measurement.overlap_tls_with_zmap"),

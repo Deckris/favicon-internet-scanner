@@ -52,6 +52,8 @@ scope:
   min_seconds_between_probes_per_ip: {pace}   # pause between any two requests to the same address
   overlap_tls_with_zmap: {overlap}   # auto | true | false. true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
   # max_connections_per_subnet: 4   # connections open at once to one /24 (IPv6 /48), 1 to 64; backs off on timeouts, 429 and 503
+  # retry_after_max_hold_seconds: 30   # longest a network is left alone after a 429/503 with Retry-After, 0 to 900
+  # subnet_wait_max_seconds: 120   # longest a request waits for room in its network before it is skipped unsent, 1 to 3600
   dns_resolver: {dns_resolver}      # resolver for PTR and name checks; it sees every scanned address
   # Concurrency follows the cores, RAM and open-file limit of the host (see `scanner plan`). Set any of these to
   # fix it instead; a value set here always wins over the derived one, and a command-line flag wins over both.
@@ -148,7 +150,7 @@ def _with_profile_answers(text: str, answers: dict[str, Any]) -> str:
             text = re.sub(rf"^#   {key}: .*$", f"  {key}: {value}", text, count=1, flags=re.MULTILINE)
     if any(answers.get(k) is not None for k in ("cores", "memory_gb", "max_open_files")):
         text = text.replace("# resources:", "resources:", 1)
-    for key in ("icon_selection", "max_connections_per_subnet"):
+    for key in ("icon_selection", "max_connections_per_subnet", "retry_after_max_hold_seconds", "subnet_wait_max_seconds"):
         value = answers.get(key)
         if value is not None:
             text = re.sub(rf"^(\s*)# {key}: [^#\n]*?(\s*#.*)?$", lambda m: f"{m.group(1)}{key}: {value}{m.group(2) or ''}",
@@ -386,6 +388,14 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
     subnet_cap = cli_flags.get("max_connections_per_subnet", scope.get("max_connections_per_subnet"))
     if subnet_cap is not None and (not isinstance(subnet_cap, int) or isinstance(subnet_cap, bool) or not 1 <= subnet_cap <= 64):
         raise SettingsError("scope.max_connections_per_subnet must be a whole number from 1 to 64")
+    timing = {}
+    for key, lo, hi in (("retry_after_max_hold_seconds", 0, 900), ("subnet_wait_max_seconds", 1, 3600)):
+        value = cli_flags.get(key, scope.get(key))
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not lo <= value <= hi:
+            raise SettingsError(f"scope.{key} must be a number from {lo} to {hi}")
+        timing[key] = value
     if appr["status"] not in ("blocked", "approved"):
         raise SettingsError("approval.status must be `blocked` or `approved`")
     excl_path = _resolve(workdir, scope["exclusions_file"])
@@ -433,6 +443,7 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
              zgrab_parallel_batches=plan["zgrab_parallel_batches"], zgrab_batch_size=plan["zgrab_batch_size"])
     if subnet_cap is not None:
         m["max_connections_per_subnet"] = subnet_cap
+    m.update(timing)
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     base["dns"]["threads"] = plan["dns_threads"]

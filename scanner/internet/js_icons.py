@@ -104,7 +104,7 @@ def candidate_pages(records: Any, cap: int) -> tuple[list[dict[str, Any]], int]:
     for rec in records:
         if (rec.get("kind") == "direct_ip" and not rec.get("favicon_is_image") and rec.get("error") is None
                 and rec.get("document_outcome") in ("ok", "http_status") and rec.get("http_status") == 200
-                and rec.get("favicon_outcome") not in (None, "not_attempted", "skipped_kill_switch", "document_failed", "error")):
+                and rec.get("favicon_outcome") not in (None, "not_attempted", "skipped_kill_switch", "skipped_network_busy", "document_failed", "error")):
             if len(picked) < cap:
                 picked.append(rec)
             else:

@@ -42,6 +42,12 @@ measurement:
   # Connections open at once to one /24 (IPv6: /48), shared by every stage; 1 to 64. Timeouts, 429 and 503 lower it
   # for that network and it recovers after a quiet period. Absent means 4.
   # max_connections_per_subnet: 4
+  # A 429 or 503 with Retry-After keeps new connections away from that network for the stated time, at most this
+  # many seconds (0 to 900). Absent means 30.
+  # retry_after_max_hold_seconds: 30
+  # A request that finds its network full or held for this many seconds (1 to 3600) is skipped without being sent and
+  # recorded as skipped_network_busy; a refetch can redo it. Absent means 120.
+  # subnet_wait_max_seconds: 120
 
 target_policy:
   exclusions_file: REPLACE_ME    # opt-out / protected ranges, one CIDR per line

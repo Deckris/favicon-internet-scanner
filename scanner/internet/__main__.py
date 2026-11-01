@@ -147,7 +147,7 @@ def _profile_flags(args) -> dict:
     return out
 
 
-SCOPE_FLAGS = ("icon_selection", "max_connections_per_subnet", "javascript_enabled", "javascript_max_pages_per_shard",
+SCOPE_FLAGS = ("icon_selection", "max_connections_per_subnet", "retry_after_max_hold_seconds", "subnet_wait_max_seconds", "javascript_enabled", "javascript_max_pages_per_shard",
                "javascript_page_timeout_seconds", "javascript_concurrency", "javascript_wait_ms", "offhost_icons")
 
 
@@ -178,6 +178,7 @@ def _resource_plan(cfg, args) -> dict:
     js = f.javascript
     icons = {"icon_selection": f.icon_selection, "offhost_icons": f.offhost.enabled,
              "max_connections_per_subnet": m.max_connections_per_subnet,
+             "retry_after_max_hold_seconds": m.retry_after_max_hold_seconds, "subnet_wait_max_seconds": m.subnet_wait_max_seconds,
              "javascript": {"enabled": js.enabled, "max_pages_per_shard": js.max_pages_per_shard,
                             "page_timeout_seconds": js.page_timeout_seconds, "wait_ms": js.wait_ms,
                             "concurrency": js.concurrency or profile.javascript_concurrency(res.cores, res.memory_gb),
@@ -287,6 +288,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--overlap-tls-with-zmap", choices=("true", "false", "auto"),
                     help="init, apply: start TLS while ZMap sweeps later ports (auto: on from 4 cores)")
     ap.add_argument("--max-connections-per-subnet", type=int, help="init, apply: connections open at once to one /24 (1-64)")
+    ap.add_argument("--retry-after-max-hold-seconds", type=float,
+                    help="init, apply: longest a network is left alone after a 429/503 with Retry-After (0-900)")
+    ap.add_argument("--subnet-wait-max-seconds", type=float,
+                    help="init, apply: longest a request waits for room in its network before it is skipped (1-3600)")
     ap.add_argument("--icon-selection", choices=("first_image", "browser_models"), help="init, apply: which declared icons the favicon stage fetches")
     ap.add_argument("--offhost-icons", choices=("true", "false"), help="apply: fetch icons hosted elsewhere (the approval must allow it)")
     ap.add_argument("--javascript-enabled", choices=("true", "false"), help="init, apply: render pages in a headless browser to find script-added icons")

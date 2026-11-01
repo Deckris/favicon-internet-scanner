@@ -28,6 +28,9 @@ T = TypeVar("T")
 _SLICE = 0.5
 _CHECK = 1.0               # longest sleep of a pacer waiter between looks at the kill switch
 _LIMIT_POLL = 0.25          # how often a caller blocked only by the network cap looks again
+DEFAULT_RETRY_AFTER_MAX_HOLD = 30.0     # longest a network is left alone after one Retry-After
+DEFAULT_SUBNET_WAIT_MAX = 120.0         # longest a request waits for a network slot before it is skipped
+WAIT_OK, WAIT_STOPPED, WAIT_BUSY = "ok", "stopped", "network_busy"
 _PRUNE_EVERY = 4096         # releases between sweeps for idle back-off records
 log = logging.getLogger(__name__)
 
@@ -107,13 +110,17 @@ class IpPacer:
 
     With a ``limiter`` a release also needs a free connection slot for the address's network. The slot is held
     until ``done`` is called, which also reports how the request went so the limiter can back off. A caller held
-    only by a full network looks again every ``_LIMIT_POLL`` seconds, keeping its place in the queue.
+    only by a full network looks again every ``_LIMIT_POLL`` seconds, keeping its place in the queue. Once its own
+    pause is over and the network has still not had room for ``max_wait`` seconds, ``admit`` gives up with
+    ``WAIT_BUSY``: nothing is sent and the pause clock of the address is not started.
     """
 
     def __init__(self, min_interval: float, killed: Callable[[], bool] = lambda: False,
                  now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 stop_event: Any = None, poll: float = _CHECK, limiter: "SubnetLimiter | None" = None) -> None:
+                 stop_event: Any = None, poll: float = _CHECK, limiter: "SubnetLimiter | None" = None,
+                 max_wait: float | None = DEFAULT_SUBNET_WAIT_MAX) -> None:
         self.min_interval = float(min_interval)
+        self.max_wait = None if max_wait is None else float(max_wait)
         self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self._poll = min(max(float(poll), 0.01), _CHECK)    # longest sleep between looks at the kill switch
         self._next: dict[str, float] = {}       # first unreserved slot per address
@@ -128,14 +135,19 @@ class IpPacer:
         self._last = {ip: at for ip, at in self._last.items() if at + self.min_interval > now}
 
     def wait(self, ip: str) -> bool:
-        """Block until a request to ``ip`` may start. False means a stop condition fired: do not send."""
+        """Block until a request to ``ip`` may start. False means do not send (a stop, or a network kept busy too long)."""
+        return self.admit(ip) == WAIT_OK
+
+    def admit(self, ip: str) -> str:
+        """Like ``wait`` but says why a request may not start: ``WAIT_OK``, ``WAIT_STOPPED`` or ``WAIT_BUSY``."""
         if self.min_interval <= 0 and self.limiter is None:
-            return not (self._killed() or (self._stop is not None and self._stop.is_set()))
+            return WAIT_STOPPED if (self._killed() or (self._stop is not None and self._stop.is_set())) else WAIT_OK
         counts = {self.limiter.key_of(ip): 1} if self.limiter is not None else None
         slot: float | None = None
+        blocked_since: float | None = None      # when the network first refused this caller with its own pause over
         while True:
             if self._killed() or (self._stop is not None and self._stop.is_set()):
-                return False
+                return WAIT_STOPPED
             with self._lock:
                 now = self._now()
                 if slot is None:
@@ -147,7 +159,13 @@ class IpPacer:
                 if now < earliest - 1e-9:
                     delay = earliest - now
                 elif counts is not None and not self.limiter.try_acquire(counts):
+                    if blocked_since is None:
+                        blocked_since = now
+                    if self.max_wait is not None and now - blocked_since >= self.max_wait:
+                        return WAIT_BUSY
                     delay = _LIMIT_POLL
+                    if self.max_wait is not None:
+                        delay = min(delay, max(blocked_since + self.max_wait - now, 0.01))
                 else:
                     if last != float("-inf") and now - last < self.min_interval - 1e-6:
                         _violation(f"{ip} contacted again {now - last:.3f} s after its last contact")
@@ -157,7 +175,7 @@ class IpPacer:
                         self._grants += 1
                         if self._grants % (1 << 16) == 0:
                             self._prune(now)
-                    return True
+                    return WAIT_OK
             _nap(min(self._poll, delay), self._sleep, self._stop)
 
     def done(self, ip: str, result: Any = None) -> None:
@@ -212,11 +230,12 @@ class BackoffState:
     news within ``settle`` seconds of a halving does not halve again: connections that were already in flight
     when the limit dropped must not push it down twice. After ``recover_after`` quiet seconds the limit grows
     by ``step``, up to ``ceiling``. Only time raises it; a successful reply merely clears the timeout streak.
-    A Retry-After holds the network (no new connections) for that long, up to ``max_hold`` seconds.
+    A Retry-After holds the network (no new connections) for that long, up to ``max_hold`` seconds. The hold is short by default: a kind scanner needs to stop pressing a network, not
+    to leave it alone for as long as one host asked.
     """
 
     def __init__(self, ceiling: int, *, timeout_threshold: int = 3, recover_after: float = 120.0, step: int = 1,
-                 settle: float = 10.0, max_hold: float = 900.0) -> None:
+                 settle: float = 10.0, max_hold: float = DEFAULT_RETRY_AFTER_MAX_HOLD) -> None:
         self.ceiling = max(1, int(ceiling))
         self.timeout_threshold = max(1, int(timeout_threshold))
         self.recover_after = float(recover_after)
@@ -453,6 +472,11 @@ class SubnetLimiter:
             self.observe(ip, timeout=status in ("connection-timeout", "io-timeout"), http_status=getattr(r, "http_status", None))
 
 
+def limiter_for(measurement: Any) -> SubnetLimiter:
+    """The per-network limiter that the ``measurement`` section of a configuration asks for."""
+    return SubnetLimiter(measurement.max_connections_per_subnet, max_hold=measurement.retry_after_max_hold_seconds)
+
+
 def split_by_network(items: list[T], ip_of: Callable[[T], str], key_of: Callable[[str], str], cap: int) -> list[list[T]]:
     """Group i holds items i*cap to i*cap+cap-1 of every network, so no group has more than ``cap`` of one network."""
     groups: list[list[T]] = []
@@ -501,8 +525,10 @@ class ContactLedger:
 
     def __init__(self, seconds: float, killed: Callable[[], bool] = lambda: False,
                  now: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
-                 stop_event: Any = None, limiter: SubnetLimiter | None = None) -> None:
+                 stop_event: Any = None, limiter: SubnetLimiter | None = None,
+                 max_wait: float | None = DEFAULT_SUBNET_WAIT_MAX) -> None:
         self.seconds = float(seconds)
+        self.max_wait = None if max_wait is None else float(max_wait)
         self._killed, self._now, self._sleep, self._stop = killed, now, sleep, stop_event
         self.limiter = limiter          # a claim also needs room in each network (lock order: ledger, then limiter)
         self._all: float | None = None
@@ -536,11 +562,13 @@ class ContactLedger:
 
     def claim_some(self, ips: list[str], extra: Callable[[float], bool] | None = None) -> list[str] | None:
         """Like ``claim`` but takes only the addresses whose network has room under its current limit, and returns
-        them (never empty); the caller keeps the rest for a later claim. None on a stop."""
+        them; the caller keeps the rest for a later claim. None on a stop. Empty when every address was due and free
+        but its network stayed full or held for ``max_wait`` seconds: nothing is claimed and no pause clock starts."""
         return self._claim(ips, extra, partial=True)
 
     def _claim(self, ips: list[str], extra: Callable[[float], bool] | None, partial: bool) -> list[str] | None:
         ticket = self.limiter.ticket() if self.limiter is not None else None
+        blocked_since: float | None = None      # when the networks first refused a claim that was otherwise ready
         try:
             while True:
                 if self._killed() or (self._stop is not None and self._stop.is_set()):
@@ -569,6 +597,12 @@ class ContactLedger:
                         self._busy.update(got)
                         return got
                     wait = max((self._due(ip) for ip in ips), default=now) - now if free and not due else _SLICE
+                    if partial and self.limiter is not None and self.max_wait is not None and free and due:
+                        if blocked_since is None:
+                            blocked_since = now
+                        if now - blocked_since >= self.max_wait:
+                            return []
+                        wait = min(wait, max(blocked_since + self.max_wait - now, 0.01))
                 _nap(min(_SLICE, max(wait, 0.01)), self._sleep, self._stop)
         finally:
             if self.limiter is not None:
@@ -600,7 +634,8 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
                   run_batch: Callable[[list[T]], Any], *, batch_size: int, workers: int = 1,
                   extra: Callable[[list[T]], Callable[[float], bool] | None] | None = None,
                   group_of: Callable[[T], Any] | None = None,
-                  reuse: Callable[[list[T]], Any] | None = None) -> list[Any]:
+                  reuse: Callable[[list[T]], Any] | None = None,
+                  on_skip: Callable[[list[T]], Any] | None = None) -> list[Any]:
     """Like ``paced_rounds`` but each batch waits only for its own addresses, and up to ``workers`` run at once.
 
     Batches are the rounds of ``split_rounds`` cut into ``batch_size`` pieces, so their composition never depends
@@ -610,6 +645,10 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
     ``group_of`` keeps every batch within one group (the port, for ZGrab2): the groups are batched one after the other
     in ascending order. ``reuse(batch)`` returns the stored result of a batch that was already run by an earlier
     attempt, or None; such a batch contacts nothing, so it neither claims its addresses nor starts the pause clock.
+
+    A batch whose networks stay full or held for the ledger's ``max_wait`` is put back at the end of the queue once.
+    If it is still refused after that, it is not run: ``on_skip(batch)`` is called with its targets and its addresses
+    keep their pause clocks untouched.
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -628,7 +667,7 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
         return []
     results: dict[tuple[int, int], Any] = {}        # (batch, part) -> result; a batch cut by back-off runs in parts
     take = threading.Lock()
-    pending = deque((i, 0, batch) for i, batch in enumerate(batches))
+    pending = deque((i, 0, batch, False) for i, batch in enumerate(batches))       # (batch, part, targets, deferred once)
     failed = threading.Event()        # one batch raised: start nothing new, let the error reach the stage
 
     def worker() -> None:
@@ -636,7 +675,7 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
             with take:
                 if not pending:
                     return
-                i, part, batch = pending.popleft()
+                i, part, batch, deferred = pending.popleft()
             if part == 0 and reuse is not None:
                 kept = reuse(batch)
                 if kept is not None:
@@ -649,6 +688,13 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
                 got = ledger.claim_some(ips, extra(batch) if extra else None)
             if got is None:
                 return
+            if not got:                     # the networks stayed busy for the whole wait
+                if not deferred:
+                    with take:
+                        pending.append((i, part, batch, True))
+                elif on_skip is not None:
+                    on_skip(batch)
+                continue
             if len(got) < len(ips):         # the network's limit fell: run what fits now, the rest when there is room
                 rest = list(got)
                 head, tail = [], []
@@ -660,7 +706,7 @@ def paced_batches(items: list[T], ip_of: Callable[[T], str], ledger: ContactLedg
                     else:
                         tail.append(t)
                 with take:
-                    pending.appendleft((i, part + 1, tail))
+                    pending.appendleft((i, part + 1, tail, deferred))
                 batch, ips = head, got
             try:
                 results[(i, part)] = run_batch(batch)

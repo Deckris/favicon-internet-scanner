@@ -158,7 +158,7 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
                 cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), {(j["ip"], j["port"]) for j in jobs},
                 exclusions=exclusions, killed=st.killed, state_path=run_dir / "offhost_state.json",
                 pacer=pacing.IpPacer(cfg.measurement.min_seconds_between_probes_per_ip, st.killed, poll=2.0,
-                                      limiter=pacing.SubnetLimiter(cfg.measurement.max_connections_per_subnet)))
+                                      limiter=pacing.limiter_for(cfg.measurement), max_wait=cfg.measurement.subnet_wait_max_seconds))
             deadline = time.monotonic() + favicon_stage_seconds(cfg, len(jobs))
 
             def stop() -> bool:
@@ -189,7 +189,7 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
     compare = {"same_hash": 0, "different_hash": 0, "lost_image": 0, "new_image": 0}
     for rec in records:
         old = previous.get((rec.get("ip"), rec.get("port"), rec.get("hostname")))
-        if old is None or rec.get("favicon_outcome") == "skipped_kill_switch":
+        if old is None or rec.get("favicon_outcome") in ("skipped_kill_switch", "skipped_network_busy"):
             continue
         was, now = old["outcome"] == "image", bool(rec.get("favicon_is_image"))
         if was and now:
