@@ -242,8 +242,11 @@ def resolve_resources(s: dict[str, Any], cli: dict[str, Any] | None = None) -> t
     scope = s.get("scope", {})
     if not isinstance(section, dict):
         raise SettingsError("`resources` must hold cores, memory_gb and max_open_files")
-    resources = prof.detect(cli.get("cores", section.get("cores")), cli.get("memory_gb", section.get("memory_gb")),
-                            cli.get("max_open_files", section.get("max_open_files")))
+    try:
+        resources = prof.detect(cli.get("cores", section.get("cores")), cli.get("memory_gb", section.get("memory_gb")),
+                                cli.get("max_open_files", section.get("max_open_files")))
+    except ValueError as exc:
+        raise SettingsError(f"resources: {exc}") from exc
     overrides: dict[str, Any] = {}
     for key in prof.OVERRIDE_KEYS:
         value = cli.get(key, scope.get(key))
@@ -329,6 +332,10 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
         raise SettingsError("host.egress_check must be auto, nic, url or off")
     offhost = bool(scope.get("offhost_icons", False))
     resources, plan = derived_plan(s, cli)
+    if not prof.fits_open_files(plan, resources.open_files):
+        raise SettingsError(f"the plan needs {prof.file_demand(plan)} open descriptors but only "
+                            f"{int(prof.OPEN_FILE_FRACTION * resources.open_files)} of the limit of {resources.open_files} may be used; "
+                            "lower the concurrency settings or raise the open-file limit")
     overlap = plan["overlap_tls_with_zmap"]
     workers, processes = plan["favicon_workers"], plan["favicon_processes"]
     if isinstance(processes, bool) or not isinstance(processes, int) or not 1 <= processes <= 64:

@@ -186,3 +186,59 @@ def test_preflight_fails_when_the_plan_cannot_fit_the_open_files(tmp_path):
     def status(report):
         return {c["name"]: c["status"] for c in report["checks"]}["plan_fits_open_files"]
     assert status(few) == "fail" and status(many) == "pass"
+
+
+@pytest.mark.parametrize("kwargs", [{"cores": 0}, {"cores": -2}, {"memory_gb": 0}, {"memory_gb": -1.5}, {"open_files": 0},
+                                    {"open_files": -1}, {"cores": "many"}, {"cores": True}, {"memory_gb": float("nan")}])
+def test_detect_refuses_values_that_are_not_positive_numbers(kwargs):
+    with pytest.raises(ValueError):
+        prof.detect(**kwargs)
+
+
+def test_settings_resources_that_are_not_positive_are_refused_by_apply(tmp_path):
+    path = _workdir(tmp_path)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    for bad in (0, -4, "lots", True):
+        data["resources"] = {"cores": bad, "memory_gb": 8, "max_open_files": 65536}
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        with pytest.raises(st.SettingsError, match="cores"):
+            st.apply(tmp_path)
+
+
+def test_flags_that_are_not_positive_are_refused_by_the_parser(capsys):
+    for flag, value in (("--cores", "0"), ("--memory-gb", "-1"), ("--max-open-files", "0")):
+        with pytest.raises(SystemExit):
+            main(["plan", "--config", "x.yaml", flag, value])
+    assert "above zero" in capsys.readouterr().err
+
+
+def test_apply_refuses_a_plan_that_exceeds_the_descriptor_budget(tmp_path):
+    _workdir(tmp_path, "--cores", "8", "--memory-gb", "32", "--max-open-files", "65536")
+    with pytest.raises(st.SettingsError, match="open descriptors"):
+        st.apply(tmp_path, {"zgrab_senders": 1000, "zgrab_parallel_batches": 64, "max_open_files": 4096})
+
+
+def test_cgroup_limits_lower_the_detected_resources(tmp_path):
+    v2 = tmp_path / "v2"
+    v2.mkdir()
+    (v2 / "cpu.max").write_text("150000 100000\n")
+    (v2 / "memory.max").write_text(str(4 * GB) + "\n")
+    assert prof.cgroup_cpu_limit(v2) == 1.5 and prof.detect_cores(v2) <= 2
+    assert prof.cgroup_memory_limit_gb(v2) == 4.0
+    assert prof.detect_memory_gb(tmp_path / "no-meminfo", v2) == 4.0
+    free = tmp_path / "free"
+    free.mkdir()
+    (free / "cpu.max").write_text("max 100000\n")
+    (free / "memory.max").write_text("max\n")
+    assert prof.cgroup_cpu_limit(free) is None and prof.cgroup_memory_limit_gb(free) is None
+    v1 = tmp_path / "v1"
+    (v1 / "cpu").mkdir(parents=True)
+    (v1 / "memory").mkdir()
+    (v1 / "cpu" / "cpu.cfs_quota_us").write_text("200000\n")
+    (v1 / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    (v1 / "memory" / "memory.limit_in_bytes").write_text(str(2 * GB) + "\n")
+    assert prof.cgroup_cpu_limit(v1) == 2.0 and prof.cgroup_memory_limit_gb(v1) == 2.0
+    (v1 / "memory" / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+    (v1 / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+    assert prof.cgroup_cpu_limit(v1) is None and prof.cgroup_memory_limit_gb(v1) is None
+    assert prof.cgroup_cpu_limit(tmp_path / "missing") is None

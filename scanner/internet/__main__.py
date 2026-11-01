@@ -113,6 +113,26 @@ def _settings_command(args) -> int:
         return 2
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"`{text}` is not a whole number") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"`{text}` must be above zero")
+    return value
+
+
+def _positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"`{text}` is not a number") from None
+    if not value > 0 or value == float("inf"):
+        raise argparse.ArgumentTypeError(f"`{text}` must be above zero")
+    return value
+
+
 PROFILE_FLAGS = ("cores", "memory_gb", "max_open_files", "zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size",
                  "dns_threads", "favicon_workers", "favicon_processes", "favicon_max_active_requests",
                  "favicon_stage_max_seconds", "overlap_tls_with_zmap")
@@ -224,9 +244,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Resource profile: what the host offers, and explicit concurrency settings. An explicit value always wins over
     # the one derived from the host. init and apply use them to write config.yaml; plan and preflight check against them.
-    ap.add_argument("--cores", type=int, help="init, apply, plan, preflight: CPU cores to plan for (default: detected)")
-    ap.add_argument("--memory-gb", type=float, help="init, apply, plan, preflight: RAM to plan for, in GiB (default: detected)")
-    ap.add_argument("--max-open-files", type=int, help="init, apply, plan, preflight: open-file limit to plan for (default: detected)")
+    ap.add_argument("--cores", type=_positive_int, help="init, apply, plan, preflight: CPU cores to plan for (default: detected)")
+    ap.add_argument("--memory-gb", type=_positive_float, help="init, apply, plan, preflight: RAM to plan for, in GiB (default: detected)")
+    ap.add_argument("--max-open-files", type=_positive_int, help="init, apply, plan, preflight: open-file limit to plan for (default: detected)")
     ap.add_argument("--zgrab-senders", type=int, help="init, apply: ZGrab2 connections per process (1-1000)")
     ap.add_argument("--zgrab-parallel-batches", type=int, help="init, apply: ZGrab2 processes at once (1-64)")
     ap.add_argument("--zgrab-batch-size", type=int, help="init, apply: addresses per ZGrab2 batch (1-100000)")
