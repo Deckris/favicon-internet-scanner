@@ -49,6 +49,7 @@ scope:
   rate_pps: {rate_pps}              # ZMap packets per second
   min_seconds_between_probes_per_ip: {pace}   # pause between any two requests to the same address
   overlap_tls_with_zmap: {overlap}   # auto | true | false. true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
+  # max_connections_per_subnet: 4   # connections open at once to one /24 (IPv6 /48), 1 to 64; backs off on timeouts, 429 and 503
   dns_resolver: {dns_resolver}      # resolver for PTR and name checks; it sees every scanned address
   # Concurrency follows the cores, RAM and open-file limit of the host (see `scanner plan`). Set any of these to
   # fix it instead; a value set here always wins over the derived one, and a command-line flag wins over both.
@@ -310,6 +311,9 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
     overlap = scope.get("overlap_tls_with_zmap", "auto")
     if not isinstance(overlap, bool) and str(overlap).strip().lower() != "auto":
         raise SettingsError("scope.overlap_tls_with_zmap must be auto, true or false")
+    subnet_cap = scope.get("max_connections_per_subnet")
+    if subnet_cap is not None and (not isinstance(subnet_cap, int) or isinstance(subnet_cap, bool) or not 1 <= subnet_cap <= 64):
+        raise SettingsError("scope.max_connections_per_subnet must be a whole number from 1 to 64")
     if appr["status"] not in ("blocked", "approved"):
         raise SettingsError("approval.status must be `blocked` or `approved`")
     excl_path = _resolve(workdir, scope["exclusions_file"])
@@ -350,6 +354,8 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
     m.update(ports=[int(p) for p in scope["ports"]], zmap_rate=int(rate), zmap_probes=probes, zmap_max_runtime=runtime,
              min_seconds_between_probes_per_ip=pace, overlap_tls_with_zmap=overlap, zgrab_senders=plan["zgrab_senders"],
              zgrab_parallel_batches=plan["zgrab_parallel_batches"], zgrab_batch_size=plan["zgrab_batch_size"])
+    if subnet_cap is not None:
+        m["max_connections_per_subnet"] = subnet_cap
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     base["dns"]["threads"] = plan["dns_threads"]

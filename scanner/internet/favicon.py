@@ -29,7 +29,7 @@ from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.internet import outputs
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from scanner.internet.icon_store import IconStore
-from scanner.internet.pacing import IpPacer
+from scanner.internet.pacing import IpPacer, SubnetLimiter
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
 from scanner.favicon_discovery import parse_icon_declarations
@@ -151,14 +151,20 @@ class GuardedFetcher(WebFetcher):
             return self._outcome("policy_refused", connect_ip, hostname, port, parts.scheme)
         if self.pacer is not None and not self.pacer.wait(connect_ip):
             return self._outcome("skipped_kill_switch", connect_ip, hostname, port, parts.scheme)
+        result = None
         try:
             if self._active is None:
-                return super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+                result = super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+                return result
             with self._active:
-                return super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+                result = super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+                return result
         except Exception as exc:       # zlib.error / brotli.error / anything a hostile body provokes
             return self._outcome("decode_error" if "error" in type(exc).__name__.lower() else "fetch_error",
                                  connect_ip, hostname, port, parts.scheme)
+        finally:
+            if self.pacer is not None and hasattr(self.pacer, "done"):
+                self.pacer.done(connect_ip, result)      # frees the network slot taken by wait()
 
 
 OFFHOST_PORTS = (80, 443)
@@ -845,7 +851,8 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
             conn.send(message)
     try:
         stopped = stop.is_set
-        pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0)
+        limiter = SubnetLimiter(settings["subnet_cap"]) if settings.get("subnet_cap") else None
+        pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0, limiter=limiter)
         store = IconStore(store_root) if store_root is not None else None
         run_favicon_stage(factory(pacer, frozenset(j["ip"] for j in jobs), stopped), jobs, workers=settings["workers"],
                           max_icons=settings["max_icons"], killed=stopped, icon_store=store, selection=settings["selection"],
@@ -866,7 +873,7 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                                 max_document_bytes: int = 0, on_record: Any = None,
                                 done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None,
                                 grace: float = STOP_GRACE_SECONDS, record_sink: Any = None,
-                                on_failure: Any = None) -> list[dict[str, Any]]:
+                                on_failure: Any = None, subnet_cap: int = 0) -> list[dict[str, Any]]:
     """Like ``run_favicon_stage`` but over ``processes`` worker processes; one record per job, original order.
 
     ``factory(pacer, owned, killed)`` returns the fetcher (``owned``: the addresses of the process) and must be
@@ -921,7 +928,8 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     ctx = multiprocessing.get_context("spawn")
     stop = SharedFlag(ctx)
     settings = {"pace": pace, "workers": split_cap(workers, len(parts)), "max_icons": max_icons, "selection": selection,
-                "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace}
+                "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace,
+                "subnet_cap": max(1, subnet_cap // len(parts)) if subnet_cap else 0}      # the cap is split over the processes
     procs, conns, sends = [], [], []
     for i, indexes in enumerate(parts):
         recv_end, send_end = ctx.Pipe(duplex=False)

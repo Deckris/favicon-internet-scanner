@@ -154,6 +154,8 @@ CREATE INDEX IF NOT EXISTS endpoints_num ON endpoints (ipnum, ip);
 CREATE TABLE IF NOT EXISTS synack (ip TEXT NOT NULL, port INTEGER NOT NULL, window INTEGER, ttl INTEGER,
     PRIMARY KEY (ip, port)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS synack_window ON synack (window);
+CREATE TABLE IF NOT EXISTS tarpit_ips (ip TEXT NOT NULL, port INTEGER NOT NULL, signal TEXT NOT NULL, window INTEGER NOT NULL,
+    PRIMARY KEY (ip, port)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS tls_direct (ip TEXT NOT NULL, port INTEGER NOT NULL, outcome TEXT, data TEXT NOT NULL,
     PRIMARY KEY (ip, port)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS http_res (ip TEXT NOT NULL, port INTEGER NOT NULL, data TEXT NOT NULL,
@@ -179,6 +181,7 @@ CREATE TABLE IF NOT EXISTS ip_results (ipnum INTEGER NOT NULL, ip TEXT NOT NULL,
 _SQL = {
     "endpoints": "INSERT OR IGNORE INTO endpoints (ip, port, ipnum) VALUES (?,?,?)",
     "synack": "INSERT OR REPLACE INTO synack (ip, port, window, ttl) VALUES (?,?,?,?)",
+    "tarpit_ips": "INSERT OR REPLACE INTO tarpit_ips (ip, port, signal, window) VALUES (?,?,?,?)",
     "tls_direct": "INSERT OR REPLACE INTO tls_direct (ip, port, outcome, data) VALUES (?,?,?,?)",
     "http_res": "INSERT OR REPLACE INTO http_res (ip, port, data) VALUES (?,?,?)",
     "ptr": "INSERT OR REPLACE INTO ptr (ip, data) VALUES (?,?)",
@@ -461,6 +464,38 @@ class ShardStore:
         """Addresses with a SYN-ACK window below the threshold on any port (the old ``tarpits()``)."""
         return {r[0] for r in self._query("SELECT DISTINCT ip FROM synack WHERE window IS NOT NULL AND window < ?",
                                           (tiny_window_below,))}
+
+    def flag_tarpits(self, tiny_window_below: int, ips: Iterable[str] | None = None) -> set[str]:
+        """Apply the window test and record each offending (address, port) with its reason in ``tarpit_ips``.
+
+        With ``ips`` only those addresses are looked at, by their key in ``synack``: the incremental form, called as
+        each port's SYN-ACKs are ingested. Without it the whole table is tested through the window index (the
+        re-check after the sweeps). Returns the addresses flagged by this call; ``rejected_ips`` returns all of them.
+        """
+        if ips is None:
+            rows = self._query("SELECT ip, port, window FROM synack WHERE window < ?", (tiny_window_below,))
+        else:
+            rows = self._query_in("SELECT ip, port, window FROM synack WHERE window < ? AND ip IN ({})",
+                                  sorted({_ip(i) for i in ips}), prefix=(tiny_window_below,))
+        self._add_many("tarpit_ips", [(ip, port, "zero_window" if window == 0 else "tiny_window", window) for ip, port, window in rows])
+        return {r[0] for r in rows}
+
+    def rejected_ips(self) -> set[str]:
+        """Addresses flagged so far by ``flag_tarpits``."""
+        return {r[0] for r in self._query("SELECT DISTINCT ip FROM tarpit_ips")}
+
+    def iter_tarpit_rejections(self) -> Iterator[tuple[str, list[tuple[int, str, int]]]]:
+        """(address, [(port, signal, window)]) for every rejected address, in address order."""
+        current: str | None = None
+        group: list[tuple[int, str, int]] = []
+        for ip, port, signal, window in self._query("SELECT ip, port, signal, window FROM tarpit_ips ORDER BY ip, port"):
+            if ip != current and current is not None:
+                yield current, group
+                group = []
+            current = ip
+            group.append((port, signal, window))
+        if current is not None:
+            yield current, group
 
     # -------------------------------------------------------------- direct-IP TLS
 

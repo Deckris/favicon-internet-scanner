@@ -519,7 +519,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             return None
         return st.run(name, fn, None)
     gap = pacing.Gap(pace, killed, stop_event=st.stop)             # pause between ZMap port runs
-    ledger = pacing.ContactLedger(pace, killed, stop_event=st.stop)    # last contact per address, shared by every target-facing step
+    limiter = pacing.SubnetLimiter(cfg.measurement.max_connections_per_subnet)     # simultaneous connections per /24, all stages
+    ledger = pacing.ContactLedger(pace, killed, stop_event=st.stop, limiter=limiter)    # last contact per address, shared by every target-facing step
     gateway_mac = cfg.vantage.gateway_mac or report.get("gateway_mac")
     # Stub manifest before the first probe: if the process is killed hard (OOM, WSL shutdown) the run still
     # leaves evidence of what was started and the run-once guard still sees it.
@@ -645,7 +646,10 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             ips = sorted({r.target_ip for r in res})
             store.put_endpoints((ip, port) for ip in ips)
             try:
-                store.put_synack_port(port, enrich.parse_synack_csv((run_dir / job.raw_path).read_text(encoding="utf-8", errors="replace")))
+                synacks = enrich.parse_synack_csv((run_dir / job.raw_path).read_text(encoding="utf-8", errors="replace"))
+                store.put_synack_port(port, synacks)
+                if gate:       # overlapped TLS must not reach an address this port's SYN-ACK has just flagged
+                    st.guard("store:flag_tarpits", lambda: store.flag_tarpits(tiny, synacks))
             except OSError:
                 pass
             new = store.mark_ptr_sent(ips)
@@ -664,6 +668,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             batch_jobs, results = tlsmod.run_tls_batches(batch, mode="direct_ip", cfg=cfgview, policy=policy, run_dir=run_dir,
                                                          binary=cfg.binaries.zgrab2, executor=executor, timeout=timeout)
             store.put_tls_many(results)
+            ledger.observe(results)
             st.progress()
             return batch_jobs
         return one
@@ -689,7 +694,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 st.skipped.append(f"tls_direct:{port}")
                 continue
             # Tarpits seen on the ports swept so far are left alone; one flagged only on a later port is counted below.
-            skip = store.tarpit_ips(tiny)
+            skip = store.rejected_ips()
             # ZMap's own order: neighbours in a batch become due together
             items = sorted(((ip, port, None) for ip, _ in store.iter_endpoints(port) if ip not in skip),
                            key=lambda t: (send_order.get(t[0], 1 << 62), t[0]))
@@ -724,7 +729,10 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     # An address whose SYN-ACK advertises a zero or tiny TCP window is a tarpit: it holds connections open on purpose.
     # It stays in the results (flagged) but receives nothing beyond the ZMap SYN.
     # If the list cannot be read it stays None, and nothing more is sent to the sampled addresses on the strength of it.
-    tarpit_ips = st.guard("store:tarpit_ips", lambda: store.tarpit_ips(tiny))
+    def recheck_tarpits() -> set[str]:
+        store.flag_tarpits(tiny)                     # the whole table, whatever the incremental calls saw
+        return store.rejected_ips()
+    tarpit_ips = st.guard("store:tarpit_ips", recheck_tarpits)
     counts["tarpit_ips_not_probed"] = 0 if tarpit_ips is None else st.guard(
         "store:iter_ip_names", lambda: sum(1 for ip in store.iter_ip_names() if ip in tarpit_ips), 0)
     counts["sample_targets_per_port"] = splan.targets_per_port
@@ -758,6 +766,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                                                     run_dir=run_dir, executor=executor,
                                                     document_sink=keep_document if cfg.favicon.enabled and cfg.favicon.reuse_http_document else None)
             store.put_http_many(results)
+            ledger.observe(results)
             st.progress()
             return batch_jobs
         for batch_jobs in pacing.paced_batches(targets, lambda t: t.ip, ledger, one, batch_size=m.zgrab_batch_size,
@@ -847,6 +856,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             for r in results:
                 if r.ip and r.sni:
                     store.put_sni(r)
+            ledger.observe(results)
             st.progress()
             return batch_jobs
         for batch_jobs in pacing.paced_batches(targets, lambda t: t[0], ledger, one, batch_size=m.zgrab_batch_size,
@@ -906,7 +916,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 cfg, sorted(job_ips), job_endpoints, max_active_requests=fav.split_cap(cfg.favicon.max_active_requests, cfg.favicon.processes))
             f = None
         else:
-            pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0)     # pause between HTTP requests to one address
+            pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter)     # pause between HTTP requests to one address
             f = fetcher or fav.make_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
                                             job_endpoints, exclusions=exclusions, killed=stop,
                                             state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json", pacer=pacer)
@@ -934,6 +944,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             if parallel:
                 worker_failures: list[tuple[str, int]] = []
                 fav.run_favicon_stage_processes(factory, fjobs, processes=cfg.favicon.processes, pace=pace,
+                                                subnet_cap=cfg.measurement.max_connections_per_subnet,
                                                 on_failure=lambda why, lost: worker_failures.append((why, lost)), **common)
                 if worker_failures:
                     lost = sum(n for _, n in worker_failures)
@@ -1016,6 +1027,10 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         if cfg.favicon.offhost.enabled:
             checksums["normalized/offhost_icon_fetches.jsonl"] = write_jsonl(normalized / "offhost_icon_fetches.jsonl", offhost_log)
         checksums["normalized/policy_refusals.jsonl"] = write_jsonl(normalized / "policy_refusals.jsonl", [r.as_dict() for r in policy.refusals])
+        if tarpit_ips:
+            checksums["normalized/tarpit_rejections.jsonl"] = write_jsonl(
+                normalized / "tarpit_rejections.jsonl",
+                [enrich.tarpit_rejection(ip, hits, tiny) for ip, hits in store.iter_tarpit_rejections()])
     except Exception as exc:
         st.errors["write_outputs"] = f"{type(exc).__name__}: {exc}"[:500]
     st.guard("store_close", store.close)          # the final flush; what it or any earlier write lost is counted, not hidden

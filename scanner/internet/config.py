@@ -250,6 +250,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         "ports", "zmap_rate", "zmap_max_runtime", "zmap_cooldown", "zmap_probes",
         "zgrab_connect_timeout", "zgrab_target_timeout", "zgrab_senders", "zgrab_batch_size"}
     m = _section(raw, "measurement", measurement_keys | {"zmap_version", "min_seconds_between_probes_per_ip", "zgrab_parallel_batches",
+                                                         "max_connections_per_subnet",
                                                          "overlap_tls_with_zmap"}, measurement_keys)
     zmap_version = str(m.get("zmap_version", "2.1.1"))
     if not supported(zmap_version):
@@ -278,6 +279,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
                                                  "measurement.min_seconds_between_probes_per_ip", 0, 3600),
         # ZGrab2 processes run at once on different addresses; the per-address pause still holds.
         zgrab_parallel_batches=_int(m.get("zgrab_parallel_batches", 1), "measurement.zgrab_parallel_batches", 1, 64),
+        # Connections open at once to one /24 (IPv6: /48), over all stages of a process. Back-off can only lower it.
+        max_connections_per_subnet=_int(m.get("max_connections_per_subnet", 4), "measurement.max_connections_per_subnet", 1, 64),
         # Start direct-IP TLS while ZMap sweeps the remaining ports. Outbound traffic is then the ZMap rate plus
         # the concurrent ZGrab2 connections; the approval rate still caps ZMap alone.
         overlap_tls_with_zmap=_bool(m.get("overlap_tls_with_zmap", False), "measurement.overlap_tls_with_zmap"),
