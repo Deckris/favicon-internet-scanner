@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from pipeline.favicon_hash import fingerprint as default_fingerprint
 from scanner.favicon_discovery import FAVICON_POLICY, decode_data_uri, parse_icon_declarations, rank_icon_declarations
+from scanner.icon_selection import MODELS, RULE_VERSION, IconCandidate, attempt_order, desktop_candidates
 from scanner.models import FaviconDeclaration, FaviconResource
 
 
@@ -81,7 +82,7 @@ def _decode_resource(data_uri: str, order: int, *, fingerprint, on_icon=None) ->
     )
 
 
-SELECTION_MODES = ("all", "first_image", "browser")
+SELECTION_MODES = ("all", "first_image", "browser", "browser_models")
 FALLBACK_MODES = ("always_if_no_image", "only_if_undeclared")
 
 
@@ -97,6 +98,7 @@ def acquire_favicons(
     selection: str = "all",
     fallback: str = "always_if_no_image",
     declarations: list[FaviconDeclaration] | None = None,
+    report: dict | None = None,
 ) -> tuple[list[FaviconDeclaration], list[FaviconResource]]:
     """``selection``: ``all`` fetches every selected declaration in page order; ``first_image`` does the same but
     stops after the first icon that decodes to an image; ``browser`` tries the declarations in browser order
@@ -104,6 +106,10 @@ def acquire_favicons(
     probes ``/favicon.ico`` whenever no icon decoded; ``only_if_undeclared`` probes it only when the page declared
     no icon to try. Every declaration is returned whichever icons were fetched. ``declarations`` supplies the
     parsed declarations of a page that was fetched earlier; ``html`` is then not parsed again.
+
+    ``browser_models`` walks the ranking of each model in ``scanner.icon_selection`` (Chromium first), fetching an
+    icon once however many models rank it, until the model has an image or runs out of candidates to try. When
+    ``report`` is a dict it is filled with the rule version, the icon each model ended up with and whether they differ.
     """
     if selection not in SELECTION_MODES:
         raise ValueError(f"unknown icon selection {selection!r}")
@@ -120,9 +126,8 @@ def acquire_favicons(
     selected = [decl for decl in declarations if decl.policy_status == "selected"]
     if selection == "browser":
         selected = rank_icon_declarations(selected)
-    for decl in selected:
-        if selection != "all" and any(_resource_has_image(resource) for resource in resources):
-            break
+
+    def acquire(decl: FaviconDeclaration) -> FaviconResource:
         assert decl.resolved_url is not None
         if decl.kind == "data":
             resource = _decode_resource(decl.resolved_url, decl.order, fingerprint=fingerprint, on_icon=on_icon)
@@ -130,6 +135,34 @@ def acquire_favicons(
             resource = _fetch_resource(decl.resolved_url, decl.order, page_url=page_url, connect_ip=connect_ip, fetcher=fetcher, fingerprint=fingerprint, on_icon=on_icon)
         index_by_url[decl.resolved_url] = len(resources)
         resources.append(resource)
+        return resource
+
+    if selection == "browser_models":
+        by_order = {decl.order: decl for decl in selected}
+        candidates = [IconCandidate.from_declaration(decl) for decl in selected]
+        chosen: dict[str, str | None] = {}
+        for model in MODELS:
+            chosen[model] = None
+            for cand in attempt_order(model, candidates):
+                decl = by_order[cand.order]
+                assert decl.resolved_url is not None
+                if decl.resolved_url in index_by_url:
+                    resource = resources[index_by_url[decl.resolved_url]]
+                else:
+                    resource = acquire(decl)
+                if _resource_has_image(resource):
+                    chosen[model] = decl.resolved_url
+                    break
+        if report is not None:
+            report.update(rule_version=RULE_VERSION, chosen=chosen, differ=len(set(chosen.values())) > 1)
+        # what a desktop tab can use decides whether the page declared an icon at all
+        desktop_orders = {c.order for c in desktop_candidates(candidates)}
+        selected = [decl for decl in selected if decl.order in desktop_orders]
+    else:
+        for decl in selected:
+            if selection != "all" and any(_resource_has_image(resource) for resource in resources):
+                break
+            acquire(decl)
     for decl in declarations:
         if decl.policy_status == "duplicate" and decl.resolved_url in index_by_url:
             idx = index_by_url[decl.resolved_url]
