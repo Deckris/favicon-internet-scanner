@@ -34,6 +34,18 @@ def parse_synack_csv(text: str) -> dict[str, dict[str, int | None]]:
     return out
 
 
+def tarpit_rejection(ip: str, hits: list[tuple[int, str, int]], tiny_window_below: int) -> dict[str, Any]:
+    """The record of one address left unprobed on the window signal: ``hits`` are (port, signal, window) rows."""
+    signals = sorted({signal for _, signal, _ in hits})
+    reasons = []
+    if "zero_window" in signals:
+        reasons.append("SYN-ACK advertised a zero TCP window")
+    if "tiny_window" in signals:
+        reasons.append(f"SYN-ACK window below {tiny_window_below} bytes")
+    return {"ip": ip, "signals": signals, "reason": "; ".join(reasons), "tiny_window_below": tiny_window_below,
+            "ports": [{"port": port, "window": window} for port, _, window in hits], "probed": False}
+
+
 def tarpit_assessment(endpoints: list[dict[str, Any]], scanned_port_count: int, min_open_ports: int,
                       tiny_window_below: int = 246) -> dict[str, Any]:
     """Judge ONE address from what we already hold for each of its open endpoints.

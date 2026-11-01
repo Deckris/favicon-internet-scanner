@@ -4,6 +4,7 @@ manifest.json
 normalized/endpoints.jsonl
 normalized/hostname_resolution.jsonl
 normalized/policy_refusals.jsonl
+normalized/tarpit_rejections.jsonl
 normalized/tool_jobs.jsonl
 preflight.json
 raw/zdns/ZDNS-dd2f0c13a4b08dce.jsonl.zst

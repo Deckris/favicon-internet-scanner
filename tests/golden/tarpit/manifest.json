@@ -29,6 +29,7 @@
     "normalized/endpoints.jsonl": "50a41d4b67a7f7f8393bf557d84311e7d23f5bd2dd9495cc8c5482943804f399",
     "normalized/hostname_resolution.jsonl": "eeb0a10c84be1ef71cd59826ef8e4e0d6af48047936463450a749547c86a3c68",
     "normalized/policy_refusals.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "normalized/tarpit_rejections.jsonl": "567a57ac994bd19fc80fefb9f009911a26cdda9f650b38caf720e890fea30a3f",
     "raw/zdns/ZDNS-dd2f0c13a4b08dce.jsonl.zst": "b16428c43f6771f571eb9d27dffdef808f59057899569c992c96876bf33d65fe",
     "raw/zgrab/ZGRAB-5ab06d7e41ff4f8d.jsonl.zst": "e1dc9b579384b6c26b813bad351d96c66a19cdca4316129d48a51d027a14fd4f",
     "raw/zgrab/ZGRAB-ab558a0d16128765.jsonl.zst": "87260812215fa31abe444dda6dd7987b6e391b192a163a4a767a3102738c1787",
