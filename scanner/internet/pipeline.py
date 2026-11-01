@@ -926,9 +926,20 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                           selection=cfg.favicon.icon_selection, fallback=cfg.favicon.fallback,
                           documents=http_docs, max_document_bytes=cfg.fetch.max_document_bytes, record_sink=sink)
             if parallel:
-                fav.run_favicon_stage_processes(factory, fjobs, processes=cfg.favicon.processes, pace=pace, **common)
+                worker_failures: list[tuple[str, int]] = []
+                fav.run_favicon_stage_processes(factory, fjobs, processes=cfg.favicon.processes, pace=pace,
+                                                on_failure=lambda why, lost: worker_failures.append((why, lost)), **common)
+                if worker_failures:
+                    lost = sum(n for _, n in worker_failures)
+                    st.errors["favicon_workers"] = (f"{len(worker_failures)} favicon worker process(es) failed, {lost} of {len(fjobs)} lookups "
+                                                    f"lost; first: {worker_failures[0][0]}")[:500]
             else:
                 fav.run_favicon_stage(f, fjobs, **common)
+            # every job leaves exactly one record, whatever happened to it; fewer in the store means some were lost
+            expected = len({(j["ip"], j["port"], j.get("hostname")) for j in fjobs})
+            stored = store.count_favicons()
+            if stored < expected:
+                st.errors["favicon_records_missing"] = f"{stored} favicon records stored for {expected} lookups"
             skipped = store.count_favicon_outcome("skipped_kill_switch")
             if time.monotonic() > deadline and skipped:
                 st.errors["favicon_deadline"] = f"stage cap of {cfg.favicon.stage_max_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"

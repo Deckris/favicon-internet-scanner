@@ -6,7 +6,7 @@ redirect can never lead the run to a host outside the sample.
 """
 from __future__ import annotations
 
-import copy
+import dataclasses
 import hashlib
 import json
 import multiprocessing
@@ -17,6 +17,7 @@ import time
 from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from concurrent.futures import Future
 from urllib.parse import urlsplit
 from typing import Any
@@ -780,9 +781,8 @@ class FetcherFactory:
         sampled = [ip for ip in self.sampled_ips if owned is None or ip in owned]
         endpoints = {e for e in self.endpoints if owned is None or e[0] in owned}
         if self.max_active_requests is not None:
-            cfg = copy.copy(cfg)
-            cfg.favicon = copy.copy(cfg.favicon)
-            cfg.favicon.max_active_requests = self.max_active_requests
+            # the configuration is a frozen dataclass: the share of this process goes into a copy
+            cfg = dataclasses.replace(cfg, favicon=SimpleNamespace(**{**vars(cfg.favicon), "max_active_requests": self.max_active_requests}))
         return _make_local_fetcher(cfg, fetch_policy(cfg, sampled), RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
                                    endpoints, pacer, killed or (lambda: False))
 
@@ -831,7 +831,8 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                                 fallback: str = "always_if_no_image", documents: dict[tuple[str, int], dict[str, Any]] | None = None,
                                 max_document_bytes: int = 0, on_record: Any = None,
                                 done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None,
-                                grace: float = STOP_GRACE_SECONDS, record_sink: Any = None) -> list[dict[str, Any]]:
+                                grace: float = STOP_GRACE_SECONDS, record_sink: Any = None,
+                                on_failure: Any = None) -> list[dict[str, Any]]:
     """Like ``run_favicon_stage`` but over ``processes`` worker processes; one record per job, original order.
 
     ``factory(pacer, owned, killed)`` returns the fetcher (``owned``: the addresses of the process) and must be
@@ -846,7 +847,9 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
 
     ``killed`` is polled here and mirrored to the workers through an event, so a stop reaches every process within a
     poll; a process still running well after ``grace`` is terminated and its unfinished jobs recorded as skipped. A
-    process that dies or raises yields ``error`` records for its unfinished jobs.
+    process that dies or raises yields ``error`` records for its unfinished jobs, and ``on_failure(reason, jobs_lost)``
+    is called for it, so the caller can mark the stage as failed. Those error records are handed to ``record_sink``
+    but not to ``on_record``: they are not lookups, and a resumed attempt must repeat them.
     """
     if not jobs:
         return []
@@ -867,9 +870,14 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
 
     def settle_rest(indexes: list[int], why: str | None) -> None:
         """Records for the jobs of a partition that never reported: a stop skips them, a failure is an error."""
+        lost = 0
         for k in indexes:
             if k not in sunk:
-                deliver(k, prior_of(jobs[k]) or (_failed(jobs[k], why) if why else _skipped(jobs[k])))
+                prior = prior_of(jobs[k])
+                lost += prior is None
+                deliver(k, prior or (_failed(jobs[k], why) if why else _skipped(jobs[k])))
+        if why and lost and on_failure is not None:
+            on_failure(why, lost)
 
     if killed():
         settle_rest(list(range(len(jobs))), None)
