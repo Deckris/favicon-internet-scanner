@@ -17,6 +17,8 @@ from typing import Any
 
 import yaml
 
+from scanner.internet import profile as prof
+
 PLACEHOLDER = "REPLACE_ME"
 SETTINGS_NAME, CONFIG_NAME, APPROVAL_NAME = "settings.yaml", "config.yaml", "approval.yaml"
 MIN_PACE_SECONDS = 5.0                     # the shortest pause between two requests to one address that any approval may allow
@@ -46,9 +48,18 @@ scope:
   seed: {seed}
   rate_pps: {rate_pps}              # ZMap packets per second
   min_seconds_between_probes_per_ip: {pace}   # pause between any two requests to the same address
-  overlap_tls_with_zmap: {overlap}   # true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
+  overlap_tls_with_zmap: {overlap}   # auto | true | false. true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
   dns_resolver: {dns_resolver}      # resolver for PTR and name checks; it sees every scanned address
-  favicon_processes: 1              # worker processes sharing the favicon requests (one per core; not with offhost_icons)
+  # Concurrency follows the cores, RAM and open-file limit of the host (see `scanner plan`). Set any of these to
+  # fix it instead; a value set here always wins over the derived one, and a command-line flag wins over both.
+  # zgrab_senders: 500                # connections per ZGrab2 process (1-1000)
+  # zgrab_parallel_batches: 4         # ZGrab2 processes at once (1-64)
+  # zgrab_batch_size: 20000           # addresses per ZGrab2 batch (1-100000)
+  # dns_threads: 100                  # zdns threads (1-1000)
+  # favicon_workers: 256              # favicon worker threads in all (1-8192)
+  # favicon_processes: 4              # worker processes sharing the favicon requests (not with offhost_icons)
+  # favicon_max_active_requests: 512  # favicon requests on the wire at once (1-8192)
+  # favicon_stage_max_seconds: 86400  # time limit of the favicon stage (1-86400)
   try_unverified_names: false       # also request pages under certificate names that did not verify
   offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it)
 
@@ -61,6 +72,11 @@ approval:                           # copy these from the real approval; they ca
   min_seconds_between_probes_per_ip: {approval_pace}   # the approved pause between requests to one address; never below 5
   data_handling: {data_handling}    # where raw output is kept, who may read it, when it is deleted
 
+# resources:                          # optional; detected from the host when absent
+#   cores: 8
+#   memory_gb: 16
+#   max_open_files: 65536
+
 run:
   label: {label}
   output_dir: {output_dir}
@@ -72,7 +88,7 @@ DEFAULTS: dict[str, Any] = {
     "scanner_name": "research-scanner", "contact": PLACEHOLDER, "info_url": PLACEHOLDER, "incident_contact": '""',
     "public_ip": PLACEHOLDER, "source_ip": '""', "interface": "eth0", "egress_check": "auto", "gateway_mac": '""',
     "exclusions_file": "exclusions.txt", "ports": "[80, 443, 8080, 8090, 8443]", "sample_fraction": "0.000001",
-    "seed": "4", "rate_pps": "100", "pace": "5", "overlap": "false", "dns_resolver": PLACEHOLDER, "approval_status": "blocked",
+    "seed": "4", "rate_pps": "100", "pace": "5", "overlap": "auto", "dns_resolver": PLACEHOLDER, "approval_status": "blocked",
     "approval_reference": PLACEHOLDER, "valid_until": PLACEHOLDER, "max_rate_pps": "100", "max_fraction": "0.000001", "approval_pace": "5",
     "data_handling": PLACEHOLDER, "label": "pilot", "output_dir": "runs", "kill_switch": "STOP",
 }
@@ -101,9 +117,28 @@ def write_settings(workdir: Path, answers: dict[str, Any], *, force: bool = Fals
         if value is not None:
             values[key] = value
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = TEMPLATE.format(**{k: _scalar(k, v) for k, v in values.items()})
+    text = TEMPLATE.format(**{k: _scalar(k, v) for k, v in values.items() if k in DEFAULTS})
+    text = _with_profile_answers(text, answers)
     path.write_text(text, encoding="utf-8", newline="\n")
     return path
+
+
+def _with_profile_answers(text: str, answers: dict[str, Any]) -> str:
+    """Uncomment the concurrency and resource lines that the operator gave on the command line."""
+    for key in prof.OVERRIDE_KEYS:
+        value = answers.get(key)
+        if value is None:
+            continue
+        shown = str(value).lower() if isinstance(value, bool) else str(value)
+        pattern = re.compile(rf"^(\s*)(?:# )?{key}: [^#\n]*?(\s*#.*)?$", re.MULTILINE)
+        text = pattern.sub(lambda m: f"{m.group(1)}{key}: {shown}{m.group(2) or ''}", text, count=1)
+    for key in ("cores", "memory_gb", "max_open_files"):
+        value = answers.get(key)
+        if value is not None:
+            text = re.sub(rf"^#   {key}: .*$", f"  {key}: {value}", text, count=1, flags=re.MULTILINE)
+    if any(answers.get(k) is not None for k in ("cores", "memory_gb", "max_open_files")):
+        text = text.replace("# resources:", "resources:", 1)
+    return text
 
 
 def _scalar(key: str, value: Any) -> str:
@@ -199,8 +234,39 @@ def _header(source: str) -> str:
             f"# Source: {source}\n")
 
 
-def apply(workdir: Path) -> dict[str, Any]:
-    """Validate settings.yaml and write config.yaml and approval.yaml. Returns a summary."""
+def resolve_resources(s: dict[str, Any], cli: dict[str, Any] | None = None) -> tuple[prof.Resources, dict[str, Any]]:
+    """The host resources and the explicit overrides: command-line flags over settings.yaml over detection."""
+    cli = {k: v for k, v in (cli or {}).items() if v is not None}
+    section = s.get("resources") or {}
+    scope = s.get("scope", {})
+    if not isinstance(section, dict):
+        raise SettingsError("`resources` must hold cores, memory_gb and max_open_files")
+    resources = prof.detect(cli.get("cores", section.get("cores")), cli.get("memory_gb", section.get("memory_gb")),
+                            cli.get("max_open_files", section.get("max_open_files")))
+    overrides: dict[str, Any] = {}
+    for key in prof.OVERRIDE_KEYS:
+        value = cli.get(key, scope.get(key))
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            value = None
+        overrides[key] = value
+    return resources, overrides
+
+
+def derived_plan(s: dict[str, Any], cli: dict[str, Any] | None = None) -> tuple[prof.Resources, dict[str, Any]]:
+    resources, overrides = resolve_resources(s, cli)
+    try:
+        plan = prof.derive(resources.cores, resources.memory_gb, resources.open_files,
+                           offhost_icons=bool(s.get("scope", {}).get("offhost_icons", False)), overrides=overrides)
+    except ValueError as exc:
+        raise SettingsError(str(exc)) from exc
+    return resources, plan
+
+
+def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validate settings.yaml and write config.yaml and approval.yaml. Returns a summary.
+
+    ``cli`` holds command-line overrides (cores, memory_gb, max_open_files and the concurrency settings).
+    """
     workdir = Path(workdir)
     s = load_settings(workdir)
     host, scope, appr, run = s["host"], s["scope"], s["approval"], s["run"]
@@ -241,9 +307,9 @@ def apply(workdir: Path) -> dict[str, Any]:
         raise SettingsError(f"approval.min_seconds_between_probes_per_ip {approved_pace:g} is below the minimum of {MIN_PACE_SECONDS:g} s")
     if pace < approved_pace:
         raise SettingsError(f"scope.min_seconds_between_probes_per_ip {pace:g} is below the approved {approved_pace:g} s")
-    overlap = scope.get("overlap_tls_with_zmap", False)
-    if not isinstance(overlap, bool):
-        raise SettingsError("scope.overlap_tls_with_zmap must be true or false")
+    overlap = scope.get("overlap_tls_with_zmap", "auto")
+    if not isinstance(overlap, bool) and str(overlap).strip().lower() != "auto":
+        raise SettingsError("scope.overlap_tls_with_zmap must be auto, true or false")
     if appr["status"] not in ("blocked", "approved"):
         raise SettingsError("approval.status must be `blocked` or `approved`")
     excl_path = _resolve(workdir, scope["exclusions_file"])
@@ -258,8 +324,9 @@ def apply(workdir: Path) -> dict[str, Any]:
     if check not in ("nic", "url", "off"):
         raise SettingsError("host.egress_check must be auto, nic, url or off")
     offhost = bool(scope.get("offhost_icons", False))
-    workers = scope.get("favicon_workers", 64)
-    processes = scope.get("favicon_processes", 1)
+    resources, plan = derived_plan(s, cli)
+    overlap = plan["overlap_tls_with_zmap"]
+    workers, processes = plan["favicon_workers"], plan["favicon_processes"]
     if isinstance(processes, bool) or not isinstance(processes, int) or not 1 <= processes <= 64:
         raise SettingsError(f"scope.favicon_processes `{processes}` must be a whole number from 1 to 64")
     if processes > int(workers):
@@ -281,11 +348,14 @@ def apply(workdir: Path) -> dict[str, Any]:
         base["sample"]["shards"] = int(scope["shards"])     # run with `campaign`: one bounded run per shard
     m = base["measurement"]
     m.update(ports=[int(p) for p in scope["ports"]], zmap_rate=int(rate), zmap_probes=probes, zmap_max_runtime=runtime,
-             min_seconds_between_probes_per_ip=pace, overlap_tls_with_zmap=overlap)
+             min_seconds_between_probes_per_ip=pace, overlap_tls_with_zmap=overlap, zgrab_senders=plan["zgrab_senders"],
+             zgrab_parallel_batches=plan["zgrab_parallel_batches"], zgrab_batch_size=plan["zgrab_batch_size"])
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
+    base["dns"]["threads"] = plan["dns_threads"]
     f = base["favicon"]
-    f.update(workers=int(workers), processes=processes, stage_max_seconds=86400,
+    f.update(workers=int(workers), processes=processes, stage_max_seconds=plan["favicon_stage_max_seconds"],
+             max_active_requests=plan["favicon_max_active_requests"],
              max_unverified_names_per_endpoint=2 if scope.get("try_unverified_names") else 0)
     f["offhost_icons"] = {**f.get("offhost_icons", {}), "enabled": offhost}
     base["fetch"]["user_agent"] = f"{s.get('scanner_name', 'research-scanner')} (+{info}; contact {contact})"
@@ -316,5 +386,9 @@ def apply(workdir: Path) -> dict[str, Any]:
         if not target.exists() or target.read_text(encoding="utf-8") != text:
             target.write_text(text, encoding="utf-8", newline="\n")
             written.append(name)
-    return {"written": written, "exclusions_entries": len(entries), "exclusions_sha256": digest, "egress_check": check,
+    return {"written": written, "resources": _resources_dict(resources), "derived_plan": plan, "exclusions_entries": len(entries), "exclusions_sha256": digest, "egress_check": check,
             "approval_status": appr["status"], "user_agent": base["fetch"]["user_agent"]}
+
+
+def _resources_dict(r: prof.Resources) -> dict[str, Any]:
+    return {"cores": r.cores, "memory_gb": None if r.memory_gb is None else round(r.memory_gb, 1), "max_open_files": r.open_files}

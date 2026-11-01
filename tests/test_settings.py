@@ -33,14 +33,14 @@ def test_fresh_settings_need_attention(tmp_path, capsys):
 
 
 def test_apply_generates_a_loadable_config_and_approval(tmp_path):
-    path = _init(tmp_path)
+    path = _init(tmp_path, "--cores", "2", "--memory-gb", "4", "--max-open-files", "65536")
     _approve(path)
     assert main(["apply", "--workdir", str(tmp_path)]) == 0
     cfg = load_config(tmp_path / "config.yaml")
     assert cfg.transparency.contact == "optout@uni.example"
     assert cfg.measurement.min_seconds_between_probes_per_ip == 5
     assert cfg.measurement.zmap_probes == 1
-    assert cfg.measurement.overlap_tls_with_zmap is False and cfg.measurement.zgrab_parallel_batches == 4
+    assert cfg.measurement.overlap_tls_with_zmap is False and cfg.measurement.zgrab_parallel_batches == 1
     first = (tmp_path / "config.yaml").read_text(encoding="utf-8")
     assert main(["apply", "--workdir", str(tmp_path)]) == 0
     assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == first

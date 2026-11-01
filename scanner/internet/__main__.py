@@ -92,6 +92,7 @@ def _settings_command(args) -> int:
                 target = workdir / "exclusions.txt"
                 if Path(args.exclusions).resolve() != target.resolve():
                     shutil.copyfile(args.exclusions, target)
+            answers.update(_profile_flags(args))
             path = st.write_settings(workdir, answers, force=args.force)
             print(f"wrote {path}\nEdit it (every REPLACE_ME), then run: scanner apply")
             if not args.exclusions and not (workdir / "exclusions.txt").exists():
@@ -99,7 +100,7 @@ def _settings_command(args) -> int:
                       f"{workdir / 'exclusions.txt'} (or run `scanner init --force --exclusions FILE`).")
             return 0
         if args.command == "apply":
-            result = st.apply(workdir)
+            result = st.apply(workdir, _profile_flags(args))
             print(json.dumps(result, indent=2))
             print("config.yaml and approval.yaml are up to date" if not result["written"]
                   else "wrote " + ", ".join(result["written"]))
@@ -112,7 +113,39 @@ def _settings_command(args) -> int:
         return 2
 
 
+PROFILE_FLAGS = ("cores", "memory_gb", "max_open_files", "zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size",
+                 "dns_threads", "favicon_workers", "favicon_processes", "favicon_max_active_requests",
+                 "favicon_stage_max_seconds", "overlap_tls_with_zmap")
+
+
+def _profile_flags(args) -> dict:
+    """The resource flags that were given, with the overlap flag as a boolean (or ``auto``)."""
+    out = {name: getattr(args, name) for name in PROFILE_FLAGS if getattr(args, name, None) is not None}
+    if "overlap_tls_with_zmap" in out:
+        out["overlap_tls_with_zmap"] = {"true": True, "false": False}.get(out["overlap_tls_with_zmap"], "auto")
+    return out
+
+
+def _resource_plan(cfg, args) -> dict:
+    """What the configured concurrency asks of this host, next to what the host offers."""
+    from scanner.internet import profile
+    flags = _profile_flags(args)
+    res = profile.detect(flags.get("cores"), flags.get("memory_gb"), flags.get("max_open_files"))
+    m, f = cfg.measurement, cfg.favicon
+    plan = {"zgrab_senders": m.zgrab_senders, "zgrab_parallel_batches": m.zgrab_parallel_batches, "zgrab_batch_size": m.zgrab_batch_size,
+            "dns_threads": cfg.dns.threads, "favicon_workers": f.workers, "favicon_processes": f.processes,
+            "favicon_max_active_requests": f.max_active_requests, "favicon_stage_max_seconds": f.stage_max_seconds,
+            "overlap_tls_with_zmap": m.overlap_tls_with_zmap}
+    budget = profile.connection_budget(res.cores, res.memory_gb, res.open_files)
+    return {"host": {"cores": res.cores, "memory_gb": None if res.memory_gb is None else round(res.memory_gb, 1),
+                     "max_open_files": res.open_files},
+            "connection_budget": budget, "configured": plan, "descriptors_needed": profile.file_demand(plan),
+            "fits_open_files": profile.fits_open_files(plan, res.open_files)}
+
+
 def main(argv: list[str] | None = None) -> int:
+    from scanner.internet import profile as _profile
+    _profile.raise_open_file_limit()
     ap = argparse.ArgumentParser(prog="scanner.internet")
     ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact", "prune-raw") + SETTINGS_COMMANDS)
     ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact, prune-raw: the finished run")
@@ -144,6 +177,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="campaign: 2 runs the next shard's network stages while the previous shard works through its favicon stage")
     ap.add_argument("--allow-rerun", action="store_true",
                     help="run: permit a second run of an identical config (it re-probes the same sample)")
+
+    # Resource profile: what the host offers, and explicit concurrency settings. An explicit value always wins over
+    # the one derived from the host. init and apply use them to write config.yaml; plan and preflight check against them.
+    ap.add_argument("--cores", type=int, help="init, apply, plan, preflight: CPU cores to plan for (default: detected)")
+    ap.add_argument("--memory-gb", type=float, help="init, apply, plan, preflight: RAM to plan for, in GiB (default: detected)")
+    ap.add_argument("--max-open-files", type=int, help="init, apply, plan, preflight: open-file limit to plan for (default: detected)")
+    ap.add_argument("--zgrab-senders", type=int, help="init, apply: ZGrab2 connections per process (1-1000)")
+    ap.add_argument("--zgrab-parallel-batches", type=int, help="init, apply: ZGrab2 processes at once (1-64)")
+    ap.add_argument("--zgrab-batch-size", type=int, help="init, apply: addresses per ZGrab2 batch (1-100000)")
+    ap.add_argument("--dns-threads", type=int, help="init, apply: zdns threads (1-1000)")
+    ap.add_argument("--favicon-workers", type=int, help="init, apply: favicon worker threads in all (1-8192)")
+    ap.add_argument("--favicon-processes", type=int, help="init, apply: favicon worker processes (1-64)")
+    ap.add_argument("--favicon-max-active-requests", type=int, help="init, apply: favicon requests on the wire at once (1-8192)")
+    ap.add_argument("--favicon-stage-max-seconds", type=int, help="init, apply: time limit of the favicon stage (1-86400)")
+    ap.add_argument("--overlap-tls-with-zmap", choices=("true", "false", "auto"),
+                    help="init, apply: start TLS while ZMap sweeps later ports (auto: on from 4 cores)")
     args = ap.parse_args(argv)
 
     if args.command in SETTINGS_COMMANDS:
@@ -247,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
             "favicon_enabled": cfg.favicon.enabled,
             "sni_confirm_enabled": cfg.sni_confirm.enabled,
             "output_dir": str(cfg.output_dir),
+            "resource_plan": _resource_plan(cfg, args),
             "confirm_token": token,
         }, indent=2))
         verb = "campaign" if splan.shards > 1 else "run"
@@ -255,7 +305,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "preflight":
         (Path(cfg.output_dir) / "doctor").mkdir(parents=True, exist_ok=True)
-        report = pre.run_preflight(cfg, splan, run_dir=Path(cfg.output_dir) / "doctor", offline=args.offline)
+        report = pre.run_preflight(cfg, splan, run_dir=Path(cfg.output_dir) / "doctor", offline=args.offline,
+                                   resources=_profile.detect(args.cores, args.memory_gb, args.max_open_files))
         print(json.dumps(report, indent=2, default=str))
         return 0 if report["ok"] else 2
 
