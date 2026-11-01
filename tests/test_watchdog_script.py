@@ -7,9 +7,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers import posix_bash
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "run" / "watchdog.sh"
-pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+BASH = posix_bash()
+pytestmark = pytest.mark.skipif(BASH is None, reason="needs a bash that runs scripts (not the WSL launcher)")
 
 
 def meminfo(path, available_mib, swap_mib):
@@ -33,15 +36,15 @@ def run(tmp_path, *args, mem=None, pgrep_hits=False, env=None):
     e = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", **(env or {}))
     if mem is not None:
         e["WATCHDOG_MEMINFO"] = str(mem)
-    return subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=e, timeout=30)
+    return subprocess.run([BASH, str(SCRIPT), *args], capture_output=True, text=True, env=e, timeout=30)
 
 
 def test_script_parses():
-    assert subprocess.run(["bash", "-n", str(SCRIPT)]).returncode == 0
+    assert subprocess.run([BASH, "-n", str(SCRIPT)]).returncode == 0
 
 
 def test_kill_file_is_required():
-    assert subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True).returncode == 2
+    assert subprocess.run([BASH, str(SCRIPT)], capture_output=True, text=True).returncode == 2
 
 
 def test_low_memory_touches_the_kill_file(tmp_path):
@@ -65,7 +68,7 @@ def test_stale_paths_touch_the_kill_file(tmp_path):
     mem = meminfo(tmp_path / "meminfo", 3000, 0)
     old_file(tmp_path / "campaign.log")
     old_file(tmp_path / "favicon_records.jsonl")
-    out = run(tmp_path, "-k", str(kill), "-w", str(tmp_path / "*.log"), "-w", str(tmp_path / "favicon_*.jsonl"),
+    out = run(tmp_path, "-k", str(kill), "-w", (tmp_path / "*.log").as_posix(), "-w", (tmp_path / "favicon_*.jsonl").as_posix(),
               "-s", "30", "-i", "1", mem=mem)
     assert kill.exists() and "no zmap" in out.stdout
 
@@ -100,7 +103,7 @@ def test_failed_touch_is_logged_and_retried_instead_of_exiting(tmp_path):
     kill, log = tmp_path / "nodir" / "STOP", tmp_path / "wd.log"
     mem = meminfo(tmp_path / "meminfo", 100, 0)
     e = dict(os.environ, WATCHDOG_MEMINFO=str(mem))
-    p = subprocess.Popen(["bash", str(SCRIPT), "-k", str(kill), "-i", "1", "-l", str(log)], env=e,
+    p = subprocess.Popen([BASH, str(SCRIPT), "-k", str(kill), "-i", "1", "-l", str(log)], env=e,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(3.5)
@@ -114,6 +117,7 @@ def test_failed_touch_is_logged_and_retried_instead_of_exiting(tmp_path):
     assert text.count("could not touch") >= 2 and kill.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="builds a PATH of symlinks to the coreutils")
 def test_missing_pgrep_never_allows_the_stale_stop(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -125,7 +129,7 @@ def test_missing_pgrep_never_allows_the_stale_stop(tmp_path):
     old_file(tmp_path / "campaign.log")
     mem = meminfo(tmp_path / "meminfo", 3000, 0)
     e = dict(os.environ, PATH=str(bin_dir), WATCHDOG_MEMINFO=str(mem))
-    p = subprocess.Popen([shutil.which("bash"), str(SCRIPT), "-k", str(kill), "-w", str(tmp_path / "campaign.log"),
+    p = subprocess.Popen([BASH, str(SCRIPT), "-k", str(kill), "-w", str(tmp_path / "campaign.log"),
                           "-s", "30", "-i", "1", "-l", str(log)], env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(3.5)
@@ -140,7 +144,7 @@ def test_missing_memavailable_is_warned_about_once(tmp_path):
     mem = tmp_path / "meminfo"
     mem.write_text("MemTotal:  4000000 kB\n")
     log = tmp_path / "wd.log"
-    p = subprocess.Popen(["bash", str(SCRIPT), "-k", str(tmp_path / "STOP"), "-i", "1", "-l", str(log)],
+    p = subprocess.Popen([BASH, str(SCRIPT), "-k", str(tmp_path / "STOP"), "-i", "1", "-l", str(log)],
                          env=dict(os.environ, WATCHDOG_MEMINFO=str(mem)), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(3.5)
@@ -156,7 +160,7 @@ def test_leading_zero_numbers_are_decimal_and_paths_may_contain_spaces(tmp_path)
     spaced = tmp_path / "with space"
     spaced.mkdir()
     old_file(spaced / "campaign.log")
-    out = run(tmp_path, "-k", str(kill), "-w", str(spaced / "*.log"), "-s", "030", "-i", "01", "-m", "0700", mem=mem)
+    out = run(tmp_path, "-k", str(kill), "-w", (spaced / "*.log").as_posix(), "-s", "030", "-i", "01", "-m", "0700", mem=mem)
     assert kill.exists() and "no zmap" in out.stdout
 
 

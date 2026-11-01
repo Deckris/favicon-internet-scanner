@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import json
 import re
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,14 @@ import yaml
 from scanner.internet.config import sha256_file
 
 FIX = Path(__file__).parent / "fixtures" / "scan"
+
+
+def posix_bash() -> str | None:
+    """A bash that runs scripts on this machine. On Windows, System32\bash.exe only relays to a WSL distro."""
+    found = shutil.which("bash")
+    if found is None or "system32" in found.lower() or "windowsapps" in found.lower():
+        return None
+    return found
 
 
 @functools.lru_cache(maxsize=None)

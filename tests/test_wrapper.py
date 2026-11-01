@@ -1,21 +1,23 @@
 """The scanner entry-point script and the container recipe: syntax, dispatch and packaging."""
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from tests.helpers import posix_bash
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "run" / "scanner"
-pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
+BASH = posix_bash()
+pytestmark = pytest.mark.skipif(BASH is None, reason="needs a bash that runs scripts (not the WSL launcher)")
 
 
 def run(*args, cwd=None):
-    return subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, cwd=cwd)
+    return subprocess.run([BASH, str(SCRIPT), *args], capture_output=True, text=True, cwd=cwd)
 
 
 def test_script_parses():
-    assert subprocess.run(["bash", "-n", str(SCRIPT)]).returncode == 0
+    assert subprocess.run([BASH, "-n", str(SCRIPT)]).returncode == 0
 
 
 def test_help_lists_every_command():

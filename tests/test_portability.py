@@ -9,7 +9,7 @@ import yaml
 from scanner.internet import pipeline
 from scanner.internet import preflight as pre
 from scanner.internet.config import ConfigError, load_config
-from tests.helpers import config_dict, write_approval, write_config, write_exclusions
+from tests.helpers import config_dict, posix_bash, write_approval, write_config, write_exclusions
 
 
 def _config(tmp_path, **vantage):
@@ -73,6 +73,10 @@ def test_only_pinned_zmap_versions_are_accepted():
     assert not pre.zmap_version_supported("")
 
 
+needs_sighup = pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="SIGHUP exists only on POSIX hosts")
+
+
+@needs_sighup
 def test_nohup_style_ignored_hangup_is_respected():
     old = signal.signal(signal.SIGHUP, signal.SIG_IGN)                       # what `nohup` sets up before exec
     try:
@@ -84,6 +88,7 @@ def test_nohup_style_ignored_hangup_is_respected():
         signal.signal(signal.SIGHUP, old)
 
 
+@needs_sighup
 def test_default_hangup_still_stops_the_run_cleanly():
     old = signal.signal(signal.SIGHUP, signal.SIG_DFL)
     try:
@@ -100,8 +105,11 @@ def test_shell_scripts_parse_and_gate_the_environment():
     setup = (root / "setup-wsl.sh").read_text(encoding="utf-8")
     assert "sys.version_info >= (3, 11)" in setup and "ZMAP_COMMIT=" in setup and "x86_64" in setup
     assert "RESPECT_INSTALL_PREFIX_CONFIG=ON" in setup
+    bash = posix_bash()
+    if bash is None:
+        pytest.skip("no bash that runs scripts on this host (Windows without Git Bash on PATH)")
     for name in ("setup-wsl.sh", "scanner"):
-        res = subprocess.run(["bash", "-n", str(root / name)], capture_output=True, text=True)
+        res = subprocess.run([bash, "-n", str(root / name)], capture_output=True, text=True)
         assert res.returncode == 0, res.stderr
     assert "pytest" in (root.parent / "requirements.txt").read_text(encoding="utf-8")
 
