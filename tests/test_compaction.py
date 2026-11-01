@@ -307,6 +307,8 @@ def test_a_resumed_campaign_completes_a_compaction_that_was_interrupted(tmp_path
     for r in runs:
         assert not (r / "normalized" / "endpoints.jsonl").exists() and (r / "normalized" / "endpoints.jsonl.zst").exists()
         assert _manifest(r)["compaction"]["files"]["ip_results.csv.zst"]["content_bytes"] > 0
+    state = json.loads(Path(result["state_file"]).read_text())
+    assert all(e["disk_bytes"] == outputs.tree_bytes(e["run_dir"]) for e in state["shard_states"].values())
 
 
 def test_a_shard_that_finished_before_the_state_file_heard_of_it_is_not_repeated(tmp_path):

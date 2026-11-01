@@ -128,6 +128,7 @@ operations:
   kill_switch_file: /tmp/scanner.KILL     # `touch` it: running tools are stopped within ~1 s and the run is marked partial
   # egress_check_seconds: 120             # how often the public address is re-checked during a run (0 = off)
   # min_free_mib: 512                     # the run stops when free disk space drops below this
+  # min_free_gb_between_shards: 40        # a campaign starts no shard below this much free disk (default: twice the largest finished shard + 15 GB, 20 GB before the first; 0 = off)
 
 binaries:
   zmap: /opt/scanner/zmap-4.4.0/sbin/zmap

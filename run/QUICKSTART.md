@@ -90,7 +90,7 @@ A run that finished cleanly stores its record files (`normalized/*.jsonl`, `ip_r
 - The approval file must match the config: ports, rate, sample size, source address, operations, expiry, exclusion list checksum and the pause between requests to one address.
 - The confirmation token is tied to the exact plan.
 - The public egress address is checked before and during the run; a change stops it.
-- A kill-switch file, a disk-space guard and an approval-expiry guard.
+- A kill-switch file, a disk-space guard and an approval-expiry guard. A campaign also starts no new shard when the free disk is below `operations.min_free_gb_between_shards` (exit code 6; free space and run the same command again).
 - Favicon fetches stay on the IP and port pairs that answered the scan; redirects and icon URLs elsewhere are refused.
 - An address whose SYN-ACK advertises a zero or tiny TCP window (a tarpit) gets nothing beyond the ZMap SYN; it stays in the results, flagged, and the summary counts `tarpit_ips_not_probed`.
 - ZMap runs one port at a time, with the configured pause between port runs.

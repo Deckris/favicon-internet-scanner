@@ -3,7 +3,7 @@ and ``python -m scanner.internet export-csv RUN_DIR [--out FILE]``.
 
 Exit codes: 0 complete, 2 refused (config, approval, preflight, confirmation, or a prior run of this config),
 3 run error, 4 run finished but found zero responsive endpoints, 5 run ended early or with stage errors
-(outputs are partial and flagged).
+(outputs are partial and flagged), 6 campaign stopped before a shard for lack of free disk (resume with the same command).
 """
 from __future__ import annotations
 
@@ -42,7 +42,9 @@ PILOT_MAX_TARGETS_PER_PORT = 5000
 # stage_errors, kill_switch, stalled, egress_changed, ...) is a stop that needs a look: exit 5, the same as an
 # incomplete `run`. `stalled` is listed on purpose: a shard made no progress for operations.stall_minutes.
 EXIT_STOPPED = 5
-CAMPAIGN_EXIT = {"preflight_failed": 2, "zero_responsive": 4, "drain": 0, "stalled": EXIT_STOPPED}
+# `disk` is a stop between shards for lack of free space (operations.min_free_gb_between_shards): free space, run again.
+EXIT_DISK = 6
+CAMPAIGN_EXIT = {"preflight_failed": 2, "zero_responsive": 4, "drain": 0, "stalled": EXIT_STOPPED, "disk": EXIT_DISK}
 
 
 def _anonymous_refusal(cfg, args) -> str | None:
@@ -267,7 +269,10 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, default=str))
         if result["complete"]:
             return 0
-        return CAMPAIGN_EXIT.get((result["stopped"] or {}).get("reason"), EXIT_STOPPED)
+        stopped = result["stopped"] or {}
+        if stopped.get("reason") == "disk":
+            print(f"WARNING: campaign stopped for lack of disk space: {stopped.get('detail')}", file=sys.stderr)
+        return CAMPAIGN_EXIT.get(stopped.get("reason"), EXIT_STOPPED)
     if cfg.shards > 1:
         if args.shard is None or not 0 <= args.shard < cfg.shards:
             print(f"REFUSED: this config has {cfg.shards} shards; use `campaign`, or `run --shard N` with 0 <= N < {cfg.shards}", file=sys.stderr)

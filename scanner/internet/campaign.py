@@ -8,6 +8,8 @@ repeats the one that was interrupted (as a new attempt, in a new run directory).
 The campaign stops at the first shard that does not finish cleanly: the kill switch, a changed public IP, low
 disk, an expired approval and tool errors all end it, and nothing further is sent until the operator looks.
 A file named ``DRAIN`` in the campaign directory ends it more gently: the shard in progress finishes, no further shard starts.
+So does too little free disk: a shard starts only while the output disk holds ``disk_floor`` bytes (``operations.min_free_gb_between_shards``),
+and a campaign that stops for that reason (reason ``disk``) resumes when the same command is run again with space freed.
 A finished shard's record files are compacted to ``.zst`` (see ``outputs.compact_run``); a resumed campaign completes a compaction that was interrupted.
 With ``pipeline_depth=2`` the shards run as child processes that overlap (see ``supervisor``); the state file and the stop rules stay the same.
 """
@@ -183,6 +185,47 @@ def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: C
         lock.unlink(missing_ok=True)
 
 
+GIB = 1 << 30
+DISK_FIRST_SHARD_GB = 20                     # free space wanted before any shard has finished
+DISK_MARGIN_GB = 15                          # on top of twice the largest finished shard
+
+
+def _shard_bytes(entry: dict[str, Any]) -> int:
+    """On-disk size of a finished shard: recorded when it finished, measured (once) for a state file that lacks it."""
+    if "disk_bytes" not in entry and entry.get("run_dir") and Path(entry["run_dir"]).is_dir():
+        entry["disk_bytes"] = outputs.tree_bytes(entry["run_dir"])
+    return int(entry.get("disk_bytes") or 0)
+
+
+def disk_floor(cfg: Any, state: dict[str, Any]) -> tuple[int, str]:
+    """Free bytes a campaign wants before it starts a shard, and how that figure came about."""
+    if cfg.min_free_gb_between_shards is not None:
+        return int(cfg.min_free_gb_between_shards * GIB), f"operations.min_free_gb_between_shards is {cfg.min_free_gb_between_shards:g} GB"
+    sizes = [_shard_bytes(e) for e in state["shard_states"].values() if e.get("status") == "complete"]
+    if not any(sizes):
+        return DISK_FIRST_SHARD_GB * GIB, f"no shard has finished yet, so {DISK_FIRST_SHARD_GB} GB"
+    largest = max(sizes)
+    return 2 * largest + DISK_MARGIN_GB * GIB, f"twice the largest finished shard ({largest / GIB:.1f} GB) plus {DISK_MARGIN_GB} GB"
+
+
+def disk_shortfall(cfg: Any, state: dict[str, Any]) -> str | None:
+    """A message naming the shortfall when the output disk holds less than ``disk_floor``, else None."""
+    wanted, basis = disk_floor(cfg, state)
+    if wanted <= 0:
+        return None
+    probe = Path(cfg.output_dir)
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return None
+    if free >= wanted:
+        return None
+    return (f"{free / GIB:.1f} GB free on the disk of {cfg.output_dir}, {wanted / GIB:.1f} GB needed ({basis}); "
+            f"{(wanted - free) / GIB:.1f} GB short. Free space and run the same command again to resume")
+
+
 def compact_finished(cfg: Any, entry: dict[str, Any], log: Callable[[str], None]) -> None:
     """Finish the compaction of a completed shard (a no-op when it is done, switched off or the shard is gone)."""
     if not cfg.compact_outputs or not entry.get("run_dir") or not Path(entry["run_dir"]).is_dir():
@@ -193,6 +236,7 @@ def compact_finished(cfg: Any, entry: dict[str, Any], log: Callable[[str], None]
         log(f"[campaign] could not compact {entry['run_dir']}: {type(exc).__name__}: {exc}")
         return
     if result["status"] == "compacted":
+        entry["disk_bytes"] = outputs.tree_bytes(entry["run_dir"])
         log(f"[campaign] compacted {Path(entry['run_dir']).name}")
 
 
@@ -245,7 +289,8 @@ def resume_source(cfg: Any, i: int, run_id: str) -> Path | None:
 
 
 def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], None]) -> tuple[str, str | None]:
-    """Decide what to do with shard ``i``: ``("complete", None)``, ``("drain", None)`` or ``("run", run_id)`` (attempt counted)."""
+    """Decide what to do with shard ``i``: ``("complete", None)``, ``("drain", None)``, ``("disk", shortfall message)``
+    or ``("run", run_id)`` (attempt counted)."""
     path = campaign_dir(cfg) / "campaign.json"
     entry = state["shard_states"].setdefault(str(i), {"status": "pending", "attempts": 0})
     if entry["status"] != "complete" and entry.get("run_id") and _finished_cleanly(Path(cfg.output_dir) / entry["run_id"]):
@@ -263,6 +308,10 @@ def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], No
     if (campaign_dir(cfg) / "DRAIN").exists():
         log(f"[campaign] {campaign_dir(cfg) / 'DRAIN'} exists: stopping before shard {i + 1}/{cfg.shards}")
         return "drain", None
+    short = disk_shortfall(cfg, state)
+    if short is not None:
+        log(f"[campaign] not starting shard {i + 1}/{cfg.shards}: {short}")
+        return "disk", short
     entry["attempts"] += 1
     for stale in ("run_dir", "error", "finished_at", "abort_reason", "elapsed_seconds"):
         entry.pop(stale, None)
@@ -294,6 +343,7 @@ def record_finished(entry: dict[str, Any], i: int, run_dir: Path) -> dict[str, A
         return {"shard": i, "reason": "zero_responsive", "detail": "no endpoint answered although every tool ran cleanly"}
     if manifest.get("complete"):
         entry["status"] = "complete"
+        entry["disk_bytes"] = outputs.tree_bytes(run_dir)
         return None
     entry["status"] = "incomplete"
     return {"shard": i, "reason": manifest.get("abort_reason") or "stage_errors", "detail": manifest.get("stage_errors")}
@@ -321,6 +371,9 @@ def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], No
             continue
         if action == "drain":
             stopped = {"shard": i, "reason": "drain", "detail": "stopped between shards on request"}
+            break
+        if action == "disk":
+            stopped = {"shard": i, "reason": "disk", "detail": run_id}
             break
         try:
             resume = resume_source(cfg, i, run_id)

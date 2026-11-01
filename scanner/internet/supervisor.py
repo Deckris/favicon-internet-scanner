@@ -40,7 +40,7 @@ except ImportError:             # Windows: campaigns run the shards one after an
 DEPTH = 2
 LOCKS = {"a": "phase-a.lock", "b": "phase-b.lock"}
 PHASE_B_NICE = 5               # keeps ZMap's receiver ahead of the Python favicon workers when both are busy
-LETS_SIBLING_FINISH = ("crashed", "stage_errors", "zero_responsive", "drain")    # any other stop (kill switch, stall, ...) ends a sweep in progress
+LETS_SIBLING_FINISH = ("crashed", "stage_errors", "zero_responsive", "drain", "disk")    # any other stop (kill switch, stall, ...) ends a sweep in progress
 EXIT_REFUSED, EXIT_CRASHED, EXIT_MISMATCH, EXIT_INTERRUPTED = 2, 3, 4, 5
 
 
@@ -289,6 +289,9 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
                     continue
                 if action == "drain":
                     halted = {"shard": i, "reason": "drain", "detail": "stopped between shards on request"}
+                    break
+                if action == "disk":
+                    halted = {"shard": i, "reason": "disk", "detail": run_id}
                     break
                 inflight[i] = _Child(i, run_id, subprocess.Popen(launcher(i, run_id), **spawn_kw))
                 a_free = False
