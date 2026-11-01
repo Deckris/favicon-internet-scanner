@@ -227,4 +227,9 @@ def run_refetch(cfg: ScanConfig, source: Path, *, all_jobs: bool = False, run_id
         "parameters": {"favicon": vars(cfg.favicon), "fetch": vars(cfg.fetch)}, "summary": summary, "output_checksums": checksums,
     }, indent=2, default=pipeline._jsonable), encoding="utf-8")
     print(f"[scanner favicon_refetch] images stored: {len(store)}; {json.dumps(compare)}", file=sys.stderr, flush=True)
+    if cfg.compact_outputs:
+        try:
+            outputs.compact_run(run_dir)
+        except Exception as exc:    # the plain files stay and the manifest is untouched
+            print(f"[scanner favicon_refetch] could not compact the outputs: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
     return run_dir

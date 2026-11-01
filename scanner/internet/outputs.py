@@ -13,6 +13,12 @@ Output schema 2 (``output_schema`` in the manifest; absent means 1) changes two 
   file. The compressed bytes of a batch depend on how the tool's output was cut into reads, so they are not
   reproducible between runs; the decompressed content is. A batch is compressed while the tool's output
   arrives, so a run that dies mid-batch leaves a frame cut short, which still reads up to the cut.
+* When a shard has finished cleanly its record files (``normalized/*.jsonl``, ``raw/favicon_records.jsonl`` and
+  ``ip_results.csv``) are compacted to ``<name>.zst`` (``compact_run``; ``output.compact`` in the configuration turns
+  it off). The readers here and ``RecordLog`` open a path through ``resolve``, so they read the plain or the compressed
+  file alike. The manifest keeps the checksum of the stored bytes in ``output_checksums`` and, under ``compaction``,
+  the checksum and size of the content as well. The original is removed only after the compressed copy has been
+  written, flushed, read back and found identical, so a crash leaves one of the two intact.
 
 ``iter_endpoint_rows`` and ``iter_hostname_rows`` yield the rows of either schema in the schema 1 shape.
 Both files are written in the same ``(ip, port)`` order, so the join is a single streaming merge.
@@ -20,10 +26,13 @@ Both files are written in the same ``(ip, port)`` order, so the join is a single
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import os
+import sys
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 try:
     import zstandard
@@ -32,6 +41,7 @@ except ImportError:         # the run then stores plain files and the manifest s
 
 OUTPUT_SCHEMA = 2
 ZSTD_LEVEL = 3
+COMPACT_LEVEL = 12          # about 20 times faster than level 19 for a few percent more bytes (measured); paid once per shard
 COMPRESSION = "zstd" if zstandard is not None else "none"
 RAW_SUFFIX = ".jsonl.zst" if zstandard is not None else ".jsonl"
 COMPRESSION_NOTE = None if zstandard is not None else "zstandard is not installed; raw batch files are stored uncompressed"
@@ -99,11 +109,34 @@ def compress_bytes(data: bytes) -> bytes:
     return zstandard.ZstdCompressor(level=ZSTD_LEVEL).compress(data)
 
 
-def open_binary(path: Any) -> Any:
-    """The decompressed byte stream of a stored file (the file itself when it is not compressed)."""
+def resolve(path: Any) -> Path:
+    """The stored file behind ``path``: the plain file when it exists, else its ``.zst`` twin, else ``path`` itself.
+
+    The plain file wins while both exist: that is a compaction that stopped before the original was removed, and
+    the original is the complete one.
+    """
     path = Path(path)
-    if not is_compressed(path):
-        return open(path, "rb")
+    if path.exists() or is_compressed(path):
+        return path
+    packed = path.with_name(path.name + ".zst")
+    return packed if packed.exists() else path
+
+
+def exists(path: Any) -> bool:
+    return resolve(path).exists()
+
+
+def open_binary(path: Any) -> Any:
+    """The decompressed byte stream of a stored file (the file itself when it is not compressed).
+
+    A plain name whose file has been compacted opens its ``.zst`` twin.
+    """
+    path = resolve(path)
+    return open_zstd(path) if is_compressed(path) else open(path, "rb")
+
+
+def open_zstd(path: Path) -> Any:
+    """The decompressed stream of a zstd file, whatever its name."""
     if zstandard is None:
         raise RuntimeError(f"{path.name} is zstd-compressed but the zstandard package is not installed")
     fh = open(path, "rb")
@@ -142,7 +175,7 @@ def output_schema(run_dir: Path) -> int:
 
 
 def _jsonl(path: Path) -> Iterator[dict[str, Any]]:
-    with path.open(encoding="utf-8") as fh:
+    with open_text(path) as fh:
         for line in fh:
             if line.strip():
                 yield json.loads(line)
@@ -215,3 +248,167 @@ def export_csv(run_dir: Any, out_path: Any | None = None) -> Path:
                 columns = CSV_COLUMNS_UNNAMED if row["hostname"] is None else CSV_COLUMNS_NAMED
             sink.write({c: row[c] for c in columns})
     return out_path
+
+
+# ---------------------------------------------------------------- compaction
+
+COMPACT_GLOBS = ("normalized/*.jsonl", "raw/favicon_records.jsonl", "ip_results.csv")
+
+
+def _sha256_stream(path: Path, *, compressed: bool) -> tuple[str, int]:
+    """SHA-256 and length of a file's content (decompressed when ``compressed``)."""
+    digest, size = hashlib.sha256(), 0
+    with (open_zstd(path) if compressed else open(path, "rb")) as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def _sha256_file(path: Path) -> str:
+    return _sha256_stream(path, compressed=False)[0]
+
+
+class _HashingReader:
+    """Read side of ``copy_stream`` that hashes what passes through."""
+
+    def __init__(self, fh: Any) -> None:
+        self._fh = fh
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def read(self, n: int = -1) -> bytes:
+        block = self._fh.read(n)
+        self.digest.update(block)
+        self.size += len(block)
+        return block
+
+
+def _fsync_dir(path: Path) -> None:
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _compact_file(plain: Path, expected: str | None, level: int) -> dict[str, Any]:
+    """Replace ``plain`` by ``plain.zst``; returns the manifest record. ``plain`` stays unless the copy is verified.
+
+    The copy is written under a temporary name, flushed to disk and decompressed again; only when its content hashes
+    to what was read from ``plain`` (and to ``expected``, the checksum the manifest holds, if it holds one) is it
+    renamed into place and the original removed.
+    """
+    packed = plain.with_name(plain.name + ".zst")
+    tmp = plain.with_name(plain.name + ".zst.tmp")
+    try:
+        with open(plain, "rb") as src, open(tmp, "wb") as dst:
+            reader = _HashingReader(src)
+            zstandard.ZstdCompressor(level=level).copy_stream(reader, dst, read_size=1 << 20, write_size=1 << 20)
+            dst.flush()
+            os.fsync(dst.fileno())
+        content, length = reader.digest.hexdigest(), reader.size
+        if expected is not None and expected != content:
+            raise ValueError(f"{plain.name} does not match the checksum in the manifest")
+        back, back_len = _sha256_stream(tmp, compressed=True)
+        if (back, back_len) != (content, length):
+            raise ValueError(f"{tmp.name} does not decompress to {plain.name}")
+        stored = _sha256_file(tmp)
+        stored_len = tmp.stat().st_size
+        os.replace(tmp, packed)
+        _fsync_dir(packed.parent)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    plain.unlink()
+    _fsync_dir(packed.parent)
+    return {"sha256": stored, "content_sha256": content, "bytes": stored_len, "content_bytes": length}
+
+
+def _verify_packed(packed: Path, expected: str | None) -> dict[str, Any]:
+    """The manifest record of a ``.zst`` whose original is already gone (a compaction that stopped before the manifest was written)."""
+    content, length = _sha256_stream(packed, compressed=True)
+    if expected is not None and expected != content:
+        raise ValueError(f"{packed.name} does not match the checksum in the manifest")
+    return {"sha256": _sha256_file(packed), "content_sha256": content, "bytes": packed.stat().st_size, "content_bytes": length}
+
+
+def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(manifest, indent=2, default=str))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def compact_eligible(manifest: Any) -> bool:
+    """A shard whose manifest says it finished cleanly. An incomplete, aborted or empty-handed one keeps its plain files."""
+    return (isinstance(manifest, dict) and manifest.get("status") == "finished" and bool(manifest.get("complete"))
+            and not manifest.get("zero_responsive") and not manifest.get("abort_reason"))
+
+
+def compact_run(run_dir: Any, *, level: int = COMPACT_LEVEL, log: Callable[[str], None] | None = None) -> dict[str, Any]:
+    """Compress the record files of a finished run in place and record them in its manifest.
+
+    Safe to repeat and to call after a crash: a file already compacted is skipped, a ``.zst`` whose original was
+    removed but which the manifest does not list yet is verified and listed, a leftover temporary file is replaced.
+    Returns ``{"status": ..., "files": {name: record}}``; ``status`` is ``compacted`` when anything changed.
+    """
+    run_dir = Path(run_dir)
+    say = log or (lambda text: print(text, file=sys.stderr, flush=True))
+    if zstandard is None:
+        return {"status": "unavailable", "files": {}}
+    manifest_path = run_dir / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"status": "skipped", "files": {}, "reason": "no readable manifest"}
+    if not compact_eligible(manifest):
+        return {"status": "skipped", "files": {}, "reason": "the run did not finish cleanly"}
+    checksums = manifest.setdefault("output_checksums", {})
+    section = manifest.get("compaction") if isinstance(manifest.get("compaction"), dict) else {}
+    done: dict[str, Any] = dict(section.get("files") or {})
+    found = {p.relative_to(run_dir).as_posix() for pattern in COMPACT_GLOBS for p in run_dir.glob(pattern)}
+    found |= {p.relative_to(run_dir).as_posix()[:-4] for pattern in COMPACT_GLOBS for p in run_dir.glob(pattern + ".zst")}
+    changed: dict[str, Any] = {}
+    failed: dict[str, str] = {}
+    for rel in sorted(found):
+        plain, key = run_dir / rel, rel + ".zst"
+        if key in done and not plain.exists():
+            continue
+        expected = checksums.get(rel) or (done.get(key) or {}).get("content_sha256")
+        try:
+            record = _compact_file(plain, expected, level) if plain.exists() else _verify_packed(run_dir / key, expected)
+        except Exception as exc:        # the plain file stays: the run keeps working, and the next attempt tries again
+            failed[rel] = f"{type(exc).__name__}: {exc}"[:300]
+            say(f"[scanner] could not compact {rel}: {failed[rel]}")
+            continue
+        changed[key] = record
+    if changed:
+        done.update(changed)
+        for key, record in changed.items():
+            checksums.pop(key[:-4], None)
+            checksums[key] = record["sha256"]
+        manifest["compaction"] = {"zstd_level": level, "files": dict(sorted(done.items()))}
+        manifest["output_checksums"] = dict(sorted(checksums.items()))
+        _write_manifest(manifest_path, manifest)
+    result: dict[str, Any] = {"status": "compacted" if changed else "unchanged", "files": changed}
+    if failed:
+        result["failed"] = failed
+    return result
+
+
+def tree_bytes(path: Any) -> int:
+    """Bytes the files under ``path`` occupy (file sizes added up)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total

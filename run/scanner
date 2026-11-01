@@ -294,7 +294,7 @@ case "$CMD" in
     # slim and needs endpoints.jsonl next to it, which the archive holds; `export-csv` rebuilds the CSV from it.
     items=("$base/manifest.json" "$base/report")
     if [ "$results" -eq 1 ]; then
-      for f in normalized ip_results.csv scanned_ips.txt favicons; do [ -e "$run/$f" ] && items+=("$base/$f"); done
+      for f in normalized ip_results.csv ip_results.csv.zst scanned_ips.txt favicons; do [ -e "$run/$f" ] && items+=("$base/$f"); done
     fi
     [ "$raw" -eq 1 ] && items+=("$base/raw")
     tarball="$run.results.tar.gz"

@@ -112,8 +112,8 @@ def _settings_command(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="scanner.internet")
-    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv") + SETTINGS_COMMANDS)
-    ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv: the finished run")
+    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact") + SETTINGS_COMMANDS)
+    ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact: the finished run")
     ap.add_argument("--out", type=Path, help="export-csv: output file (default: normalized/hostname_resolution.csv in the run)")
     ap.add_argument("--config", type=Path)
     ap.add_argument("--workdir", type=Path, default=Path("."), help="init, apply, exclusions: folder holding settings.yaml")
@@ -151,6 +151,16 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("export-csv needs RUN_DIR")
         from scanner.internet import outputs
         print(outputs.export_csv(args.run_dir, args.out))
+        return 0
+    if args.command == "compact":
+        if args.run_dir is None:
+            ap.error("compact needs RUN_DIR")
+        from scanner.internet import outputs
+        result = outputs.compact_run(args.run_dir)
+        print(json.dumps(result, indent=2))
+        if result["status"] in ("skipped", "unavailable") or result.get("failed"):
+            print(f"REFUSED: nothing was compacted ({result.get('reason') or result.get('failed') or 'zstandard is not installed'})", file=sys.stderr)
+            return 2
         return 0
     if args.config is None:
         ap.error("--config is required for this command")

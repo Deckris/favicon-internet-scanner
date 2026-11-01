@@ -26,6 +26,7 @@ from typing import Any
 import dns.resolver
 
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
+from scanner.internet import outputs
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from scanner.internet.icon_store import IconStore
 from scanner.internet.pacing import IpPacer
@@ -491,9 +492,10 @@ class RecordLog:
 
     def load(self) -> dict[tuple[str, int, str | None], dict[str, Any]]:
         found: dict[tuple[str, int, str | None], dict[str, Any]] = {}
-        if not self.path.exists():
+        path = outputs.resolve(self.path)          # a finished run keeps this log compressed
+        if not path.exists():
             return found
-        with self.path.open(encoding="utf-8") as fh:
+        with outputs.open_text(path) as fh:
             for line in fh:
                 try:
                     rec = json.loads(line)

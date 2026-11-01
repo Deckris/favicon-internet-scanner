@@ -8,6 +8,7 @@ repeats the one that was interrupted (as a new attempt, in a new run directory).
 The campaign stops at the first shard that does not finish cleanly: the kill switch, a changed public IP, low
 disk, an expired approval and tool errors all end it, and nothing further is sent until the operator looks.
 A file named ``DRAIN`` in the campaign directory ends it more gently: the shard in progress finishes, no further shard starts.
+A finished shard's record files are compacted to ``.zst`` (see ``outputs.compact_run``); a resumed campaign completes a compaction that was interrupted.
 With ``pipeline_depth=2`` the shards run as child processes that overlap (see ``supervisor``); the state file and the stop rules stay the same.
 """
 from __future__ import annotations
@@ -22,7 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from scanner.internet import pipeline
+from scanner.internet import outputs, pipeline
 from scanner.internet.preflight import PreflightFailed
 
 MERGE_DICTS = ("counts", "protocol_by_endpoint", "tls_outcome_by_endpoint", "final_hostname_status_by_row", "dns_status_by_row",
@@ -182,6 +183,19 @@ def run_campaign(cfg: Any, *, run_fn: Callable[..., Path] = pipeline.run, log: C
         lock.unlink(missing_ok=True)
 
 
+def compact_finished(cfg: Any, entry: dict[str, Any], log: Callable[[str], None]) -> None:
+    """Finish the compaction of a completed shard (a no-op when it is done, switched off or the shard is gone)."""
+    if not cfg.compact_outputs or not entry.get("run_dir") or not Path(entry["run_dir"]).is_dir():
+        return
+    try:
+        result = outputs.compact_run(entry["run_dir"], log=log)
+    except Exception as exc:                       # the plain files are still there; the campaign goes on
+        log(f"[campaign] could not compact {entry['run_dir']}: {type(exc).__name__}: {exc}")
+        return
+    if result["status"] == "compacted":
+        log(f"[campaign] compacted {Path(entry['run_dir']).name}")
+
+
 def _run_id(cfg: Any, i: int, attempt: int) -> str:
     return f"scanner-{cfg.run_label}-{cfg.checksum[:8]}-s{i:03d}of{cfg.shards:03d}-a{attempt}"
 
@@ -219,7 +233,7 @@ def resume_source(cfg: Any, i: int, run_id: str) -> Path | None:
     if m is None:
         return None
     for d in _earlier_attempts(cfg, i, int(m.group(1))):
-        if _finished_cleanly(d) or not (d / "raw" / "favicon_records.jsonl").is_file():
+        if _finished_cleanly(d) or not outputs.resolve(d / "raw" / "favicon_records.jsonl").is_file():
             continue
         try:
             manifest = json.loads((d / "manifest.json").read_text(encoding="utf-8")) if (d / "manifest.json").exists() else {}
@@ -234,12 +248,17 @@ def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], No
     """Decide what to do with shard ``i``: ``("complete", None)``, ``("drain", None)`` or ``("run", run_id)`` (attempt counted)."""
     path = campaign_dir(cfg) / "campaign.json"
     entry = state["shard_states"].setdefault(str(i), {"status": "pending", "attempts": 0})
+    if entry["status"] != "complete" and entry.get("run_id") and _finished_cleanly(Path(cfg.output_dir) / entry["run_id"]):
+        # the process ended after the run finished but before the state file heard of it (e.g. while the outputs were compacted)
+        entry.update(status="complete", run_dir=str(Path(cfg.output_dir) / entry["run_id"]), adopted=True)
+        log(f"[campaign] shard {i + 1}/{cfg.shards}: {entry['run_id']} had finished; not repeating it")
     if entry["status"] != "complete":
         prior = _prior_complete(cfg, i) if entry["attempts"] == 0 else None
         if prior is not None:                      # never probe a shard twice just because the state file did not know
             entry.update(status="complete", run_dir=str(prior), adopted=True)
             log(f"[campaign] shard {i + 1}/{cfg.shards}: adopting the finished run {prior.name}")
     if entry["status"] == "complete":
+        compact_finished(cfg, entry, log)
         return "complete", None
     if (campaign_dir(cfg) / "DRAIN").exists():
         log(f"[campaign] {campaign_dir(cfg) / 'DRAIN'} exists: stopping before shard {i + 1}/{cfg.shards}")

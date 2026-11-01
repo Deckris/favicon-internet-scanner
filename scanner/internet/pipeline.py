@@ -446,13 +446,19 @@ def run(
         (run_dir / "preflight.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         if not report["ok"] and not skip_preflight:
             raise pre.PreflightFailed(report)
-        return _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                           started, wall, run_id, resume_from, fetcher_factory)
+        finished = _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
+                               started, wall, run_id, resume_from, fetcher_factory)
     finally:
         st.phases.close()
         st.stop_monitor()
         release_stacks()
         restore_signals()
+    if cfg.compact_outputs:         # after the phase locks are released: the next shard does not wait for it
+        try:
+            outputs.compact_run(finished)
+        except Exception as exc:    # the plain files stay and the manifest is untouched
+            print(f"[scanner] could not compact the outputs of {finished.name}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    return finished
 
 
 def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,

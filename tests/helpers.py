@@ -75,7 +75,7 @@ def config_dict(tmp: Path, excl: Path, approval: Path, **over: Any) -> dict[str,
                   "max_favicon_bytes": 524288, "max_decoded_bytes": 4194304, "max_redirects": 3,
                   "user_agent": "scanner-research-scanner (+https://example.org/scan; contact optout@example.org)"},
         "transparency": {"info_url": "https://example.org/scan", "contact": "optout@example.org"},
-        "output": {"dir": str(tmp / "out")},
+        "output": {"dir": str(tmp / "out"), "compact": False},      # most tests read the plain files; test_compaction.py turns it on
         "operations": {"kill_switch_file": str(tmp / "KILL")},
     }
     for k, v in over.items():

@@ -48,6 +48,7 @@
     "kill_switch_file": "<tmp>/KILL"
   },
   "output": {
+    "compact": false,
     "dir": "<tmp>/out"
   },
   "run_label": "test",
