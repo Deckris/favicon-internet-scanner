@@ -33,6 +33,7 @@ from scanner.internet import candidates as cand
 from scanner.internet import enrich
 from scanner.internet import favicon as fav
 from scanner.internet import icon_store
+from scanner.internet import js_icons
 from scanner.internet import outputs
 from scanner.internet import overlap as ovl
 from scanner.internet import pacing
@@ -1001,6 +1002,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     # ---- Stage 8: favicon acquisition (HTTP and HTTPS), bounded, sample-and-port-confined ---
     offhost_log: list[dict[str, Any]] = []
+    js_rows: list[dict[str, Any]] = []
 
     def favicon_stage() -> None:
         if not cfg.favicon.enabled:
@@ -1019,7 +1021,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         # the remaining icons of their page.
         # With several processes each builds its own fetcher and pacer; the parent keeps none.
         parallel = cfg.favicon.processes > 1 and (fetcher is None or fetcher_factory is not None)
-        factory = service = None
+        factory = service = pacer = None
         if parallel:
             if cfg.favicon.offhost.enabled:
                 # one off-host fetcher in this process for all workers: shared cache, caps and per-destination pacing
@@ -1069,6 +1071,20 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                                                     f"lost; first: {worker_failures[0][0]}")[:500]
             else:
                 fav.run_favicon_stage(f, fjobs, **common)
+            def js_stage() -> None:
+                nonlocal pacer
+                jf = f
+                if jf is None:       # several processes: the browser stage runs here, with a fetcher and pacer of its own
+                    pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter)
+                    jf = fav._make_local_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), job_endpoints, pacer, stop)
+                    if service is not None:
+                        jf = fav.RoutingFetcher(jf, service.fetcher)
+                js = js_icons.apply_to_shard(cfg, store, fjobs, fetcher=jf, pacer=pacer, allowed_endpoints=job_endpoints,
+                                             icon_store=icons, killed=stop)
+                js_rows.extend(js.rows)
+                counts.update(js.counts())
+            if getattr(getattr(cfg.favicon, "javascript", None), "enabled", False) and not stop():
+                st.guard("favicon_js_icons", js_stage)
             # every job leaves exactly one record, whatever happened to it; fewer in the store means some were lost
             expected = len({(j["ip"], j["port"], j.get("hostname")) for j in fjobs})
             stored = store.count_favicons()
@@ -1146,6 +1162,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             checksums["normalized/tool_jobs.jsonl"] = write_jsonl(normalized / "tool_jobs.jsonl", jobs)
         if docs_sha:
             checksums["normalized/http_documents.jsonl"] = docs_sha
+        if getattr(getattr(cfg.favicon, "javascript", None), "enabled", False):
+            checksums["normalized/js_icon_pages.jsonl"] = write_jsonl(normalized / "js_icon_pages.jsonl",
+                                                                       sorted(js_rows, key=lambda r: (r["ip"], r["port"])))
         if cfg.favicon.offhost.enabled:
             checksums["normalized/offhost_icon_fetches.jsonl"] = write_jsonl(normalized / "offhost_icon_fetches.jsonl", offhost_log)
         checksums["normalized/policy_refusals.jsonl"] = write_jsonl(normalized / "policy_refusals.jsonl", [r.as_dict() for r in policy.refusals])
