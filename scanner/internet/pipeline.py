@@ -1019,8 +1019,15 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         # the remaining icons of their page.
         # With several processes each builds its own fetcher and pacer; the parent keeps none.
         parallel = cfg.favicon.processes > 1 and (fetcher is None or fetcher_factory is not None)
-        factory = None
+        factory = service = None
         if parallel:
+            if cfg.favicon.offhost.enabled:
+                # one off-host fetcher in this process for all workers: shared cache, caps and per-destination pacing
+                service = fav.OffhostService(fav.make_offhost_fetcher(
+                    cfg, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout), exclusions, killed=stop,
+                    state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json",
+                    pacer=pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0, limiter=limiter)),
+                    threads=min(64, cfg.favicon.workers))
             factory = fetcher_factory or fav.FetcherFactory(
                 cfg, sorted(job_ips), job_endpoints, max_active_requests=fav.split_cap(cfg.favicon.max_active_requests, cfg.favicon.processes))
             f = None
@@ -1054,7 +1061,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 worker_failures: list[tuple[str, int]] = []
                 fav.run_favicon_stage_processes(factory, fjobs, processes=cfg.favicon.processes, pace=pace,
                                                 subnet_cap=cfg.measurement.max_connections_per_subnet,
-                                                on_failure=lambda why, lost: worker_failures.append((why, lost)), **common)
+                                                on_failure=lambda why, lost: worker_failures.append((why, lost)),
+                                                offhost_service=service, **common)
                 if worker_failures:
                     lost = sum(n for _, n in worker_failures)
                     st.errors["favicon_workers"] = (f"{len(worker_failures)} favicon worker process(es) failed, {lost} of {len(fjobs)} lookups "
@@ -1081,7 +1089,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                     counts["favicon_images_stored"] = len(icons)
                     counts["favicon_images_indexed"] = icons.write_index(store.iter_favicons(), spool=run_dir / "work" / "icon-index.sqlite")
                 st.guard("favicon_icon_index", index_icons)
-            offhost = getattr(f, "offhost", None)
+            offhost = getattr(f, "offhost", None) or (service.fetcher if service is not None else None)
             st.guard("favicon_offhost_state", getattr(offhost, "save_state", lambda: None))
 
             def count_offhost() -> None:
@@ -1092,6 +1100,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                     counts["offhost_icon_requests"] = len(sent)
                     counts["offhost_icon_logged"] = len(third_party)
                     counts["offhost_icon_refused"] = sum(1 for e in third_party if e["outcome"] == "policy_refused")
+                    counts["offhost_icon_distinct_urls"] = len({e["url"] for e in third_party})
+                    counts["offhost_icon_cache_hits"] = sum(1 for e in third_party if e["cached"])
+                    counts["offhost_icon_duplicate_content"] = sum(1 for e in third_party if e.get("duplicate_content"))
             st.guard("favicon_offhost_log", count_offhost)
 
     if not st.network_only:

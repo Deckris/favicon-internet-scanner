@@ -88,8 +88,8 @@ def test_overrides_outside_the_validated_ranges_are_refused(name, value):
         prof.derive(8, 16, 65536, overrides={name: value})
 
 
-def test_offhost_icons_keep_one_favicon_process():
-    assert prof.derive(16, 64, 65536, offhost_icons=True)["favicon_processes"] == 1
+def test_offhost_icons_no_longer_limit_the_favicon_processes():
+    assert prof.derive(16, 64, 65536, offhost_icons=True)["favicon_processes"] == 16
 
 
 def test_detect_prefers_given_values():

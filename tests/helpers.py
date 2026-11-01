@@ -251,9 +251,12 @@ class ProcessFetcher(FakeFetcher):
         if self.log:
             with _LOG_LOCK, open(f"{self.log}.{os.getpid()}", "a", encoding="ascii") as fh:
                 fh.write(f"{connect_ip} {time.monotonic():.6f}\n")
-        if self.delay:
-            time.sleep(self.delay)
-        return super().fetch(url, connect_ip=connect_ip, kind=kind, context=context)
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            return super().fetch(url, connect_ip=connect_ip, kind=kind, context=context)
+        finally:
+            self.pacer.done(connect_ip)       # gives the network slot back, as GuardedFetcher does
 
 
 class ProcessFetcherFactory:

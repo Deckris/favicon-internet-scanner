@@ -92,7 +92,7 @@ def derive(cores: int, memory_gb: float | None, open_files: int, *, offhost_icon
     batch = given.get("zgrab_batch_size") or _clamp(senders * BATCH_PER_SENDER, "zgrab_batch_size")
 
     active = given.get("favicon_max_active_requests") or _clamp(favicon_active, "favicon_max_active_requests")
-    processes = given.get("favicon_processes") or (1 if offhost_icons else _clamp(min(cores, 64), "favicon_processes"))
+    processes = given.get("favicon_processes") or _clamp(min(cores, 64), "favicon_processes")
     workers = given.get("favicon_workers") or _clamp(max(64, active * 2, processes), "favicon_workers")
     if "favicon_processes" not in given:
         processes = max(1, min(processes, workers, active))      # each process needs a worker and a request slot

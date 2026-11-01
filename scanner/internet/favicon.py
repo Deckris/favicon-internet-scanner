@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from concurrent.futures import Future
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from typing import Any
 
 import dns.resolver
@@ -29,6 +29,7 @@ from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.internet import outputs
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from scanner.internet.icon_store import IconStore
+from scanner.internet.offhost_service import OffhostClient, OffhostService
 from scanner.internet.pacing import IpPacer, SubnetLimiter
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
@@ -180,12 +181,16 @@ class OffhostIconFetcher(WebFetcher):
     """
 
     def __init__(self, *args: Any, max_total: int, max_per_host: int, min_interval: float,
-                 killed: Any = lambda: False, state_path: Any = None, **kwargs: Any) -> None:
+                 killed: Any = lambda: False, state_path: Any = None, pacer: Any = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.max_total, self.max_per_host, self.min_interval, self.killed = max_total, max_per_host, min_interval, killed
+        # Per destination address: the same pause and per-network cap as for the scanned addresses (see IpPacer).
+        self.pacer = pacer
         self.log: list[dict[str, Any]] = []
         self._lock = threading.Lock()
-        self._cache: dict[str, tuple[Any, bytes | None]] = {}
+        self._cache: dict[str, tuple[Any, bytes | None]] = {}      # by normalised URL, also by the URL an icon ended at
+        self._inflight: dict[str, threading.Event] = {}            # a URL being fetched: other askers wait for it
+        self._by_hash: dict[str, str] = {}                         # body digest -> first URL that returned it
         self._per_host: dict[str, int] = {}
         self._per_ip: dict[str, int] = {}
         self._next_slot: dict[str, float] = {}
@@ -216,13 +221,18 @@ class OffhostIconFetcher(WebFetcher):
             failure_category=reason, http_status=None, content_type=None, content_encoding=None, retry_after=None,
             body_sha256=None, body_bytes=0, redirect_chain=(), final_url=url, certificate=None), None
 
-    def _record(self, url: str, context: str, result: Any, cached: bool) -> None:
+    @staticmethod
+    def _key(url: str) -> str:
+        p = urlsplit(url)
+        return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path or "/", p.query, ""))
+
+    def _record(self, url: str, context: str, result: Any, cached: bool, duplicate_content: bool = False) -> None:
         with self._lock:
             self.log.append({
                 "url": url, "referred_by": context, "outcome": result.outcome, "failure_category": result.failure_category,
                 "http_status": result.http_status, "content_type": result.content_type, "bytes": result.body_bytes,
                 "sha256": result.body_sha256, "connect_ip": result.connect_ip, "cached": cached,
-                "redirects": [h.to_url for h in result.redirect_chain],
+                "redirects": [h.to_url for h in result.redirect_chain], "duplicate_content": duplicate_content,
             })
 
     def fetch(self, url: str, *, connect_ip: str | None, kind: str, context: str = ""):   # type: ignore[override]
@@ -235,11 +245,28 @@ class OffhostIconFetcher(WebFetcher):
             return self._refuse(url, connect_ip, "offhost_favicons_only")
         if port not in OFFHOST_PORTS:
             return self._refuse(url, None, "offhost_port")
-        with self._lock:
-            hit = self._cache.get(url)
-        if hit is not None:
-            self._record(url, context, hit[0], True)
-            return hit
+        key = self._key(url)
+        while True:
+            with self._lock:
+                hit = self._cache.get(key)
+                pending = None if hit is not None else self._inflight.get(key)
+                if hit is None and pending is None:
+                    self._inflight[key] = threading.Event()
+            if hit is not None:
+                self._record(url, context, hit[0], True)
+                return hit
+            if pending is None:
+                break
+            pending.wait()          # another thread is fetching this URL: take its result instead of asking again
+        try:
+            return self._fetch_new(url, key, host, context)
+        finally:
+            with self._lock:
+                done = self._inflight.pop(key, None)
+            if done is not None:
+                done.set()
+
+    def _fetch_new(self, url: str, key: str, host: str, context: str):
         with self._lock:
             reason = ("run_cap" if self._sent >= self.max_total else
                       "host_cap" if self._per_host.get(host, 0) >= self.max_per_host else None)
@@ -257,9 +284,14 @@ class OffhostIconFetcher(WebFetcher):
         if delay > 0:
             time.sleep(delay)
         res = super().fetch(url, connect_ip=None, kind="favicon", context=context)
+        sha = res[0].body_sha256
         with self._lock:
-            self._cache[url] = res
-        self._record(url, context, res[0], False)
+            self._cache[key] = res
+            final = res[0].final_url
+            if res[0].outcome == "ok" and final:
+                self._cache.setdefault(self._key(final), res)       # the same icon asked for under its final address
+            duplicate = bool(sha) and self._by_hash.setdefault(sha, key) != key
+        self._record(url, context, res[0], False, duplicate)
         return res
 
     def _one_request(self, parts, hostname, port, connect_ip, limits, timeout, deadline):   # type: ignore[override]
@@ -270,11 +302,18 @@ class OffhostIconFetcher(WebFetcher):
             if seen >= self.max_per_host * 2:
                 return GuardedFetcher._outcome("policy_refused", connect_ip, hostname, port, parts.scheme)
             self._per_ip[connect_ip] = seen + 1
+        if self.pacer is not None and not self.pacer.wait(connect_ip):
+            return GuardedFetcher._outcome("skipped_kill_switch", connect_ip, hostname, port, parts.scheme)
+        result = None
         try:
-            return super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+            result = super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+            return result
         except Exception as exc:
             return GuardedFetcher._outcome("decode_error" if "error" in type(exc).__name__.lower() else "fetch_error",
                                            connect_ip, hostname, port, parts.scheme)
+        finally:
+            if self.pacer is not None and hasattr(self.pacer, "done"):
+                self.pacer.done(connect_ip, result)
 
 
 class RoutingFetcher:
@@ -304,16 +343,21 @@ def make_fetcher(cfg: Any, policy: TargetPolicy, resolver: Any, allowed_endpoint
                  *, exclusions: list[str] | None = None, killed: Any = lambda: False, state_path: Any = None,
                  pacer: Any = None) -> Any:
     local = _make_local_fetcher(cfg, policy, resolver, allowed_endpoints, pacer, killed)
-    oh = cfg.favicon.offhost
-    if not oh.enabled:
+    if not cfg.favicon.offhost.enabled:
         return local
+    return RoutingFetcher(local, make_offhost_fetcher(cfg, resolver, exclusions or [], killed=killed, state_path=state_path, pacer=pacer))
+
+
+def make_offhost_fetcher(cfg: Any, resolver: Any, exclusions: list[str], *, killed: Any = lambda: False,
+                         state_path: Any = None, pacer: Any = None) -> OffhostIconFetcher:
+    """The third-party icon fetcher. ``pacer`` spaces requests per destination address (shared by all callers)."""
+    oh = cfg.favicon.offhost
     lim = _limits(cfg, oh.max_bytes)
-    third_party = OffhostIconFetcher(
-        offhost_policy(cfg, exclusions or []), resolver, user_agent=cfg.fetch.user_agent,
+    return OffhostIconFetcher(
+        offhost_policy(cfg, exclusions), resolver, user_agent=cfg.fetch.user_agent,
         document_limits=lim, favicon_limits=lim, retry_statuses=(), max_retries=0, retry_after_cap=0.0,
         max_total=oh.max_total_fetches, max_per_host=oh.max_per_host, min_interval=oh.min_interval_seconds, killed=killed,
-        state_path=state_path)
-    return RoutingFetcher(local, third_party)
+        state_path=state_path, pacer=pacer)
 
 
 def _make_local_fetcher(cfg: Any, policy: TargetPolicy, resolver: Any, allowed_endpoints: set[tuple[str, int]],
@@ -848,7 +892,7 @@ class SharedFlag:
 
 def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings: dict[str, Any], store_root: Any,
                  documents: dict[tuple[str, int], dict[str, Any]], done: dict[tuple[str, int, str | None], dict[str, Any]],
-                 stop: Any, conn: Any) -> None:
+                 stop: Any, conn: Any, offhost_conn: Any = None) -> None:
     """``conn`` is the sending end of this process's own pipe, so a process killed mid-send blocks no other.
 
     Messages: ``("log", record)`` for a record fetched here, ``("rec", position, record)`` for every final record
@@ -864,7 +908,10 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
         limiter = SubnetLimiter(settings["subnet_cap"]) if settings.get("subnet_cap") else None
         pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0, limiter=limiter)
         store = IconStore(store_root) if store_root is not None else None
-        run_favicon_stage(factory(pacer, frozenset(j["ip"] for j in jobs), stopped), jobs, workers=settings["workers"],
+        fetcher = factory(pacer, frozenset(j["ip"] for j in jobs), stopped)
+        if offhost_conn is not None:       # icons on other hosts are fetched by the parent's service, once for all processes
+            fetcher = RoutingFetcher(fetcher, OffhostClient(offhost_conn))
+        run_favicon_stage(fetcher, jobs, workers=settings["workers"],
                           max_icons=settings["max_icons"], killed=stopped, icon_store=store, selection=settings["selection"],
                           fallback=settings["fallback"], documents=documents, max_document_bytes=settings["max_document_bytes"],
                           done=done, on_record=lambda rec: send(("log", rec)), grace=settings["grace"],
@@ -883,7 +930,7 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                                 max_document_bytes: int = 0, on_record: Any = None,
                                 done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None,
                                 grace: float = STOP_GRACE_SECONDS, record_sink: Any = None,
-                                on_failure: Any = None, subnet_cap: int = 0) -> list[dict[str, Any]]:
+                                on_failure: Any = None, subnet_cap: int = 0, offhost_service: Any = None) -> list[dict[str, Any]]:
     """Like ``run_favicon_stage`` but over ``processes`` worker processes; one record per job, original order.
 
     ``factory(pacer, owned, killed)`` returns the fetcher (``owned``: the addresses of the process) and must be
@@ -895,6 +942,9 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     One difference from a single process: a process is approved only for its own addresses, so a redirect hop to an
     endpoint owned by another process is refused (``policy_refused``), exactly like a hop to any endpoint that is not
     approved; with one process the hop would be followed. This keeps every address contacted and paced by one process.
+
+    With ``offhost_service`` (an ``OffhostService``) every process sends the icon URLs that lie on other hosts to the
+    service in this process, which fetches each URL once, paces each destination address and counts the caps for all.
 
     ``killed`` is polled here and mirrored to the workers through an event, so a stop reaches every process within a
     poll; a process still running well after ``grace`` is terminated and its unfinished jobs recorded as skipped. A
@@ -949,9 +999,12 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
         keys = {(j["ip"], j["port"]) for j in mine}
         docs = {key: doc for key, doc in (documents or {}).items() if key in keys}
         earlier = {key: rec for key, rec in (done or {}).items() if key[0] in owned}
+        off_end = offhost_service.open_channel(ctx) if offhost_service is not None else None
         procs.append(ctx.Process(target=_worker_main, name=f"favicon-{i}", daemon=True,
-                                 args=(i, factory, mine, settings, store_root, docs, earlier, stop, send_end)))
+                                 args=(i, factory, mine, settings, store_root, docs, earlier, stop, send_end, off_end)))
         sends.append(send_end)
+        if off_end is not None:
+            sends.append(off_end)
     finished: set[int] = set()
 
     def handle(i: int, message: tuple) -> None:

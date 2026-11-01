@@ -399,9 +399,6 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     if not isinstance(oh["enabled"], bool):
         raise ConfigError("favicon.offhost_icons.enabled must be true or false")
     procs = _int(fv.get("processes", 1), "favicon.processes", 1, 64)
-    if oh["enabled"] and procs > 1:
-        # The third-party caps and their saved state are counted by one fetcher; several processes would each count their own.
-        raise ConfigError("favicon.processes above 1 cannot be combined with favicon.offhost_icons.enabled")
     for key, cap in (("workers", fv.get("workers")), ("max_active_requests", fv.get("max_active_requests", 512))):
         if isinstance(cap, int) and not isinstance(cap, bool) and procs > cap:
             raise ConfigError(f"favicon.processes ({procs}) cannot exceed favicon.{key} ({cap}); each process needs at least one")

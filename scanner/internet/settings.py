@@ -58,7 +58,7 @@ scope:
   # zgrab_batch_size: 20000           # addresses per ZGrab2 batch (1-100000)
   # dns_threads: 100                  # zdns threads (1-1000)
   # favicon_workers: 256              # favicon worker threads in all (1-8192)
-  # favicon_processes: 4              # worker processes sharing the favicon requests (not with offhost_icons)
+  # favicon_processes: 4              # worker processes sharing the favicon requests
   # favicon_max_active_requests: 512  # favicon requests on the wire at once (1-8192)
   # favicon_stage_max_seconds: 86400  # time limit of the favicon stage (1-86400)
   try_unverified_names: false       # also request pages under certificate names that did not verify
@@ -335,8 +335,6 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
         raise SettingsError(f"scope.favicon_processes `{processes}` must be a whole number from 1 to 64")
     if processes > int(workers):
         raise SettingsError(f"scope.favicon_processes `{processes}` cannot exceed scope.favicon_workers `{workers}`")
-    if offhost and processes > 1:
-        raise SettingsError("scope.favicon_processes above 1 cannot be combined with scope.offhost_icons")
     probes = 1
     targets = ALLOWED_ADDRESSES * fraction
     runtime = int(min(7 * 24 * 3600, max(3600, math.ceil(targets * probes / rate * 1.5) + 600)))

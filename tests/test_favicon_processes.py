@@ -217,11 +217,6 @@ def test_processes_setting_is_validated(tmp_path):
             load_config(_rewrite(tmp_path, lambda d: d["favicon"].update(processes=bad)))
 
 
-def test_several_processes_cannot_share_the_off_host_caps(tmp_path):
-    with pytest.raises(ConfigError, match="offhost_icons"):
-        load_config(_rewrite(tmp_path, lambda d: d["favicon"].update(processes=2, offhost_icons={"enabled": True})))
-
-
 def test_pipeline_outputs_match_between_one_and_two_processes(tmp_path):
     one, two = tmp_path / "one", tmp_path / "two"
     one.mkdir()
