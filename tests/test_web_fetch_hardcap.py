@@ -368,3 +368,70 @@ def test_a_finished_request_is_never_expired_afterwards():
     watch.finish()
     time.sleep(0.6)
     assert fired == [] and not watch.fired.is_set()
+
+
+def test_a_cookie_set_by_one_response_is_not_sent_on_the_next_request(serve):
+    seen = []
+
+    def cookie_setter(conn, stop):
+        data = conn.recv(4096).decode("latin-1", "replace")
+        seen.append([line for line in data.split("\r\n") if line.lower().startswith("cookie:")])
+        conn.sendall(b"HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        conn.close()
+    srv = serve(cookie_setter)
+    fetcher = _fetcher()
+    for host in ("a.example", "a.example", "b.example", LOOPBACK):
+        res, _ = fetcher.fetch(f"http://{host}:{srv.port}/", connect_ip=LOOPBACK, kind="document")
+        assert res.http_status == 200, host
+    assert seen == [[], [], [], []]
+
+
+def test_the_reused_client_keeps_no_cookies_between_requests():
+    class Guard:
+        pass
+    with web_fetch._request_client(Guard()) as client:
+        client.cookies.set("sid", "abc", domain="127.0.0.1")
+        assert len(client.cookies.jar) == 1
+    assert len(client.cookies.jar) == 0
+
+
+def test_the_fork_hook_leaves_the_ssl_lock_free(monkeypatch):
+    monkeypatch.setattr(web_fetch, "_WATCHDOG", web_fetch._WatchdogService())
+    web_fetch._SSL_LOCK.acquire()
+    try:
+        web_fetch._after_fork_in_child()
+        assert web_fetch._SSL_LOCK.acquire(timeout=1.0)
+    finally:
+        try:
+            web_fetch._SSL_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+def test_a_slow_kill_check_does_not_delay_another_request_deadline():
+    service = web_fetch._WatchdogService()
+    fired = []
+
+    def slow_killed():
+        time.sleep(1.5)
+        return False
+    slow = service.watch(time.monotonic() + 30, slow_killed, lambda: fired.append("slow"))
+    quick = service.watch(time.monotonic() + 0.3, lambda: False, lambda: fired.append("quick"))
+    began = time.monotonic()
+    assert quick.fired.wait(1.0), "the expired request waited behind a slow kill check"
+    assert time.monotonic() - began < 1.0
+    slow.finish()
+    quick.finish()
+
+
+def test_a_request_with_an_earlier_deadline_is_not_held_to_the_next_tick():
+    service = web_fetch._WatchdogService()
+    service.TICK = 2.0
+    later = service.watch(time.monotonic() + 30, lambda: False, lambda: None)
+    time.sleep(0.2)                                   # the service thread is now asleep until its tick
+    began = time.monotonic()
+    soon = service.watch(began + 0.2, lambda: False, lambda: None)
+    assert soon.fired.wait(1.5)
+    assert time.monotonic() - began < 1.0
+    later.finish()
+    soon.finish()
