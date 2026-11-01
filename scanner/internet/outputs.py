@@ -19,6 +19,9 @@ Output schema 2 (``output_schema`` in the manifest; absent means 1) changes two 
   file alike. The manifest keeps the checksum of the stored bytes in ``output_checksums`` and, under ``compaction``,
   the checksum and size of the content as well. The original is removed only after the compressed copy has been
   written, flushed, read back and found identical, so a crash leaves one of the two intact.
+* ``prune_raw`` (``python -m scanner.internet prune-raw RUN_DIR``) deletes the ``raw/`` directory of a compacted run
+  once the files of its manifest have been re-hashed and the tables the analysis reads are there. The manifest is left
+  as it is; ``raw_pruned.json`` records what was removed.
 
 ``iter_endpoint_rows`` and ``iter_hostname_rows`` yield the rows of either schema in the schema 1 shape.
 Both files are written in the same ``(ip, port)`` order, so the join is a single streaming merge.
@@ -30,7 +33,9 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -400,6 +405,109 @@ def compact_run(run_dir: Any, *, level: int = COMPACT_LEVEL, log: Callable[[str]
     if failed:
         result["failed"] = failed
     return result
+
+
+# ---------------------------------------------------------------- pruning raw/
+
+# Written by every run that finishes cleanly, plain or compacted; the analysis reads them (the matcher needs the first three).
+PRUNE_REQUIRES = ("ip_results.csv", "normalized/endpoints.jsonl", "normalized/hostname_resolution.jsonl",
+                  "normalized/tool_jobs.jsonl", "normalized/policy_refusals.jsonl")
+
+
+def _prune_refusal(run_dir: Path, manifest: Any) -> str | None:
+    """Why ``raw/`` of this run may not be deleted, or None when it may."""
+    if not isinstance(manifest, dict):
+        return "no readable manifest"
+    if not manifest.get("complete"):
+        return "the manifest does not say the run is complete"
+    if manifest.get("stage_errors"):
+        return "the manifest lists stage errors"
+    section = manifest.get("compaction")
+    files = section.get("files") if isinstance(section, dict) else None
+    if not isinstance(files, dict) or not files:
+        return "the run has not been compacted (no compaction block in the manifest)"
+    for rel, record in sorted(files.items()):
+        target = (run_dir / rel).resolve()
+        if run_dir.resolve() not in target.parents:
+            return f"{rel} in the compaction block points outside the run"
+        if not target.is_file():
+            return f"{rel} from the compaction block is missing"
+        if not isinstance(record, dict) or not record.get("sha256"):
+            return f"{rel} has no recorded checksum"
+        if _sha256_file(target) != record["sha256"]:
+            return f"{rel} does not match its checksum in the manifest"
+    for rel in PRUNE_REQUIRES:
+        if not exists(run_dir / rel):
+            return f"{rel} is missing"
+    return None
+
+
+def _atomic_json(path: Path, data: Any) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, indent=2, default=str))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def prune_raw(run_dir: Any) -> dict[str, Any]:
+    """Delete ``raw/`` of a run whose outputs are complete, compacted and still match their checksums.
+
+    Nothing is deleted unless the manifest says the run is complete without stage errors, every file of its
+    ``compaction`` block is on disk with the recorded SHA-256, and the tables listed in ``PRUNE_REQUIRES`` exist.
+    The manifest is not touched; ``raw_pruned.json`` holds the time, the bytes and file count removed and the raw
+    files with the checksums the manifest recorded for them. ``raw/`` is renamed to ``raw.pruning`` before it is
+    removed, so an interruption leaves a directory that a repeated call (it needs no further checks) finishes off.
+    Returns ``{"status": "pruned" | "unchanged" | "refused" | "failed", ...}``; ``reason`` explains the last two.
+    """
+    run_dir = Path(run_dir)
+    raw, pending, record_path = run_dir / "raw", run_dir / "raw.pruning", run_dir / "raw_pruned.json"
+    if pending.exists():
+        if raw.exists():
+            return {"status": "refused", "reason": "raw and raw.pruning both exist"}
+        resumed = True
+    elif raw.is_dir():
+        try:
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = None
+        reason = _prune_refusal(run_dir, manifest)
+        if reason is not None:
+            return {"status": "refused", "reason": reason}
+        os.replace(raw, pending)
+        _fsync_dir(run_dir)
+        resumed = False
+    elif record_path.exists():
+        return {"status": "unchanged", "reason": "raw/ was removed earlier"}
+    else:
+        return {"status": "refused", "reason": "there is no raw/ directory"}
+    if not record_path.exists():
+        recorded = _read_json(run_dir / "manifest.json").get("output_checksums") or {}
+        listed = []
+        for root, _dirs, names in os.walk(pending):
+            for name in sorted(names):
+                path = Path(root) / name
+                rel = "raw/" + path.relative_to(pending).as_posix()
+                listed.append({"file": rel, "bytes": path.lstat().st_size, "sha256": recorded.get(rel)})
+        listed.sort(key=lambda item: item["file"])
+        _atomic_json(record_path, {"pruned_at": time.time(), "files_removed": len(listed),
+                                   "bytes_removed": sum(item["bytes"] for item in listed), "resumed": resumed, "files": listed})
+    try:
+        shutil.rmtree(pending)
+    except OSError as exc:
+        return {"status": "failed", "reason": f"raw.pruning could not be removed ({exc})"}
+    _fsync_dir(run_dir)
+    return {"status": "pruned", **{k: v for k, v in _read_json(record_path).items() if k != "files"}}
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def tree_bytes(path: Any) -> int:

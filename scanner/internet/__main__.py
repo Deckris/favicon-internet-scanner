@@ -114,8 +114,8 @@ def _settings_command(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="scanner.internet")
-    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact") + SETTINGS_COMMANDS)
-    ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact: the finished run")
+    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact", "prune-raw") + SETTINGS_COMMANDS)
+    ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact, prune-raw: the finished run")
     ap.add_argument("--out", type=Path, help="export-csv: output file (default: normalized/hostname_resolution.csv in the run)")
     ap.add_argument("--config", type=Path)
     ap.add_argument("--workdir", type=Path, default=Path("."), help="init, apply, exclusions: folder holding settings.yaml")
@@ -162,6 +162,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2))
         if result["status"] in ("skipped", "unavailable") or result.get("failed"):
             print(f"REFUSED: nothing was compacted ({result.get('reason') or result.get('failed') or 'zstandard is not installed'})", file=sys.stderr)
+            return 2
+        return 0
+    if args.command == "prune-raw":
+        if args.run_dir is None:
+            ap.error("prune-raw needs RUN_DIR")
+        from scanner.internet import outputs
+        result = outputs.prune_raw(args.run_dir)
+        print(json.dumps(result, indent=2))
+        if result["status"] in ("refused", "failed"):
+            print(f"REFUSED: raw/ was not removed ({result['reason']})", file=sys.stderr)
             return 2
         return 0
     if args.config is None:

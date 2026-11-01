@@ -39,3 +39,4 @@ run:
   label: pilot
   output_dir: runs
   kill_switch_file: STOP   # `scanner stop` creates this file
+  # prune_raw_keep_every: 50   # campaign: delete raw/ of each compacted shard except every 50th (0 or absent keeps all; changes the config checksum)

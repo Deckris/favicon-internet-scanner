@@ -65,6 +65,7 @@ run:
   label: {label}
   output_dir: {output_dir}
   kill_switch_file: {kill_switch}   # `scanner stop` creates this file
+  # prune_raw_keep_every: 50   # campaign: delete raw/ of each compacted shard except every 50th (0 or absent keeps all; changes the config checksum)
 """
 
 DEFAULTS: dict[str, Any] = {
@@ -290,6 +291,11 @@ def apply(workdir: Path) -> dict[str, Any]:
     base["fetch"]["user_agent"] = f"{s.get('scanner_name', 'research-scanner')} (+{info}; contact {contact})"
     base["transparency"] = {"info_url": info, "contact": contact}
     base["output"] = {"dir": str(run["output_dir"])}
+    keep_raw = run.get("prune_raw_keep_every", 0)
+    if isinstance(keep_raw, bool) or not isinstance(keep_raw, int) or keep_raw < 0:
+        raise SettingsError(f"run.prune_raw_keep_every `{keep_raw}` must be a whole number, 0 or more")
+    if keep_raw:
+        base["output"]["prune_raw_keep_every"] = keep_raw     # left out when off, so the config checksum is the one it was
     base["operations"] = {**base.get("operations", {}), "kill_switch_file": str(run["kill_switch_file"])}
 
     operations = ["hostname_resolution", "favicon_fetch"] + (["offhost_icon_fetch"] if offhost else [])

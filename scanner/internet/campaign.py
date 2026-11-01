@@ -10,7 +10,7 @@ disk, an expired approval and tool errors all end it, and nothing further is sen
 A file named ``DRAIN`` in the campaign directory ends it more gently: the shard in progress finishes, no further shard starts.
 So does too little free disk: a shard starts only while the output disk holds ``disk_floor`` bytes (``operations.min_free_gb_between_shards``),
 and a campaign that stops for that reason (reason ``disk``) resumes when the same command is run again with space freed.
-A finished shard's record files are compacted to ``.zst`` (see ``outputs.compact_run``); a resumed campaign completes a compaction that was interrupted.
+A finished shard's record files are compacted to ``.zst`` (see ``outputs.compact_run``); a resumed campaign completes a compaction that was interrupted. With ``output.prune_raw_keep_every`` set, the ``raw/`` directory of a compacted shard is then deleted (``outputs.prune_raw``).
 With ``pipeline_depth=2`` the shards run as child processes that overlap (see ``supervisor``); the state file and the stop rules stay the same.
 """
 from __future__ import annotations
@@ -240,6 +240,26 @@ def compact_finished(cfg: Any, entry: dict[str, Any], log: Callable[[str], None]
         log(f"[campaign] compacted {Path(entry['run_dir']).name}")
 
 
+def prune_finished(cfg: Any, entry: dict[str, Any], i: int, log: Callable[[str], None]) -> None:
+    """Delete ``raw/`` of a compacted shard unless ``output.prune_raw_keep_every`` keeps it (off by default).
+
+    A refusal is logged and leaves ``raw/`` where it is; it never stops the campaign.
+    """
+    keep = cfg.prune_raw_keep_every
+    if keep <= 0 or i % keep == 0 or not entry.get("run_dir") or not Path(entry["run_dir"]).is_dir():
+        return
+    try:
+        result = outputs.prune_raw(entry["run_dir"])
+    except Exception as exc:                       # raw/ stays (or the next call finishes the removal); the campaign goes on
+        log(f"[campaign] could not prune raw/ of {entry['run_dir']}: {type(exc).__name__}: {exc}")
+        return
+    if result["status"] == "pruned":
+        entry["disk_bytes"] = outputs.tree_bytes(entry["run_dir"])
+        log(f"[campaign] removed raw/ of {Path(entry['run_dir']).name} ({result['bytes_removed']} bytes)")
+    elif result["status"] != "unchanged":
+        log(f"[campaign] kept raw/ of {Path(entry['run_dir']).name}: {result['reason']}")
+
+
 def _run_id(cfg: Any, i: int, attempt: int) -> str:
     return f"scanner-{cfg.run_label}-{cfg.checksum[:8]}-s{i:03d}of{cfg.shards:03d}-a{attempt}"
 
@@ -304,6 +324,7 @@ def begin_shard(cfg: Any, state: dict[str, Any], i: int, log: Callable[[str], No
             log(f"[campaign] shard {i + 1}/{cfg.shards}: adopting the finished run {prior.name}")
     if entry["status"] == "complete":
         compact_finished(cfg, entry, log)
+        prune_finished(cfg, entry, i, log)
         return "complete", None
     if (campaign_dir(cfg) / "DRAIN").exists():
         log(f"[campaign] {campaign_dir(cfg) / 'DRAIN'} exists: stopping before shard {i + 1}/{cfg.shards}")
@@ -388,6 +409,7 @@ def _run_campaign(cfg: Any, run_fn: Callable[..., Path], log: Callable[[str], No
         run_dirs[i] = Path(run_dir)
         stopped = record_finished(entry, i, run_dir)
         if entry["status"] == "complete":
+            prune_finished(cfg, entry, i, log)
             _write_json(path, state)
         if stopped:
             break

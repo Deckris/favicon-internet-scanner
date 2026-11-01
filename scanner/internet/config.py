@@ -99,6 +99,7 @@ class ScanConfig:
     min_free_mib: int = 512                    # abort when free disk falls below this
     min_free_gb_between_shards: float | None = None   # a campaign starts no shard below this much free disk (None = from the shard sizes)
     compact_outputs: bool = True               # compress the record files of a finished shard (outputs.compact_run)
+    prune_raw_keep_every: int = 0              # campaign: delete raw/ of a compacted shard unless its index is a multiple of this (0 = never)
     stall_minutes: int = 30                    # abort when no stage makes progress for this long and no tool runs (0 = off)
     target_ips: tuple[str, ...] = ()           # known-targets mode: probe exactly these addresses, not a random sample
     target_hostnames: tuple[str, ...] = ()     # operator-supplied names, verified like any other candidate
@@ -356,7 +357,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
             raise ConfigError("transparency.anonymous is set but fetch.user_agent still carries a contact or URL")
     elif tr["contact"] not in f["user_agent"] and tr["info_url"] not in f["user_agent"]:
         raise ConfigError("fetch.user_agent must embed the transparency contact or info URL")
-    out = _section(raw, "output", {"dir", "max_listed_targets", "compact"}, {"dir"})
+    out = _section(raw, "output", {"dir", "max_listed_targets", "compact", "prune_raw_keep_every"}, {"dir"})
     ops = _section(raw, "operations", {"kill_switch_file", "egress_check_seconds", "min_free_mib", "min_free_gb_between_shards", "stall_minutes"},
                    {"kill_switch_file"})
     bins = _section({"binaries": raw.get("binaries") or {}}, "binaries", {"zmap", "zgrab2", "zdns"}, set())
@@ -378,6 +379,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         min_free_gb_between_shards=(None if ops.get("min_free_gb_between_shards") is None
                                     else _float(ops["min_free_gb_between_shards"], "operations.min_free_gb_between_shards", 0.0, 10**6)),
         compact_outputs=_bool(out.get("compact", True), "output.compact"),
+        prune_raw_keep_every=_int(out.get("prune_raw_keep_every", 0), "output.prune_raw_keep_every", 0, 10**6),
         stall_minutes=_int(ops.get("stall_minutes", 30), "operations.stall_minutes", 0, 10**5),
         exclusions_file=excl_file, exclusions_sha256=str(tp["exclusions_sha256"]).lower(),
         approval_file=rel(tp["approval_file"]),

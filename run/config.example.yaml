@@ -123,6 +123,7 @@ output:
   dir: runs   # use an absolute path; relative paths are resolved against THIS file
   # max_listed_targets: 1000000      # above this many targets per shard the full target list is not written
   # compact: true                    # compress the record files of a shard that finished cleanly (.zst); false keeps them plain
+  # prune_raw_keep_every: 0           # campaign: delete raw/ of each compacted shard whose index is not a multiple of this (0 = never)
 
 operations:
   kill_switch_file: /tmp/scanner.KILL     # `touch` it: running tools are stopped within ~1 s and the run is marked partial

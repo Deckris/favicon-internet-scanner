@@ -264,6 +264,8 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
                     continue
                 del inflight[i]
                 stop = _settle(cfg, state, c, rc, run_dirs)
+                if not stop and state["shard_states"][str(i)]["status"] == "complete":
+                    campaign.prune_finished(cfg, state["shard_states"][str(i)], i, log)
                 if stop:
                     failures[i] = stop
                     log(f"[campaign] shard {i + 1}/{cfg.shards} stopped: {stop['reason']}")
