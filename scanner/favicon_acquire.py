@@ -138,8 +138,14 @@ def acquire_favicons(
         return resource
 
     if selection == "browser_models":
-        by_order = {decl.order: decl for decl in selected}
-        candidates = [IconCandidate.from_declaration(decl) for decl in selected]
+        # A repeated URL is ranked at every position it was declared in (the models break ties by position and size)
+        # and fetched once, as the declaration that came first.
+        ranked_decls = [decl for decl in declarations if decl.policy_status in ("selected", "duplicate") and decl.resolved_url]
+        by_order = {decl.order: decl for decl in ranked_decls}
+        first_by_url: dict[str, FaviconDeclaration] = {}
+        for decl in ranked_decls:
+            first_by_url.setdefault(decl.resolved_url, decl)
+        candidates = [IconCandidate.from_declaration(decl) for decl in ranked_decls]
         chosen: dict[str, str | None] = {}
         for model in MODELS:
             chosen[model] = None
@@ -149,7 +155,7 @@ def acquire_favicons(
                 if decl.resolved_url in index_by_url:
                     resource = resources[index_by_url[decl.resolved_url]]
                 else:
-                    resource = acquire(decl)
+                    resource = acquire(first_by_url[decl.resolved_url])
                 if _resource_has_image(resource):
                     chosen[model] = decl.resolved_url
                     break
