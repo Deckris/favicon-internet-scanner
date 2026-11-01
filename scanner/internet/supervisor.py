@@ -218,7 +218,7 @@ def _settle(cfg: Any, state: dict[str, Any], child: _Child, rc: int, run_dirs: d
 
 def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path: Path | None = None, kwargs_factory: str | None = None,
                    launcher: Callable[[int, str], list[str]] | None = None, poll: float = 0.2,
-                   shards_from: int = 0, shards_to: int | None = None) -> dict[str, Any]:
+                   shards_from: int = 0, shards_to: int | None = None, archive: Any = None) -> dict[str, Any]:
     span = campaign.shard_span(cfg, shards_from, shards_to)
     check_overlap_safe(cfg)
     if launcher is None:
@@ -285,11 +285,13 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
             while (not failures and halted is None and not terminating and next_shard < span.stop
                    and len(inflight) < DEPTH and a_free and not (switch and inflight)):
                 i = next_shard
-                action, run_id = campaign.begin_shard(cfg, state, i, log)
+                action, run_id = campaign.begin_shard(cfg, state, i, log, archive)
                 next_shard += 1
                 entry = state["shard_states"][str(i)]
                 if action == "complete":
                     run_dirs[i] = Path(entry["run_dir"])
+                    continue
+                if action == "network_done":
                     continue
                 if action == "drain":
                     halted = {"shard": i, "reason": "drain", "detail": "stopped between shards on request"}

@@ -112,10 +112,54 @@ def _settings_command(args) -> int:
         return 2
 
 
+def _favicon_stage(args, cfg) -> int:
+    """Run the favicon stage of a network-only shard (this host's copy or the original) and finish the shard."""
+    if args.run_dir is None:
+        print("REFUSED: favicon-stage needs RUN_DIR", file=sys.stderr)
+        return 2
+    from scanner.internet import split
+    problems = split.verify_export(args.run_dir)
+    if problems:
+        print("REFUSED: the exported run does not match its checksums: " + "; ".join(problems[:5]), file=sys.stderr)
+        return 2
+    token = pipeline.confirm_token(cfg, pipeline.build_policy(cfg)[1])
+    if args.confirm != token:
+        print("REFUSED: favicon-stage requires --confirm with the token printed by `plan` for this config", file=sys.stderr)
+        return 2
+    refusal = _anonymous_refusal(cfg, args)
+    if refusal:
+        print(f"REFUSED: {refusal}", file=sys.stderr)
+        return 2
+    try:
+        run_dir = pipeline.run_favicon_only(cfg, args.run_dir)
+    except (ConfigError, pre.PreflightFailed) as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:   # pragma: no cover - last-resort report
+        print(f"RUN ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    print(f"done: {run_dir}  (elapsed {manifest['elapsed_seconds']} s)")
+    if not manifest.get("complete"):
+        print(f"WARNING: favicon stage incomplete (abort_reason={manifest.get('abort_reason')}, errors={manifest.get('stage_errors')}). "
+              "The shard stays network-only; run favicon-stage again to continue.", file=sys.stderr)
+        return 5
+    try:
+        from scanner.internet import campaign
+        campaign.record_finished_shard(cfg, run_dir)
+    except Exception as exc:
+        print(f"note: the campaign state was not updated ({exc}); a repeated campaign adopts the finished run", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="scanner.internet")
-    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact", "prune-raw") + SETTINGS_COMMANDS)
-    ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact, prune-raw: the finished run")
+    ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact", "prune-raw",
+                                    "favicon-stage", "export-network", "import-favicons", "export-shard") + SETTINGS_COMMANDS)
+    ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact, prune-raw, export-shard: the finished run; "
+                    "favicon-stage, export-network, import-favicons: a network-only run")
+    ap.add_argument("dest", nargs="?", type=Path, help="export-network: new directory for the copy; import-favicons: the favicon run "
+                    "to take the outputs from; export-shard: directory to copy the run into")
     ap.add_argument("--out", type=Path, help="export-csv: output file (default: normalized/hostname_resolution.csv in the run)")
     ap.add_argument("--config", type=Path)
     ap.add_argument("--workdir", type=Path, default=Path("."), help="init, apply, exclusions: folder holding settings.yaml")
@@ -151,6 +195,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shards-to", type=int, default=None, metavar="N",
                     help="campaign: end of the shard range, exclusive (default: all shards). "
                          "`--shards-from 0 --shards-to 50` runs shards 0 to 49, `--shards-from 50` the rest")
+
+    # network-only shards and the favicon stage on a second machine
+    ap.add_argument("--stop-after-network", action="store_true",
+                    help="run, campaign: stop after the network stages and keep work/facts.sqlite (state network_done); "
+                         "finish with favicon-stage, here or on another machine")
+
+    # export of finished shards to another disk
+    ap.add_argument("--remove-source", action="store_true",
+                    help="export-shard: after every check passed, remove the exported files from the source (a stub stays)")
+    ap.add_argument("--archive-to", type=Path, metavar="DIR",
+                    help="campaign: when the output disk runs low, export finished shards to DIR (verified before any removal)")
+    ap.add_argument("--archive-remove-source", action="store_true",
+                    help="campaign: with --archive-to, remove the exported files from the output disk once verified")
+    ap.add_argument("--archive-when-free-gb-below", type=float, default=None, metavar="GB",
+                    help="campaign: with --archive-to, export when less than this is free (default: less than a shard start needs)")
     args = ap.parse_args(argv)
 
     if args.command in SETTINGS_COMMANDS:
@@ -181,6 +240,47 @@ def main(argv: list[str] | None = None) -> int:
             print(f"REFUSED: raw/ was not removed ({result['reason']})", file=sys.stderr)
             return 2
         return 0
+    if args.command == "export-network":
+        if args.run_dir is None or args.dest is None:
+            ap.error("export-network needs RUN_DIR and OUT_DIR")
+        from scanner.internet import split
+        try:
+            record = split.export_network(args.run_dir, args.dest)
+        except ConfigError as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({**record, "files": sorted(record["files"])}, indent=2))
+        return 0
+    if args.command == "import-favicons":
+        if args.run_dir is None or args.dest is None:
+            ap.error("import-favicons needs RUN_DIR and the favicon run directory")
+        from scanner.internet import split
+        try:
+            record = split.import_favicons(args.run_dir, args.dest)
+        except ConfigError as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"imported_files": len(record["files"]), "run_id": record["run_id"]}, indent=2))
+        print(f"\nFinish the shard without sending anything: python -m scanner.internet favicon-stage {args.run_dir} --config <file>")
+        return 0
+    if args.command == "export-shard":
+        if args.run_dir is None or args.dest is None:
+            ap.error("export-shard needs RUN_DIR and DEST")
+        from scanner.internet import archive
+        try:
+            result = archive.export_shard(args.run_dir, args.dest, remove_source=args.remove_source, log=print)
+        except archive.ArchiveRefused as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({k: v for k, v in result.items() if k != "problems"}, indent=2))
+        if args.config is not None:
+            try:
+                from scanner.internet import campaign
+                if not campaign.record_archived(load_config(args.config), args.run_dir, result):
+                    print("note: the campaign state does not list this run; it was not updated", file=sys.stderr)
+            except (ConfigError, ValueError, RuntimeError) as exc:
+                print(f"note: the campaign state was not updated ({exc})", file=sys.stderr)
+        return 0
     if args.config is None:
         ap.error("--config is required for this command")
     if args.command == "selftest":     # loopback only: needs no approval and sends nothing external
@@ -198,6 +298,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
 
+    if args.command == "favicon-stage":
+        return _favicon_stage(args, cfg)
     if args.command == "favicon-refetch":
         from scanner.internet import refetch
         if args.source_run is None:
@@ -280,13 +382,18 @@ def main(argv: list[str] | None = None) -> int:
         from scanner.internet.campaign import CampaignLocked, run_campaign
         try:
             span = {"shards_from": args.shards_from, "shards_to": args.shards_to}
+            if args.stop_after_network:
+                span["network_only"] = True
+            if args.archive_to is not None:
+                from scanner.internet.campaign import ArchivePolicy
+                span["archive"] = ArchivePolicy(args.archive_to, args.archive_remove_source, args.archive_when_free_gb_below)
             result = (run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config, **span) if args.pipeline > 1
                       else run_campaign(cfg, **span))
         except (CampaignLocked, ValueError) as exc:
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 2
         print(json.dumps(result, indent=2, default=str))
-        if result["complete"]:
+        if result["complete"] or (args.stop_after_network and result.get("network_complete") and not result["stopped"]):
             return 0
         stopped = result["stopped"] or {}
         if stopped.get("reason") == "disk":
@@ -307,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
               "pass --allow-rerun only if that is intended.", file=sys.stderr)
         return 2
     try:
-        run_dir = pipeline.run(cfg, run_id=args.run_id)
+        run_dir = pipeline.run(cfg, run_id=args.run_id, **({"network_only": True} if args.stop_after_network else {}))
     except pre.PreflightFailed as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
@@ -316,6 +423,9 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     print(f"done: {run_dir}  (elapsed {manifest['elapsed_seconds']} s)")
+    if manifest.get("network_done"):
+        print(f"network stages finished; favicon stage still to run: python -m scanner.internet favicon-stage {run_dir} --config <file> --confirm <token>")
+        return 0
     if manifest.get("stage_errors") or not manifest.get("complete"):
         print(f"WARNING: run incomplete (abort_reason={manifest.get('abort_reason')}, "
               f"errors={manifest.get('stage_errors')}). Outputs are partial; see raw/stderr/.", file=sys.stderr)

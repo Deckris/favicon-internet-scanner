@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import dataclasses
 import faulthandler
 import hashlib
 import json
@@ -97,6 +98,39 @@ def _scrub(value: Any) -> Any:
     return value
 
 
+def favicon_jobs(store: ShardStore, cfg: ScanConfig, counts: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str], set[tuple[str, int]]]:
+    """The favicon lookups of a shard, built from the fact store: the jobs, their addresses and their endpoints."""
+    fjobs: list[dict[str, Any]] = []
+    job_ips: set[str] = set()
+    job_endpoints: set[tuple[str, int]] = set()
+    for g in store.iter_ips():
+        for e in g.endpoints:
+            proto = _protocol_of(e)
+            first = len(fjobs)
+            # A bare-IP request only makes sense where a bare-IP session works; a host that answered
+            # only with SNI would just fail (and record a misleading direct-IP failure).
+            if proto == "http" or (proto == "https" and e.tls.ok):
+                fjobs.append({"scheme": proto, "ip": g.ip, "port": e.port, "hostname": None})
+            for h in _verified_names(g, e)[: cfg.favicon.max_hostnames_per_endpoint]:
+                sni = e.sni.get(h)
+                if proto == "http":
+                    scheme = "http"
+                elif proto == "https" and (e.tls.ok or (sni is not None and sni.ok)):
+                    scheme = "https"
+                else:
+                    continue
+                fjobs.append({"scheme": scheme, "ip": g.ip, "port": e.port, "hostname": h})
+            # Unverified names: same scanned ip:port, just a different Host/SNI. Recorded as unverified in the rows.
+            if proto in ("http", "https", "tls_unestablished"):
+                for h in _unverified_names(g, e)[: cfg.favicon.max_unverified_names_per_endpoint]:
+                    fjobs.append({"scheme": "http" if proto == "http" else "https", "ip": g.ip, "port": e.port, "hostname": h})
+                    counts["favicon_jobs_unverified_names"] = counts.get("favicon_jobs_unverified_names", 0) + 1
+            if len(fjobs) > first:
+                job_ips.add(g.ip)
+                job_endpoints.add((g.ip, e.port))
+    return fjobs, job_ips, job_endpoints
+
+
 def _earlier_attempt_records(resume_from: Path | None, have: dict, fjobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Favicon records of an earlier attempt that belong to this attempt's jobs and are not already in hand."""
     if resume_from is None:
@@ -152,6 +186,8 @@ class _Stages:
         self._monitor_done = threading.Event()
         self.phase_gate: Callable[[str], Any] | None = None     # overlapped campaigns: serialises phase A and phase B across shards
         self.phases = contextlib.ExitStack()
+        self.network_only = False                # stop after the network stages and keep the fact store (see ``run``)
+        self.replay: dict[str, Any] | None = None    # favicon-only finish of a network-only run: its manifest, see ``run_favicon_only``
 
     def progress(self) -> None:
         """Called whenever a stage gets a result; a run that stops calling it for ``stall_minutes`` is aborted."""
@@ -313,6 +349,8 @@ class _Stages:
         return None
 
     def run(self, name: str, fn: Callable[[], Any], default: Any) -> Any:
+        if self.replay is not None and name in NETWORK_STAGES:
+            return default                       # done by the network-only run whose store this run continues
         if name == "favicon" and self.phase_gate is not None:
             self.phases.close()                  # phase A ends here; phase B (favicon and write-out) waits for its slot
             try:
@@ -341,6 +379,9 @@ class _Stages:
             self.timings[name] = round(time.monotonic() - t, 3)
             self.progress()
             print(f"[scanner {self.label}] {name}: {self.timings[name]} s", file=sys.stderr, flush=True)
+
+
+NETWORK_STAGES = frozenset({"sample_list", "zmap", "tls_direct", "http_direct", "ptr", "candidates", "dns_forward", "sni_confirm"})
 
 
 def _install_signal_handlers(on_signal: Callable[[], None] | None = None) -> Callable[[], None]:
@@ -412,9 +453,14 @@ def run(
     offline_preflight: bool = False,
     phase_gate: Callable[[str], Any] | None = None,
     resume_from: Path | None = None,
+    network_only: bool = False,
 ) -> Path:
     """``resume_from``: the run directory (or the ``favicon_records.jsonl`` itself) of an earlier unfinished attempt of
-    this shard; the favicon lookups it completed are reused instead of being sent again."""
+    this shard; the favicon lookups it completed are reused instead of being sent again.
+
+    ``network_only`` ends the run where the favicon stage would start: the network stages are written out as usual, the
+    fact store ``work/facts.sqlite`` is kept, and the manifest says ``network_done`` instead of ``complete``. The
+    favicon stage is then run by ``run_favicon_only`` (on this host or another one)."""
     if cfg.approval is None:
         raise ConfigError("run requires an authorized config (approval not loaded)")
     started = datetime.now(UTC)
@@ -430,6 +476,7 @@ def run(
     (run_dir / "config.snapshot.json").write_text(json.dumps(cfg.raw, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
     st = _Stages(cfg, run_dir, guards=not offline_preflight)
+    st.network_only = network_only
     executor = executor or ManagedExecutor(cfg, run_dir, st.killed)
     st.executor = executor
     restore_signals = _install_signal_handlers(lambda: st.flag_stop("interrupt"))
@@ -461,11 +508,89 @@ def run(
     return finished
 
 
+def shared_checksum(raw: dict[str, Any]) -> str:
+    """Checksum of the parts of a configuration that two hosts of one campaign must share: not the vantage, the output
+    directory, the operational limits, the tool paths or the locations of the exclusion and approval files, which differ from host to host."""
+    kept = {k: v for k, v in raw.items() if k not in ("vantage", "output", "operations", "binaries")}
+    if isinstance(kept.get("target_policy"), dict):       # the files may sit elsewhere on another host; their checksums stay
+        kept["target_policy"] = {k: v for k, v in kept["target_policy"].items() if k not in ("exclusions_file", "approval_file")}
+    return hashlib.sha256(json.dumps(kept, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def read_network_manifest(run_dir: Path) -> dict[str, Any]:
+    """The manifest of a network-only run, or ConfigError when the directory is not one that is waiting for its favicon stage."""
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigError(f"{run_dir} has no readable manifest ({exc})") from exc
+    if not manifest.get("network_done"):
+        raise ConfigError(f"{run_dir} is not a network-only shard waiting for its favicon stage (manifest status {manifest.get('status')!r})")
+    if not (run_dir / "work" / "facts.sqlite").is_file():
+        raise ConfigError(f"{run_dir}/work/facts.sqlite is missing")
+    return manifest
+
+
+def run_favicon_only(
+    cfg: ScanConfig,
+    run_dir: Path,
+    *,
+    executor: Executor | None = None,
+    fetcher: Any = None,
+    fetcher_factory: Any = None,
+) -> Path:
+    """Run the favicon stage of a network-only shard from its fact store, then write the shard out as a finished run.
+
+    The sampled addresses are not contacted again: the jobs come from the store and the stored HTTP pages. The run
+    directory may have been copied to another host (``split.export_network``); ``cfg`` is that host's own config of
+    the same campaign. A favicon stage that does not complete leaves the shard network-only, so it can be repeated.
+    """
+    if cfg.approval is None:
+        raise ConfigError("favicon-stage requires an authorized config (approval not loaded)")
+    run_dir = Path(run_dir)
+    prior = read_network_manifest(run_dir)
+    if shared_checksum(cfg.raw) != shared_checksum(json.loads((run_dir / "config.snapshot.json").read_text(encoding="utf-8"))):
+        raise ConfigError("this config differs from the one the shard was scanned with (beyond vantage, output, operations and binaries)")
+    shard = (prior.get("shard") or {}).get("index", 0)
+    cfg = dataclasses.replace(cfg, shard=shard)
+    started = datetime.now(UTC)
+    wall = time.monotonic()
+    policy, splan, exclusions = build_policy(cfg)
+    for sub in ("raw", "normalized", "report"):
+        (run_dir / sub).mkdir(parents=True, exist_ok=True)
+    st = _Stages(cfg, run_dir, guards=True)
+    jobs: list[Any] = []
+    counts: dict[str, Any] = dict(prior.get("stage_counts") or {})
+    jobs_path = run_dir / "normalized" / "tool_jobs.jsonl"
+    if outputs.exists(jobs_path):                   # the tool jobs of the network stages, kept as written
+        jobs.extend(SimpleNamespace(**json.loads(line)) for line in outputs.iter_lines(outputs.resolve(jobs_path)) if line.strip())
+    st.replay = {"manifest": prior, "counts": counts}
+    st.timings.update(prior.get("stage_seconds") or {})
+    executor = executor or ManagedExecutor(cfg, run_dir, st.killed)
+    st.executor = executor
+    restore_signals = _install_signal_handlers(lambda: st.flag_stop("interrupt"))
+    release_stacks = _register_stack_dump(run_dir)
+    st.start_monitor()
+    try:
+        finished = _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts,
+                               {"tool_versions": prior.get("tools") or {}}, started, wall, prior.get("run_id") or run_dir.name, None,
+                               fetcher_factory)
+    finally:
+        st.stop_monitor()
+        release_stacks()
+        restore_signals()
+    if cfg.compact_outputs:
+        try:
+            outputs.compact_run(finished)
+        except Exception as exc:
+            print(f"[scanner] could not compact the outputs of {finished.name}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+    return finished
+
+
 def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
                 resume_from=None, fetcher_factory=None) -> Path:
     # What the stages learn about each endpoint goes to disk, not into dictionaries: memory then stays flat in the shard size.
     try:
-        store = ShardStore(run_dir / "work" / "facts.sqlite", reset=True)
+        store = ShardStore(run_dir / "work" / "facts.sqlite", reset=st.replay is None)
     except Exception as exc:
         st.errors["store"] = f"{type(exc).__name__}: {exc}"[:500]
         return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
@@ -490,6 +615,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
         "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
         "shard": {"index": cfg.shard, "of": cfg.shards}, "stage_counts": counts,
         "output_schema": outputs.OUTPUT_SCHEMA, "limitations": LIMITATIONS,
+        **({"network_done": True} if st.replay is not None else {}),     # the favicon stage can be repeated
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
     return run_dir
@@ -523,12 +649,13 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     gateway_mac = cfg.vantage.gateway_mac or report.get("gateway_mac")
     # Stub manifest before the first probe: if the process is killed hard (OOM, WSL shutdown) the run still
     # leaves evidence of what was started and the run-once guard still sees it.
-    (run_dir / "manifest.json").write_text(json.dumps({
-        "schema_version": SCHEMA_VERSION, "experiment": "scanner", "run_id": run_id, "status": "started",
-        "complete": False, "started_at": started.isoformat(), "config_checksum": cfg.checksum,
-        "shard": {"index": cfg.shard, "of": cfg.shards},
-        "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
-    }, indent=2), encoding="utf-8")
+    if st.replay is None:       # a favicon-only run keeps the manifest of the network-only run until it has its own
+        (run_dir / "manifest.json").write_text(json.dumps({
+            "schema_version": SCHEMA_VERSION, "experiment": "scanner", "run_id": run_id, "status": "started",
+            "complete": False, "started_at": started.isoformat(), "config_checksum": cfg.checksum,
+            "shard": {"index": cfg.shard, "of": cfg.shards},
+            "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
+        }, indent=2), encoding="utf-8")
     # A full scan gives ZMap no target count: each shard then covers its whole slice of the allowed space.
     full = cfg.sample_fraction >= 1.0 and not cfg.target_ips
     mview = SimpleNamespace(**{**vars(cfg.measurement), "zmap_max_targets": None if full else splan.targets_per_port,
@@ -543,6 +670,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     # ---- Stage 0: the complete list of sampled targets (ZMap --dryrun prints targets, sends nothing) --
     sample_ips: list[str] = []
+    if st.replay is not None and (run_dir / "scanned_ips.txt").is_file():
+        sample_ips.extend((run_dir / "scanned_ips.txt").read_text(encoding="utf-8").split())
     send_order: dict[str, int] = {}       # ZMap's send position of each target (the dry run lists them in order)
 
     def sample_stage() -> None:
@@ -855,40 +984,22 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     tarpits_known("sni_confirm", sni_stage)
 
+    if st.replay is not None:        # what the network-only run counted, and its stored pages for the favicon stage
+        counts.update(st.replay["counts"])
+        pages = run_dir / "normalized" / "http_documents.jsonl"
+        if outputs.exists(pages):
+            for line in outputs.iter_lines(outputs.resolve(pages)):
+                if line.strip():
+                    row = json.loads(line)
+                    http_docs[(row.pop("ip"), row.pop("port"))] = row
+
     # ---- Stage 8: favicon acquisition (HTTP and HTTPS), bounded, sample-and-port-confined ---
     offhost_log: list[dict[str, Any]] = []
 
     def favicon_stage() -> None:
         if not cfg.favicon.enabled:
             return
-        fjobs: list[dict[str, Any]] = []
-        job_ips: set[str] = set()
-        job_endpoints: set[tuple[str, int]] = set()
-        for g in store.iter_ips():
-            for e in g.endpoints:
-                proto = _protocol_of(e)
-                first = len(fjobs)
-                # A bare-IP request only makes sense where a bare-IP session works; a host that answered
-                # only with SNI would just fail (and record a misleading direct-IP failure).
-                if proto == "http" or (proto == "https" and e.tls.ok):
-                    fjobs.append({"scheme": proto, "ip": g.ip, "port": e.port, "hostname": None})
-                for h in _verified_names(g, e)[: cfg.favicon.max_hostnames_per_endpoint]:
-                    sni = e.sni.get(h)
-                    if proto == "http":
-                        scheme = "http"
-                    elif proto == "https" and (e.tls.ok or (sni is not None and sni.ok)):
-                        scheme = "https"
-                    else:
-                        continue
-                    fjobs.append({"scheme": scheme, "ip": g.ip, "port": e.port, "hostname": h})
-                # Unverified names: same scanned ip:port, just a different Host/SNI. Recorded as unverified in the rows.
-                if proto in ("http", "https", "tls_unestablished"):
-                    for h in _unverified_names(g, e)[: cfg.favicon.max_unverified_names_per_endpoint]:
-                        fjobs.append({"scheme": "http" if proto == "http" else "https", "ip": g.ip, "port": e.port, "hostname": h})
-                        counts["favicon_jobs_unverified_names"] = counts.get("favicon_jobs_unverified_names", 0) + 1
-                if len(fjobs) > first:
-                    job_ips.add(g.ip)
-                    job_endpoints.add((g.ip, e.port))
+        fjobs, job_ips, job_endpoints = favicon_jobs(store, cfg, counts)
         if not fjobs or not ledger.wait(job_ips):
             return
         fp = fav.fetch_policy(cfg, sorted(job_ips))
@@ -976,7 +1087,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                     counts["offhost_icon_refused"] = sum(1 for e in third_party if e["outcome"] == "policy_refused")
             st.guard("favicon_offhost_log", count_offhost)
 
-    tarpits_known("favicon", favicon_stage)
+    if not st.network_only:
+        tarpits_known("favicon", favicon_stage)
     st.check_now()          # a stop that arrived after the last check still belongs in the manifest
 
     # The pages are written as soon as the favicon stage is done with them, so they are not held while the rows are built.
@@ -1012,7 +1124,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         if streamed:
             checksums["normalized/endpoints.jsonl"] = streamed["endpoints"]
             checksums["normalized/hostname_resolution.jsonl"] = streamed["hostnames"]
-        checksums["normalized/tool_jobs.jsonl"] = write_jsonl(normalized / "tool_jobs.jsonl", jobs)
+        if st.replay is None:       # a favicon-only run keeps the tool jobs the network stages wrote
+            checksums["normalized/tool_jobs.jsonl"] = write_jsonl(normalized / "tool_jobs.jsonl", jobs)
         if docs_sha:
             checksums["normalized/http_documents.jsonl"] = docs_sha
         if cfg.favicon.offhost.enabled:
@@ -1024,7 +1137,10 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     if store.dropped_rows:
         counts["store_dropped_rows"] = store.dropped_rows
         st.errors.setdefault("store", f"{store.dropped_rows} rows could not be written: " + "; ".join(store.errors[:3])[:300])
-    if not {"records", "ip_results", "write_outputs"} & set(st.errors):
+    stopped_early = bool(st.errors or st.skipped or tool_errors or st.reason or st.interrupted)
+    # A network-only run keeps its fact store for the favicon stage, and so does a favicon stage that did not finish.
+    keep_store = (st.network_only and not stopped_early) or (st.replay is not None and stopped_early)
+    if not {"records", "ip_results", "write_outputs"} & set(st.errors) and not keep_store:
         store.delete()                  # kept after a failed write-out, for diagnosis; never part of the listed outputs
         shutil.rmtree(run_dir / "work", ignore_errors=True)
     for p in sorted(run_dir.rglob("*")):
@@ -1046,7 +1162,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         "elapsed_seconds": round(time.monotonic() - wall, 3), "stage_seconds": st.timings,
         "stage_errors": st.errors, "stages_skipped": st.skipped, "abort_reason": st.reason,
         "anonymous_traffic": cfg.transparency.anonymous,
-        "status": "finished", "complete": not (incomplete or st.reason or st.interrupted), "tool_job_errors": tool_errors,
+        "status": "network_done" if keep_store else "finished",
+        "complete": not (incomplete or st.reason or st.interrupted or keep_store), "tool_job_errors": tool_errors,
+        **({"network_done": True} if keep_store else {}),
         # "nothing answered" is only a finding when ZMap actually ran cleanly on every port
         "zero_responsive": counts.get("l4_endpoints", 0) == 0 and st.reason is None and not st.errors,
         "config_checksum": cfg.checksum, "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
