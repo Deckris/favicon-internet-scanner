@@ -120,6 +120,48 @@ def sha256_file(path: Path) -> str:
         return h.hexdigest()
 
 
+# Settings that follow the host's cores, memory and open-file limit and change how fast a run goes, not what it measures.
+# They stay in the stored config and the snapshots; only the checksum leaves them out, so that two hosts with different
+# hardware get the same campaign directory and run ids.
+HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
+    "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "overlap_tls_with_zmap", "max_connections_per_subnet"),
+    "dns": ("threads",),
+    "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds"),
+}
+# Parts that also differ between hosts of one campaign and so are left out of ``shared_checksum``.
+HOST_LOCAL_SECTIONS = ("vantage", "output", "operations", "binaries")
+HOST_LOCAL_POLICY_KEYS = ("exclusions_file", "approval_file")
+
+
+def _without_host_derived(raw: dict[str, Any]) -> dict[str, Any]:
+    kept = dict(raw)
+    for section, keys in HOST_DERIVED_KEYS.items():
+        if isinstance(kept.get(section), dict):
+            kept[section] = {k: v for k, v in kept[section].items() if k not in keys}
+    return kept
+
+
+def _digest(data: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def config_checksum(raw: dict[str, Any]) -> str:
+    """Checksum that names a campaign and its runs: everything in the config except the settings in HOST_DERIVED_KEYS.
+
+    A config written before these settings were left out hashed the whole file, so a campaign or run started with it
+    has a different checksum now and is not recognised as the same one; start a new campaign directory for it."""
+    return _digest(_without_host_derived(raw))
+
+
+def shared_config_checksum(raw: dict[str, Any]) -> str:
+    """The checksum minus what also differs between the hosts of one campaign: the vantage, output directory,
+    operational limits, tool paths and the locations (not the checksums) of the exclusion and approval files."""
+    kept = {k: v for k, v in _without_host_derived(raw).items() if k not in HOST_LOCAL_SECTIONS}
+    if isinstance(kept.get("target_policy"), dict):
+        kept["target_policy"] = {k: v for k, v in kept["target_policy"].items() if k not in HOST_LOCAL_POLICY_KEYS}
+    return _digest(kept)
+
+
 STAGE_FLOOR_SECONDS = 7200          # favicon.stage_max_seconds when it is not set, for a shard of ordinary size
 STAGE_CAP_SECONDS = 86400           # the largest value favicon.stage_max_seconds accepts
 STAGE_MIN_JOBS_PER_SECOND = 180     # a third of the 540 lookups/s a tuned host is expected to sustain
@@ -379,7 +421,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
                    {"kill_switch_file"})
     bins = _section({"binaries": raw.get("binaries") or {}}, "binaries", {"zmap", "zgrab2", "zdns"}, set())
 
-    checksum = hashlib.sha256(json.dumps(raw, sort_keys=True, default=str).encode()).hexdigest()
+    checksum = config_checksum(raw)
     cfg = ScanConfig(
         run_label=str(raw.get("run_label") or "scanner"),
         vantage=SimpleNamespace(

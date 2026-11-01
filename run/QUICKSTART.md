@@ -83,6 +83,8 @@ For a sharded `campaign` that runs for days, see "Long campaigns" in the [README
 
 `run` refuses a second run of an identical config; `--allow-rerun` overrides that on purpose. A finished run has `manifest.json` with `"complete": true`; anything else is partial and says why.
 
+The config checksum, which names the campaign folder and the run ids, leaves out the settings that follow the host's hardware: `measurement.zgrab_senders`, `zgrab_parallel_batches`, `zgrab_batch_size`, `overlap_tls_with_zmap`, `max_connections_per_subnet`, `dns.threads`, and `favicon.workers`, `processes`, `max_active_requests` and `stage_max_seconds`. Hosts that differ only in those settings share one campaign. Campaigns and runs started before this change were named by a checksum over the whole config, so they do not match the new one: their folders and manifests are left as they are, and the same config starts a new campaign folder.
+
 A run that finished cleanly stores its record files (`normalized/*.jsonl`, `ip_results.csv`, `raw/favicon_records.jsonl`) compressed as `.zst`; `export-csv` and the other commands read them as they are, and `output.compact: false` in the config keeps them plain.
 
 `pack` puts only `manifest.json` and the aggregate report in the archive. `pack RUN_DIR --with-results` adds the per-address files (IP addresses, host names, certificate names); `--with-raw` adds the raw tool output as well.

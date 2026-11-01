@@ -124,7 +124,7 @@ def load_state(cfg: Any) -> dict[str, Any]:
             raise ValueError(f"{path} is unreadable ({exc}); restore it from a copy rather than deleting it, "
                              "or finished shards would be scanned again") from exc
         if state.get("config_checksum") != cfg.checksum or state.get("shards") != cfg.shards:
-            raise ValueError("campaign.json belongs to a different configuration")
+            raise ValueError("campaign.json belongs to a different configuration (or was written before host-derived settings were left out of the checksum)")
         return state
     return {"config_checksum": cfg.checksum, "shards": cfg.shards, "created_at": datetime.now(UTC).isoformat(), "shard_states": {}}
 

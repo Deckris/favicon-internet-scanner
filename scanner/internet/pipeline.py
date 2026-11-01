@@ -39,7 +39,7 @@ from scanner.internet import pacing
 from scanner.internet import population as pop
 from scanner.internet import preflight as pre
 from scanner.internet import tls as tlsmod
-from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, sha256_file
+from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, sha256_file, shared_config_checksum
 from scanner.internet.runner import ManagedExecutor
 from scanner.internet.shardstore import EndpointFacts, IpFacts, ShardStore
 from scanner.models import ToolJob, canonical_json, write_jsonl
@@ -509,12 +509,8 @@ def run(
 
 
 def shared_checksum(raw: dict[str, Any]) -> str:
-    """Checksum of the parts of a configuration that two hosts of one campaign must share: not the vantage, the output
-    directory, the operational limits, the tool paths or the locations of the exclusion and approval files, which differ from host to host."""
-    kept = {k: v for k, v in raw.items() if k not in ("vantage", "output", "operations", "binaries")}
-    if isinstance(kept.get("target_policy"), dict):       # the files may sit elsewhere on another host; their checksums stay
-        kept["target_policy"] = {k: v for k, v in kept["target_policy"].items() if k not in ("exclusions_file", "approval_file")}
-    return hashlib.sha256(json.dumps(kept, sort_keys=True, default=str).encode()).hexdigest()
+    """Checksum of the parts of a configuration that two hosts of one campaign must share (see config.shared_config_checksum)."""
+    return shared_config_checksum(raw)
 
 
 def read_network_manifest(run_dir: Path) -> dict[str, Any]:

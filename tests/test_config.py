@@ -222,3 +222,42 @@ def test_rate_ceiling_is_130000_and_the_approval_still_caps_it(tmp_path):
         else:
             with pytest.raises(ConfigError):
                 load_config(p)
+
+
+def _checksum(tmp_path, mutate=None):
+    p = _rewrite(tmp_path, mutate) if mutate else write_config(tmp_path)
+    return load_config(p).checksum
+
+
+def test_checksum_ignores_host_derived_settings(tmp_path):
+    def faster(d):
+        d["measurement"].update(zgrab_senders=99, zgrab_parallel_batches=8, zgrab_batch_size=1000,
+                                overlap_tls_with_zmap=True, max_connections_per_subnet=8)
+        d["dns"]["threads"] = 77
+        d["favicon"].update(workers=64, processes=2, max_active_requests=900, stage_max_seconds=9000)
+    base = _checksum(tmp_path)
+    cfg = load_config(_rewrite(tmp_path, faster))
+    assert cfg.checksum == base
+    assert cfg.raw["favicon"]["workers"] == 64 and cfg.raw["dns"]["threads"] == 77       # the stored config is unchanged
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d["measurement"].update(ports=[80, 443]),
+    lambda d: d["sample"].update(seed=5),
+    lambda d: d["sample"].update(shards=2),
+    lambda d: d["measurement"].update(min_seconds_between_probes_per_ip=1),
+    lambda d: d["measurement"].update(zmap_rate=50),
+    lambda d: d["fetch"].update(read_timeout=9.0),
+])
+def test_checksum_follows_measurement_settings(tmp_path, mutate):
+    assert _checksum(tmp_path, mutate) != _checksum(tmp_path)
+
+
+def test_shared_checksum_ignores_host_local_parts(tmp_path):
+    from scanner.internet.config import shared_config_checksum
+    from scanner.internet.pipeline import shared_checksum
+    raw = load_config(write_config(tmp_path)).raw
+    moved = {**raw, "vantage": {**raw["vantage"], "id": "elsewhere"}, "output": {"dir": "/else"},
+             "favicon": {**raw["favicon"], "workers": 500}}
+    assert shared_checksum(raw) == shared_checksum(moved) == shared_config_checksum(raw)
+    assert shared_checksum(raw) != shared_checksum({**raw, "sample": {**raw["sample"], "seed": 99}})
