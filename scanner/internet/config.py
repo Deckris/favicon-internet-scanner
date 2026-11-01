@@ -120,11 +120,14 @@ def sha256_file(path: Path) -> str:
         return h.hexdigest()
 
 
-# Settings that follow the host's cores, memory and open-file limit and change how fast a run goes, not what it measures.
-# They stay in the stored config and the snapshots; only the checksum leaves them out, so that two hosts with different
-# hardware get the same campaign directory and run ids.
+# Settings that profile.derive sizes from the host's cores, memory and open-file limit, plus the time limit of the favicon
+# stage. They change how fast a run goes, not what it measures. They stay in the stored config and the snapshots; only
+# the checksum leaves them out, so that two hosts with different hardware get the same campaign directory and run ids.
+# Politeness limits (max_connections_per_subnet, min_seconds_between_probes_per_ip) and overlap_tls_with_zmap, which
+# changes the traffic pattern, stay in the checksum: raising one needs a new approval. Hosts of one campaign that
+# derive overlap_tls_with_zmap differently set it explicitly in the settings so that it is the same on all of them.
 HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
-    "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "overlap_tls_with_zmap", "max_connections_per_subnet"),
+    "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size"),
     "dns": ("threads",),
     "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds"),
 }
