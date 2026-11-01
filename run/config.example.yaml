@@ -73,6 +73,10 @@ favicon:
   enabled: true
   max_hostnames_per_endpoint: 3
   workers: 64
+  # Worker processes sharing the favicon requests (1..64). The addresses are split between them, every address
+  # in exactly one, and the workers above are divided between the processes. Use one per core for a large shard.
+  # Cannot be combined with offhost_icons.
+  # processes: 1
   max_icons_per_page: 4
   # Which declared icons to fetch. first_image: in page order, stop after the first one that decodes as an image
   # (the stored icon is the same as with all, with fewer requests). all: fetch every declared icon.

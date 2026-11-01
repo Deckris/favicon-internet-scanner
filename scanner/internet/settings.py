@@ -48,6 +48,7 @@ scope:
   min_seconds_between_probes_per_ip: {pace}   # pause between any two requests to the same address
   overlap_tls_with_zmap: {overlap}   # true: TLS starts while ZMap sweeps later ports (traffic = ZMap + ZGrab2)
   dns_resolver: {dns_resolver}      # resolver for PTR and name checks; it sees every scanned address
+  favicon_processes: 1              # worker processes sharing the favicon requests (one per core; not with offhost_icons)
   try_unverified_names: false       # also request pages under certificate names that did not verify
   offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it)
 
@@ -256,6 +257,14 @@ def apply(workdir: Path) -> dict[str, Any]:
     if check not in ("nic", "url", "off"):
         raise SettingsError("host.egress_check must be auto, nic, url or off")
     offhost = bool(scope.get("offhost_icons", False))
+    workers = scope.get("favicon_workers", 64)
+    processes = scope.get("favicon_processes", 1)
+    if isinstance(processes, bool) or not isinstance(processes, int) or not 1 <= processes <= 64:
+        raise SettingsError(f"scope.favicon_processes `{processes}` must be a whole number from 1 to 64")
+    if processes > int(workers):
+        raise SettingsError(f"scope.favicon_processes `{processes}` cannot exceed scope.favicon_workers `{workers}`")
+    if offhost and processes > 1:
+        raise SettingsError("scope.favicon_processes above 1 cannot be combined with scope.offhost_icons")
     probes = 1
     targets = ALLOWED_ADDRESSES * fraction
     runtime = int(min(7 * 24 * 3600, max(3600, math.ceil(targets * probes / rate * 1.5) + 600)))
@@ -275,7 +284,7 @@ def apply(workdir: Path) -> dict[str, Any]:
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     f = base["favicon"]
-    f.update(workers=int(scope.get("favicon_workers", 64)), stage_max_seconds=86400,
+    f.update(workers=int(workers), processes=processes, stage_max_seconds=86400,
              max_unverified_names_per_endpoint=2 if scope.get("try_unverified_names") else 0)
     f["offhost_icons"] = {**f.get("offhost_icons", {}), "enabled": offhost}
     base["fetch"]["user_agent"] = f"{s.get('scanner_name', 'research-scanner')} (+{info}; contact {contact})"

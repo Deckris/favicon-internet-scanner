@@ -395,6 +395,7 @@ def run(
     run_id: str | None = None,
     executor: Executor | None = None,
     fetcher: Any = None,
+    fetcher_factory: Any = None,
     skip_preflight: bool = False,
     offline_preflight: bool = False,
     phase_gate: Callable[[str], Any] | None = None,
@@ -433,7 +434,7 @@ def run(
         if not report["ok"] and not skip_preflight:
             raise pre.PreflightFailed(report)
         return _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                           started, wall, run_id, resume_from)
+                           started, wall, run_id, resume_from, fetcher_factory)
     finally:
         st.phases.close()
         st.stop_monitor()
@@ -442,7 +443,7 @@ def run(
 
 
 def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
-                resume_from=None) -> Path:
+                resume_from=None, fetcher_factory=None) -> Path:
     # What the stages learn about each endpoint goes to disk, not into dictionaries: memory then stays flat in the shard size.
     try:
         store = ShardStore(run_dir / "work" / "facts.sqlite", reset=True)
@@ -451,7 +452,7 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
     try:
         return _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                                started, wall, run_id, resume_from)
+                                started, wall, run_id, resume_from, fetcher_factory)
     except Exception as exc:               # whatever escaped the stages: the run still ends with a manifest
         st.errors["run"] = f"{type(exc).__name__}: {exc}"[:500]
         return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
@@ -476,7 +477,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
 
 
 def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
-                     resume_from=None) -> Path:
+                     resume_from=None, fetcher_factory=None) -> Path:
     from scanner.internet.zmap_compat import output_args, packet_rate_args
     killed = st.killed
     pace = cfg.measurement.min_seconds_between_probes_per_ip
@@ -878,10 +879,18 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             return killed() or time.monotonic() > deadline
         # The fetcher and the pacer see the stage deadline too: workers left behind at the cap must not go on to
         # the remaining icons of their page.
-        pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0)     # pause between HTTP requests to one address
-        f = fetcher or fav.make_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
-                                        job_endpoints, exclusions=exclusions, killed=stop,
-                                        state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json", pacer=pacer)
+        # With several processes each builds its own fetcher and pacer; the parent keeps none.
+        parallel = cfg.favicon.processes > 1 and (fetcher is None or fetcher_factory is not None)
+        factory = None
+        if parallel:
+            factory = fetcher_factory or fav.FetcherFactory(
+                cfg, sorted(job_ips), job_endpoints, max_active_requests=fav.split_cap(cfg.favicon.max_active_requests, cfg.favicon.processes))
+            f = None
+        else:
+            pacer = pacing.IpPacer(pace, stop, stop_event=st.stop, poll=2.0)     # pause between HTTP requests to one address
+            f = fetcher or fav.make_fetcher(cfg, fp, fav.RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
+                                            job_endpoints, exclusions=exclusions, killed=stop,
+                                            state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json", pacer=pacer)
         icons = icon_store.IconStore(run_dir / "favicons") if cfg.favicon.store_images else None
         record_log = fav.RecordLog(run_dir / "raw" / "favicon_records.jsonl")
         earlier = record_log.load()
@@ -899,11 +908,14 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             store.put_favicon(idx, rec)
         try:
             # every record, reused ones included, goes to the store with its position in the job list
-            fav.run_favicon_stage(f, fjobs, workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page, killed=stop,
-                                  icon_store=icons, on_record=lambda rec: (record_log.append(rec), st.progress()), done=earlier,
-                                  selection=cfg.favicon.icon_selection, fallback=cfg.favicon.fallback,
-                                  documents=http_docs, max_document_bytes=cfg.fetch.max_document_bytes,
-                                  record_sink=sink)
+            common = dict(workers=cfg.favicon.workers, max_icons=cfg.favicon.max_icons_per_page, killed=stop,
+                          icon_store=icons, on_record=lambda rec: (record_log.append(rec), st.progress()), done=earlier,
+                          selection=cfg.favicon.icon_selection, fallback=cfg.favicon.fallback,
+                          documents=http_docs, max_document_bytes=cfg.fetch.max_document_bytes, record_sink=sink)
+            if parallel:
+                fav.run_favicon_stage_processes(factory, fjobs, processes=cfg.favicon.processes, pace=pace, **common)
+            else:
+                fav.run_favicon_stage(f, fjobs, **common)
             skipped = store.count_favicon_outcome("skipped_kill_switch")
             if time.monotonic() > deadline and skipped:
                 st.errors["favicon_deadline"] = f"stage cap of {cfg.favicon.stage_max_seconds} s reached; {skipped} of {len(fjobs)} lookups skipped"

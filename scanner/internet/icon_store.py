@@ -61,12 +61,34 @@ class IconStore:
             self.root.mkdir(parents=True, exist_ok=True)
             target = self.root / name
             if not target.exists():
-                tmp = target.with_name(target.name + ".tmp")
+                # Another process may be writing the same image: the name is content-addressed, so whichever
+                # replace lands last leaves identical bytes, but the temporary files must not collide.
+                tmp = target.with_name(f"{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
                 tmp.write_bytes(body)
-                os.replace(tmp, target)
+                try:
+                    os.replace(tmp, target)
+                except PermissionError:          # Windows: the other process holds the target open; its bytes are the same
+                    tmp.unlink(missing_ok=True)
+                    if not target.exists():
+                        raise
             rel = f"{self.root.name}/{name}"
             self._files[sha256] = rel
             return rel
+
+    def files(self) -> dict[str, str]:
+        """Copy of the digest -> relative path map (what a worker process hands back to the parent)."""
+        with self._lock:
+            return dict(self._files)
+
+    def remove_temporary(self) -> None:
+        """Delete temporary files left in the directory by writers that were killed (call when no writer runs)."""
+        for tmp in self.root.glob("*.tmp"):
+            tmp.unlink(missing_ok=True)
+
+    def adopt(self, files: dict[str, str]) -> None:
+        """Take over the map of a store that wrote into the same directory (files written by a worker process)."""
+        with self._lock:
+            self._files.update(files)
 
     def path_for(self, sha256: str | None) -> str | None:
         if not sha256:

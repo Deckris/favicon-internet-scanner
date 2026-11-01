@@ -6,8 +6,11 @@ redirect can never lead the run to a host outside the sample.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import multiprocessing
+import multiprocessing.connection
 import queue
 import threading
 import time
@@ -22,6 +25,8 @@ import dns.resolver
 
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.internet.enrich import document_facts, icon_declaration_facts
+from scanner.internet.icon_store import IconStore
+from scanner.internet.pacing import IpPacer
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
 from scanner.favicon_discovery import parse_icon_declarations
@@ -710,4 +715,236 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
         raise
     if failure is not None:
         raise failure
+    return [] if record_sink is not None else [r for r in out if r is not None]
+
+
+# ---- Several worker processes --------------------------------------------------------------------------------------
+# One interpreter does the TLS, the decoding and the hashing of every request, so a single process tops out at one core.
+# The jobs are split by address: every job of an address goes to the same process, whose pacer alone then guarantees
+# the pause for that address. A job does not depend on the others, so the merged records equal a single-process run.
+
+_BACKSTOP_SECONDS = 10.0      # after the stage grace, how long a worker process may take to exit before it is terminated
+
+
+def partition_by_ip(jobs: list[dict[str, Any]], parts: int) -> list[list[int]]:
+    """Indexes of ``jobs`` per partition, every address in exactly one. Deterministic.
+
+    The longest chains are placed first, each on the partition holding the fewest jobs so far. Indexes inside a
+    partition keep the original job order.
+    """
+    groups: dict[str, list[int]] = {}
+    for idx, job in enumerate(jobs):
+        groups.setdefault(job["ip"], []).append(idx)
+    out: list[list[int]] = [[] for _ in range(max(1, parts))]
+    for chain in sorted(groups.values(), key=lambda c: (-len(c), c[0])):
+        min(out, key=len).extend(chain)
+    return [sorted(p) for p in out if p]
+
+
+def split_cap(total: int, parts: int) -> int:
+    """Share of a global cap for each of ``parts`` processes: rounded down, so the sum never exceeds ``total``."""
+    return max(1, total // parts)
+
+
+class FetcherFactory:
+    """Builds the confined fetcher inside a worker process from picklable ingredients (no off-host fetching).
+
+    Only the endpoints (and sampled addresses) of the addresses the process owns are approved for it, so a redirect
+    hop to an address owned by another process is refused before any connection, as is any unapproved endpoint.
+    """
+
+    def __init__(self, cfg: Any, sampled_ips: list[str], endpoints: set[tuple[str, int]], max_active_requests: int | None = None) -> None:
+        self.cfg, self.sampled_ips, self.endpoints = cfg, sorted(set(sampled_ips)), set(endpoints)
+        self.max_active_requests = max_active_requests
+
+    def __call__(self, pacer: Any, owned: Any = None, killed: Any = None) -> Any:
+        cfg = self.cfg
+        sampled = [ip for ip in self.sampled_ips if owned is None or ip in owned]
+        endpoints = {e for e in self.endpoints if owned is None or e[0] in owned}
+        if self.max_active_requests is not None:
+            cfg = copy.copy(cfg)
+            cfg.favicon = copy.copy(cfg.favicon)
+            cfg.favicon.max_active_requests = self.max_active_requests
+        return _make_local_fetcher(cfg, fetch_policy(cfg, sampled), RedirectResolver(cfg.dns.resolvers, cfg.dns.timeout),
+                                   endpoints, pacer, killed or (lambda: False))
+
+
+def _skipped(job: dict[str, Any]) -> dict[str, Any]:
+    return {"kind": "hostname" if job.get("hostname") else "direct_ip", "scheme": job["scheme"], "hostname": job.get("hostname"),
+            "favicon_outcome": "skipped_kill_switch", "ip": job["ip"], "port": job["port"]}
+
+
+def _failed(job: dict[str, Any], why: str) -> dict[str, Any]:
+    return {**_skipped(job), "favicon_outcome": "error", "error": why[:300]}
+
+
+def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings: dict[str, Any], store_root: Any,
+                 documents: dict[tuple[str, int], dict[str, Any]], done: dict[tuple[str, int, str | None], dict[str, Any]],
+                 stop: Any, conn: Any) -> None:
+    """``conn`` is the sending end of this process's own pipe, so a process killed mid-send blocks no other.
+
+    Messages: ``("log", record)`` for a record fetched here, ``("rec", position, record)`` for every final record
+    (position in ``jobs``), then ``("end", icon files)``, or ``("error", text)`` if the stage itself failed.
+    """
+    lock = threading.Lock()
+
+    def send(message: tuple) -> None:
+        with lock:
+            conn.send(message)
+    try:
+        stopped = stop.is_set
+        pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0)
+        store = IconStore(store_root) if store_root is not None else None
+        run_favicon_stage(factory(pacer, frozenset(j["ip"] for j in jobs), stopped), jobs, workers=settings["workers"],
+                          max_icons=settings["max_icons"], killed=stopped, icon_store=store, selection=settings["selection"],
+                          fallback=settings["fallback"], documents=documents, max_document_bytes=settings["max_document_bytes"],
+                          done=done, on_record=lambda rec: send(("log", rec)), grace=settings["grace"],
+                          record_sink=lambda i, rec: send(("rec", i, rec)))
+        send(("end", store.files() if store is not None else {}))
+    except BaseException as exc:
+        try:
+            send(("error", f"{type(exc).__name__}: {exc}"))
+        except (OSError, ValueError):
+            pass
+
+
+def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, processes: int, workers: int, pace: float, max_icons: int,
+                                killed: Any = lambda: False, icon_store: Any = None, selection: str = "all",
+                                fallback: str = "always_if_no_image", documents: dict[tuple[str, int], dict[str, Any]] | None = None,
+                                max_document_bytes: int = 0, on_record: Any = None,
+                                done: dict[tuple[str, int, str | None], dict[str, Any]] | None = None,
+                                grace: float = STOP_GRACE_SECONDS, record_sink: Any = None) -> list[dict[str, Any]]:
+    """Like ``run_favicon_stage`` but over ``processes`` worker processes; one record per job, original order.
+
+    ``factory(pacer, owned, killed)`` returns the fetcher (``owned``: the addresses of the process) and must be
+    picklable (see ``FetcherFactory``). Each process gets its own pacer, fetcher, fingerprint cache and
+    ``workers // processes`` threads (at least one), so the number of concurrent requests stays at most what
+    ``workers`` says. Records stream back as the lookups finish: ``on_record`` and ``record_sink(job_index, record)``
+    are called here, in the calling thread, as ``run_favicon_stage`` calls them.
+
+    One difference from a single process: a process is approved only for its own addresses, so a redirect hop to an
+    endpoint owned by another process is refused (``policy_refused``), exactly like a hop to any endpoint that is not
+    approved; with one process the hop would be followed. This keeps every address contacted and paced by one process.
+
+    ``killed`` is polled here and mirrored to the workers through an event, so a stop reaches every process within a
+    poll; a process still running well after ``grace`` is terminated and its unfinished jobs recorded as skipped. A
+    process that dies or raises yields ``error`` records for its unfinished jobs.
+    """
+    if not jobs:
+        return []
+    out: list[dict[str, Any] | None] = [None] * len(jobs)
+    sunk: set[int] = set()
+
+    def deliver(k: int, rec: dict[str, Any]) -> None:
+        if k in sunk:
+            return
+        sunk.add(k)
+        if record_sink is None:
+            out[k] = rec
+        else:
+            record_sink(k, rec)
+
+    def prior_of(job: dict[str, Any]) -> dict[str, Any] | None:
+        return done.get((job["ip"], job["port"], job.get("hostname"))) if done else None
+
+    def settle_rest(indexes: list[int], why: str | None) -> None:
+        """Records for the jobs of a partition that never reported: a stop skips them, a failure is an error."""
+        for k in indexes:
+            if k not in sunk:
+                deliver(k, prior_of(jobs[k]) or (_failed(jobs[k], why) if why else _skipped(jobs[k])))
+
+    if killed():
+        settle_rest(list(range(len(jobs))), None)
+        return [] if record_sink is not None else [r for r in out if r is not None]
+    parts = partition_by_ip(jobs, processes)
+    store_root = icon_store.root if icon_store is not None else None
+    ctx = multiprocessing.get_context("spawn")
+    stop = ctx.Event()
+    settings = {"pace": pace, "workers": split_cap(workers, len(parts)), "max_icons": max_icons, "selection": selection,
+                "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace}
+    procs, conns, sends = [], [], []
+    for i, indexes in enumerate(parts):
+        recv_end, send_end = ctx.Pipe(duplex=False)
+        conns.append(recv_end)
+        mine = [jobs[k] for k in indexes]
+        owned = {j["ip"] for j in mine}
+        keys = {(j["ip"], j["port"]) for j in mine}
+        docs = {key: doc for key, doc in (documents or {}).items() if key in keys}
+        earlier = {key: rec for key, rec in (done or {}).items() if key[0] in owned}
+        procs.append(ctx.Process(target=_worker_main, name=f"favicon-{i}", daemon=True,
+                                 args=(i, factory, mine, settings, store_root, docs, earlier, stop, send_end)))
+        sends.append(send_end)
+    finished: set[int] = set()
+
+    def handle(i: int, message: tuple) -> None:
+        kind = message[0]
+        if kind == "log":
+            if on_record is not None:
+                try:
+                    on_record(message[1])
+                except OSError:
+                    pass        # a full disk must not cost the lookup that already succeeded
+        elif kind == "rec":
+            deliver(parts[i][message[1]], message[2])
+        elif kind == "end":
+            if icon_store is not None:
+                icon_store.adopt(message[1])
+            settle_rest(parts[i], f"favicon worker process {i}: incomplete result")
+            finished.add(i)
+        elif kind == "error":
+            settle_rest(parts[i], f"favicon worker process {i}: {message[1]}")
+            finished.add(i)
+
+    def drain(i: int) -> None:
+        while i not in finished:
+            try:
+                if not conns[i].poll(0):
+                    return
+                handle(i, conns[i].recv())
+            except (EOFError, OSError):
+                procs[i].join(2.0)          # the process is gone: whatever it did not report is lost
+                settle_rest(parts[i], f"favicon worker process {i}: exited with code {procs[i].exitcode} without a result")
+                finished.add(i)
+                return
+
+    try:
+        for p in procs:
+            p.start()
+        for c in sends:                                # only the child holds a sending end now, so its death shows as EOF
+            c.close()
+        stopped_at: float | None = None
+        while len(finished) < len(parts):
+            live = [conns[i] for i in range(len(parts)) if i not in finished]
+            ready = multiprocessing.connection.wait(live, timeout=_POLL_SECONDS)
+            for i, c in enumerate(conns):
+                if c in ready:
+                    drain(i)
+            if stopped_at is None and killed():
+                stopped_at = time.monotonic()
+                stop.set()
+            for i, p in enumerate(procs):
+                if i not in finished and not p.is_alive():
+                    drain(i)                           # it may have answered just before exiting
+                    if i not in finished:
+                        settle_rest(parts[i], f"favicon worker process {i}: exited with code {p.exitcode} without a result")
+                        finished.add(i)
+            if stopped_at is not None and time.monotonic() - stopped_at > grace + _BACKSTOP_SECONDS:
+                for i, p in enumerate(procs):
+                    if i not in finished:
+                        p.terminate()
+                        drain(i)
+                        settle_rest(parts[i], None)
+                        finished.add(i)
+    finally:
+        stop.set()
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            if p.pid is not None:
+                p.join(5.0)
+        for c in conns + sends:
+            c.close()
+        if icon_store is not None:
+            icon_store.remove_temporary()              # a terminated process leaves its half-written files behind
     return [] if record_sink is not None else [r for r in out if r is not None]

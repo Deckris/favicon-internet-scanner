@@ -216,3 +216,80 @@ class FakeFetcher:
             content_encoding=None, retry_after=None, body_sha256="x" * 64, body_bytes=len(body),
             redirect_chain=(), final_url=url, certificate=None,
         ), body
+
+
+# ---------------------------------------------------------------- fetchers for worker processes (picklable)
+
+_LOG_LOCK = __import__("threading").Lock()
+
+
+class ProcessFetcher(FakeFetcher):
+    """FakeFetcher that waits on the per-process pacer and logs when each address was contacted (one file per process)."""
+
+    def __init__(self, pacer, log: str | None, crash_ip: str | None, hang_ip: str | None, delay: float) -> None:
+        super().__init__()
+        self.pacer, self.log, self.crash_ip, self.hang_ip, self.delay = pacer, log, crash_ip, hang_ip, delay
+
+    def fetch(self, url: str, *, connect_ip: str | None, kind: str, context: str = ""):
+        import os
+        import time
+        if self.crash_ip is not None and connect_ip == self.crash_ip:
+            os._exit(3)
+        if self.hang_ip is not None and connect_ip == self.hang_ip:
+            time.sleep(600)
+        if not self.pacer.wait(connect_ip):
+            raise RuntimeError("stopped")
+        if self.log:
+            with _LOG_LOCK, open(f"{self.log}.{os.getpid()}", "a", encoding="ascii") as fh:
+                fh.write(f"{connect_ip} {time.monotonic():.6f}\n")
+        if self.delay:
+            time.sleep(self.delay)
+        return super().fetch(url, connect_ip=connect_ip, kind=kind, context=context)
+
+
+class ProcessFetcherFactory:
+    def __init__(self, log: str | None = None, crash_ip: str | None = None, hang_ip: str | None = None, delay: float = 0.0,
+                 broken: bool = False) -> None:
+        self.log, self.crash_ip, self.hang_ip, self.delay, self.broken = log, crash_ip, hang_ip, delay, broken
+
+    def __call__(self, pacer, owned=None, killed=None):
+        if self.broken:
+            raise RuntimeError("cannot build a fetcher")
+        return ProcessFetcher(pacer, self.log, self.crash_ip, self.hang_ip, self.delay)
+
+
+class GuardedStubFactory:
+    """FetcherFactory whose fetchers are real GuardedFetchers over a stubbed wire (picklable, for worker processes)."""
+
+    def __init__(self, endpoints: set[tuple[str, int]], redirects: dict[str, str], log: str) -> None:
+        self.endpoints, self.redirects, self.log = set(endpoints), dict(redirects), log
+
+    def __call__(self, pacer, owned=None, killed=None):
+        from scanner.internet.favicon import GuardedFetcher
+        from scanner.safety import TargetPolicy
+        from scanner.web_fetch import FetchLimits, WebFetcher, _RequestOutcome
+
+        class Wire(WebFetcher):
+            """Takes the place of the network under GuardedFetcher: logs the contact, answers a redirect or an empty page."""
+
+            redirects, log = self.redirects, self.log
+
+            def _one_request_inner(self, parts, hostname, port, connect_ip, limits, timeout, deadline, guard):
+                import os
+                import time
+                if self.log:
+                    with open(f"{self.log}.{os.getpid()}", "a", encoding="ascii") as fh:
+                        fh.write(f"{connect_ip} {time.monotonic():.6f}\n")
+                target = self.redirects.get(connect_ip) if parts.path in ("", "/") else None
+                return _RequestOutcome(
+                    kind="status", outcome="http_status", http_status=302 if target else 404, content_type="text/html",
+                    content_encoding=None, location=f"http://{target}/other" if target else None, body=b"", body_bytes=0,
+                    certificate=None, retry_after_seconds=None, connect_ip=connect_ip, host_header=hostname, sni=None,
+                    final_url=f"{parts.scheme}://{connect_ip}:{port}/")
+
+        class Fetcher(GuardedFetcher, Wire):
+            pass
+        lim = FetchLimits(1.0, 1.0, 5.0, 1 << 16, 1 << 16, 5)
+        endpoints = {e for e in self.endpoints if owned is None or e[0] in owned}
+        return Fetcher(TargetPolicy.for_tests(["198.51.100.0/24"]), None, user_agent="t", document_limits=lim, favicon_limits=lim,
+                       allowed_endpoints=endpoints, pacer=pacer, retry_statuses=(), max_retries=0)

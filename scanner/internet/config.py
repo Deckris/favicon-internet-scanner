@@ -330,12 +330,19 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     sc = _section(raw, "sni_confirm", {"enabled", "max_per_endpoint"})
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
                                    "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images",
-                                   "icon_selection", "fallback", "max_active_requests", "reuse_http_document"},
+                                   "icon_selection", "fallback", "max_active_requests", "reuse_http_document", "processes"},
                   {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page"})
     oh = _section({"offhost_icons": fv.get("offhost_icons") or {"enabled": False}}, "offhost_icons",
                   {"enabled", "max_total_fetches", "max_per_host", "min_interval_seconds", "max_bytes"}, {"enabled"})
     if not isinstance(oh["enabled"], bool):
         raise ConfigError("favicon.offhost_icons.enabled must be true or false")
+    procs = _int(fv.get("processes", 1), "favicon.processes", 1, 64)
+    if oh["enabled"] and procs > 1:
+        # The third-party caps and their saved state are counted by one fetcher; several processes would each count their own.
+        raise ConfigError("favicon.processes above 1 cannot be combined with favicon.offhost_icons.enabled")
+    for key, cap in (("workers", fv.get("workers")), ("max_active_requests", fv.get("max_active_requests", 512))):
+        if isinstance(cap, int) and not isinstance(cap, bool) and procs > cap:
+            raise ConfigError(f"favicon.processes ({procs}) cannot exceed favicon.{key} ({cap}); each process needs at least one")
     f = _section(raw, "fetch", {"connect_timeout", "read_timeout", "total_timeout", "max_document_bytes", "max_favicon_bytes", "max_decoded_bytes", "max_redirects", "user_agent"})
     tr = _section(raw, "transparency", {"info_url", "contact", "anonymous"}, {"info_url", "contact"})
     anonymous = tr.get("anonymous", False)
@@ -373,7 +380,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         sni_confirm=SimpleNamespace(enabled=bool(sc["enabled"]), max_per_endpoint=_int(sc["max_per_endpoint"], "sni_confirm.max_per_endpoint", 1, 20)),
         favicon=SimpleNamespace(
             enabled=bool(fv["enabled"]), max_hostnames_per_endpoint=_int(fv["max_hostnames_per_endpoint"], "favicon.max_hostnames_per_endpoint", 0, 20),
-            workers=_int(fv["workers"], "favicon.workers", 1, 8192), max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
+            workers=_int(fv["workers"], "favicon.workers", 1, 8192), processes=procs, max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
             store_images=_bool(fv.get("store_images", True), "favicon.store_images"),
             stage_max_seconds=_int(fv.get("stage_max_seconds", 7200), "favicon.stage_max_seconds", 1, 86400),
             max_unverified_names_per_endpoint=_int(fv.get("max_unverified_names_per_endpoint", 0), "favicon.max_unverified_names_per_endpoint", 0, 10),
