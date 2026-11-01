@@ -171,8 +171,8 @@ def test_a_crashed_process_gives_error_records_for_its_jobs_and_not_a_hung_stage
     for i, rec in enumerate(out):
         if i in doomed:
             assert rec["favicon_outcome"] == "error" and "exited with code 3" in rec["error"]
-        else:       # the survivors are told to wind down, so a job is either done or skipped, never lost
-            assert rec["favicon_outcome"] in ("image", "skipped_kill_switch")
+        else:
+            assert rec["favicon_outcome"] == "image"
 
 
 def test_the_stop_flag_has_the_interface_of_an_event_and_survives_a_pickle_into_a_child():

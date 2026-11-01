@@ -946,12 +946,9 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
             finished.add(i)
 
     def lost(i: int) -> None:
-        """Process ``i`` is gone without a result: error records for what it left, and the others are told to wind down."""
-        code = procs[i].exitcode
-        settle_rest(parts[i], f"favicon worker process {i}: exited with code {code} without a result")
+        """Process ``i`` is gone without a result: error records for what it left. The others carry on."""
+        settle_rest(parts[i], f"favicon worker process {i}: exited with code {procs[i].exitcode} without a result")
         finished.add(i)
-        if code != 0:
-            stop.set()
 
     def drain(i: int) -> None:
         while i not in finished:
