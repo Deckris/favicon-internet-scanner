@@ -25,6 +25,9 @@ from defusedxml import ElementTree
 from defusedxml.common import DefusedXmlException
 from PIL import IcoImagePlugin, Image, UnidentifiedImageError
 
+IMAGEHASH_VERSION = version("imagehash")   # looked up once; the metadata scan is far dearer than the hashing it labels
+PILLOW_VERSION = version("pillow")
+
 MAX_BYTES = 5 * 1024 * 1024
 MAX_PIXELS = 1_048_576          # real favicons are at most 512x512; larger images are a memory/CPU risk
 MAX_REPRESENTATIONS = 64
@@ -263,8 +266,8 @@ def _render_svg(text: str, sizes: list[tuple[int, int]]) -> list[Image.Image]:
 def fingerprint(data: bytes) -> FaviconFingerprint:
     algorithms = {
         "recipe": RECIPE,
-        "imagehash_version": version("imagehash"),
-        "pillow_version": version("pillow"),
+        "imagehash_version": IMAGEHASH_VERSION,
+        "pillow_version": PILLOW_VERSION,
         "dhash": "imagehash.dhash(hash_size=8)",
         "phash": "imagehash.phash(hash_size=8)",
         "mmh3": "mmh3.hash(base64.encodebytes(bytes))",
