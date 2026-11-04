@@ -183,7 +183,7 @@ def test_a_killed_child_frees_its_locks_and_the_shard_is_repeated_as_a_new_attem
 def test_sigterm_to_the_supervisor_reaches_the_children_and_no_shard_starts_afterwards(tmp_path, fake):
     cfg = load_config(_cfg(tmp_path, sample={"fraction": 0.0001, "seed": 4, "shards": 4}))
     _after(fake, "a-start", 1, lambda: os.kill(os.getpid(), signal.SIGTERM))
-    result = _go(cfg, fake)
+    result = _go(cfg, fake, times={"b": 8.0})
     assert not result["complete"] and result["stopped"]["reason"] == "interrupt"
     began = {e[1] for e in fake.events() if e[0] == "begin"}
     assert began == {0, 1} and not any(e[0] == "b-end" for e in fake.events())
@@ -196,7 +196,7 @@ def test_sigterm_to_the_supervisor_reaches_the_children_and_no_shard_starts_afte
 def test_kill_switch_stops_the_running_children(tmp_path, fake):
     cfg = load_config(_cfg(tmp_path, sample={"fraction": 0.0001, "seed": 4, "shards": 4}))
     _after(fake, "a-start", 1, lambda: Path(cfg.kill_switch_file).write_text("x"))
-    result = _go(cfg, fake)
+    result = _go(cfg, fake, times={"b": 8.0})
     assert not result["complete"] and result["stopped"]["reason"] == "interrupt"
     assert {e[1] for e in fake.events() if e[0] == "begin"} == {0, 1}
 

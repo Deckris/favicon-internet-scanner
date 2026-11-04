@@ -175,6 +175,13 @@ def child_main(argv: list[str] | None = None) -> int:
 class _Child:
     def __init__(self, shard: int, run_id: str, proc: subprocess.Popen) -> None:
         self.shard, self.run_id, self.proc = shard, run_id, proc
+        self.stop_sent = False
+
+    def stop(self) -> None:
+        """Ask the shard to stop. A child that has not yet armed its own handler dies of the signal itself; _settle knows why."""
+        if self.proc.poll() is None:
+            self.stop_sent = True
+            self.proc.send_signal(signal.SIGTERM)
 
 
 def child_command(cfg: Any, config_path: Path, shard: int, run_id: str, kwargs_factory: str | None = None,
@@ -209,6 +216,8 @@ def _settle(cfg: Any, state: dict[str, Any], child: _Child, rc: int, run_dirs: d
         return campaign.record_finished(entry, i, run_dir)
     if (run_dir / "manifest.json").exists():
         run_dirs[i] = run_dir
+    if rc == -signal.SIGTERM and child.stop_sent:       # our own stop reached it before (or after) its handlers were in place
+        rc = EXIT_INTERRUPTED
     if rc == EXIT_REFUSED:
         entry.update(status="refused", error=detail[:500])
         return {"shard": i, "reason": "preflight_failed", "detail": detail[:300]}
@@ -246,8 +255,7 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
     def terminate_children() -> None:
         for c in inflight.values():
             with contextlib.suppress(OSError):
-                if c.proc.poll() is None:
-                    c.proc.send_signal(signal.SIGTERM)
+                c.stop()
 
     def on_signal(signum: int, _frame: Any) -> None:
         nonlocal terminating
@@ -276,9 +284,9 @@ def run_overlapped(cfg: Any, *, log: Callable[[str], None] = print, config_path:
                     log(f"[campaign] shard {i + 1}/{cfg.shards} stopped: {stop['reason']}")
                     if stop["reason"] not in LETS_SIBLING_FINISH:
                         for other in inflight.values():          # a sibling still sweeping must not go on sending
-                            if not (phases / f"{other.run_id}.a-done").exists() and other.proc.poll() is None:
+                            if not (phases / f"{other.run_id}.a-done").exists():
                                 with contextlib.suppress(OSError):
-                                    other.proc.send_signal(signal.SIGTERM)
+                                    other.stop()
                 campaign._write_json(cdir / "campaign.json", state)
             switch = Path(cfg.kill_switch_file).exists()
             if switch and inflight and not kill_sent:
