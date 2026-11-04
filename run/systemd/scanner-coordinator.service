@@ -1,19 +1,32 @@
 [Unit]
-Description=Scanner coordinator
+Description=Scanner coordinator (spawns the ZMap, network and favicon workers)
 After=network-online.target scanner-limiterd.service
-Wants=network-online.target
-Requires=scanner-limiterd.service
+Wants=network-online.target scanner-limiterd.service
 PartOf=scanner.target
 
 [Service]
 Type=simple
 User=scanner
 EnvironmentFile=/etc/scanner/scanner.env
-ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet $${SCANNER_COORDINATOR_ARGS}'
+Environment=SCANNER_LIMITER_SOCKET=/run/scanner/limiter.sock
+ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet campaign --decoupled --config "$${SCANNER_CONFIG}" --confirm "$${SCANNER_CONFIRM}" --network-workers "$${SCANNER_NETWORK_WORKERS}" --favicon-workers "$${SCANNER_FAVICON_WORKERS}"'
+# The coordinator starts every worker process itself and restarts a worker that exits with the recycle
+# code 75, so systemd only supervises the coordinator. It restarts it after a crash or a signal, not after
+# a clean exit (the kill switch and a finished campaign both exit 0).
 Restart=on-failure
 RestartSec=30
-CPUWeight=200
+# A stop or restart signals the whole group so no ZMap sender or worker outlives the coordinator.
+KillMode=control-group
+TimeoutStopSec=120
 LimitNOFILE=65536
+CPUWeight=200
+# Memory limits apply to the coordinator and all its workers together. Size them from the host's RAM,
+# leaving room for the kernel, unbound and the limiter: MemoryHigh about 80 % of RAM (reclaim and throttling
+# start there), MemoryMax about 90 %. The values below suit a 16 GiB host.
+# The recycling thresholds the coordinator applies to each worker are set in the coordinator's own
+# settings (to be wired); keep their sum for all workers below MemoryHigh.
+MemoryHigh=12G
+MemoryMax=14G
 
 [Install]
 WantedBy=scanner.target

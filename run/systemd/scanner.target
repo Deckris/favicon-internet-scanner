@@ -1,8 +1,6 @@
 [Unit]
-Description=Scanner campaign processes
-Wants=scanner-limiterd.service scanner-zmap.service scanner-coordinator.service
-Wants=scanner-stage@tls.service scanner-stage@http.service scanner-stage@dns.service scanner-stage@sni.service
-Wants=scanner-favicon@1.service scanner-favicon@2.service
+Description=Scanner campaign
+Wants=scanner-limiterd.service scanner-coordinator.service
 
 [Install]
 WantedBy=multi-user.target

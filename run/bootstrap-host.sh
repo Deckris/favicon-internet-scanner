@@ -14,6 +14,10 @@ UNBOUND_CONF=/etc/unbound/unbound.conf.d/scanner.conf
 TMPFILES_FILE=/etc/tmpfiles.d/scanner.conf
 UNIT_DIR=/etc/systemd/system
 ENV_FILE=/etc/scanner/scanner.env
+UNIT_SUMS=/etc/scanner/unit-checksums.sha256
+LOGROTATE_FILE=/etc/logrotate.d/scanner
+# Source ports left to the local resolver (outgoing-port-permit in run/unbound/scanner.conf).
+RESOLVER_PORTS=5536
 NOFILE=65536
 
 DRY_RUN=0
@@ -22,7 +26,9 @@ DO_UNBOUND=1
 DO_SYSTEMD=1
 DO_SYSCTL=1
 DO_TOOLCHAIN=1
+DO_LOGROTATE=1
 OP_USER=""
+OP_GROUP=""
 
 usage() {
   cat <<'USAGE'
@@ -34,6 +40,7 @@ Usage: sudo bash run/bootstrap-host.sh [options] [operator-user]
   --no-sysctl     skip the sysctl and open-file-limit drop-ins
   --no-unbound    skip the local resolver
   --no-systemd    skip the unit files, env file and directories
+  --no-logrotate  skip the log rotation file
   -h, --help      this text
 USAGE
 }
@@ -49,6 +56,7 @@ while [ $# -gt 0 ]; do
     --no-sysctl) DO_SYSCTL=0 ;;
     --no-unbound) DO_UNBOUND=0 ;;
     --no-systemd) DO_SYSTEMD=0 ;;
+    --no-logrotate) DO_LOGROTATE=0 ;;
     -h|--help) usage; exit 0 ;;
     -*) usage >&2; die "unknown option: $1" ;;
     *) [ -z "$OP_USER" ] || die "more than one user given"; OP_USER="$1" ;;
@@ -63,6 +71,7 @@ OP_USER="${OP_USER:-${SUDO_USER:-}}"
 [ "$OP_USER" != "root" ] || die "the operator must be an unprivileged user, not root"
 [[ "$OP_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "unusual user name: $OP_USER"
 id "$OP_USER" >/dev/null 2>&1 || die "user does not exist: $OP_USER"
+OP_GROUP="$(id -gn "$OP_USER")"
 OP_HOME="$(getent passwd "$OP_USER" | cut -d: -f6)"
 if [ "$DRY_RUN" -eq 1 ]; then log "dry run: nothing will be changed"; fi
 
@@ -94,10 +103,10 @@ apt_get() {
 
 # Package names listed under "deferred due to phasing" in a simulated upgrade.
 phased_packages() {
-  apt-get -s full-upgrade 2>/dev/null | awk '
+  { apt-get -s full-upgrade 2>/dev/null | awk '
     /deferred due to phasing/ { on = 1; next }
     on && /^  / { for (i = 1; i <= NF; i++) print $i; next }
-    on { on = 0 }' | sort -u
+    on { on = 0 }' | sort -u; } || true
 }
 
 step_upgrade() {
@@ -170,24 +179,48 @@ unbound_threads() {
   echo "$n"
 }
 
+# Message cache in MiB: RAM / 32, between 16 and 1024. The rrset cache is twice that (cap 2048).
+unbound_msg_mib() {
+  local kb mib
+  kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || true)"
+  mib=$(( ${kb:-0} / 1024 / 32 ))
+  if [ "$mib" -lt 16 ]; then mib=16; fi
+  if [ "$mib" -gt 1024 ]; then mib=1024; fi
+  echo "$mib"
+}
+
 # Listeners on local port 53 (TCP and UDP) with process names.
 listeners_53() { ss -H -lntup 2>/dev/null | awk '$5 ~ /:53$/' || true; }
 
+# Listeners that stop unbound from binding 127.0.0.1:53: wildcard and loopback addresses on port 53 that are
+# not unbound itself. systemd-resolved's 127.0.0.53 and 127.0.0.54 are other addresses and do not match.
+conflicts_53() {
+  listeners_53 | awk '$5 ~ /^(0\.0\.0\.0|\*|\[::\]|127\.0\.0\.1|\[::1\])(%[^:]*)?:53$/ && $0 !~ /unbound/'
+}
+
 step_unbound() {
-  local template="$REPO_ROOT/run/unbound/scanner.conf" busy threads ours="" i=0
+  local template="$REPO_ROOT/run/unbound/scanner.conf" busy threads msg rrset range ours="" i=0
   log "step 6: local resolver (unbound)"
   [ -f "$template" ] || die "missing $template"
-  busy="$(listeners_53 | awk '$5 == "127.0.0.1:53" && $0 !~ /unbound/')"
+  busy="$(conflicts_53)"
   if [ -n "$busy" ]; then
-    die "127.0.0.1:53 is already in use by another process, so unbound cannot listen there:
+    die "port 53 is already in use by another process, so unbound cannot listen on 127.0.0.1:53:
 $busy
 Stop that service or move it to another address, then run this script again.
 A stub on 127.0.0.53 (systemd-resolved) does not conflict."
   fi
   run env DEBIAN_FRONTEND=noninteractive apt-get install -y -q unbound
   threads="$(unbound_threads)"
-  log "unbound threads and slabs: $threads ($(nproc) cores)"
-  sed -E "s/^([[:space:]]*(num-threads|msg-cache-slabs|rrset-cache-slabs|infra-cache-slabs|key-cache-slabs):[[:space:]]*)8\$/\\1$threads/" \
+  msg="$(unbound_msg_mib)"
+  rrset=$(( msg * 2 ))
+  # Each thread opens up to outgoing-range ports, so threads x range must fit the permitted port slice.
+  range=$(( RESOLVER_PORTS / threads ))
+  log "unbound: $threads threads, msg cache ${msg}m, rrset cache ${rrset}m, outgoing-range $range ($(nproc) cores)"
+  sed -E -e "s/^([[:space:]]*(num-threads|msg-cache-slabs|rrset-cache-slabs|infra-cache-slabs|key-cache-slabs):[[:space:]]*)[0-9]+\$/\\1$threads/" \
+         -e "s/^([[:space:]]*msg-cache-size:[[:space:]]*).*\$/\\1${msg}m/" \
+         -e "s/^([[:space:]]*rrset-cache-size:[[:space:]]*).*\$/\\1${rrset}m/" \
+         -e "s/^([[:space:]]*outgoing-range:[[:space:]]*).*\$/\\1$range/" \
+         -e "s/^([[:space:]]*num-queries-per-thread:[[:space:]]*).*\$/\\1$(( range / 2 ))/" \
     "$template" | write_file "$UNBOUND_CONF" 0644
   if [ "$DRY_RUN" -eq 1 ]; then
     log "would run: unbound-checkconf; systemctl enable unbound; systemctl restart unbound; check that only loopback serves port 53"
@@ -210,13 +243,32 @@ $ours"
   log "unbound serves port 53 on loopback only"
 }
 
-# Unit text with the unit user filled in and LimitNOFILE ensured.
-render_unit() {
-  if grep -q '^LimitNOFILE=' "$1"; then
-    sed -E "s/^User=.*/User=$OP_USER/" "$1"
-  else
-    sed -E -e "s/^User=.*/User=$OP_USER/" -e "/^\\[Service\\]/a LimitNOFILE=$NOFILE" "$1"
+# install_unit SRC: render a unit with the operator user and install it. A unit is replaced only while it is
+# still what this script wrote earlier (checksum in $UNIT_SUMS) or already identical; a locally edited unit is
+# kept and a warning points to drop-ins.
+install_unit() {
+  local src="$1" name dest tmp have want stored
+  name="$(basename "$src")"
+  dest="$UNIT_DIR/$name"
+  tmp="$(mktemp)"
+  sed -E "s/^User=.*/User=$OP_USER/" "$src" > "$tmp"
+  want="$(sha256sum "$tmp" | cut -d' ' -f1)"
+  if [ -f "$dest" ]; then
+    have="$(sha256sum "$dest" | cut -d' ' -f1)"
+    stored="$(awk -v n="$name" '$2 == n { print $1 }' "$UNIT_SUMS" 2>/dev/null || true)"
+    if [ "$have" != "$want" ] && [ "$have" != "$stored" ]; then
+      log "WARNING: $dest was edited locally and is kept. Put changes in a drop-in ('systemctl edit ${name%.*}') and delete the edited file to take the shipped unit."
+      rm -f "$tmp"
+      return 0
+    fi
   fi
+  write_file "$dest" 0644 < "$tmp"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    install -d -m 0755 "$(dirname "$UNIT_SUMS")"
+    { grep -v -F "  $name" "$UNIT_SUMS" 2>/dev/null || true; printf '%s  %s\n' "$want" "$name"; } > "$tmp"
+    install -m 0644 "$tmp" "$UNIT_SUMS"
+  fi
+  rm -f "$tmp"
 }
 
 step_systemd() {
@@ -224,24 +276,32 @@ step_systemd() {
   log "step 7: systemd units, env file and directories"
   [ -d "$src" ] || die "missing $src"
   for f in "$src"/*.service "$src"/scanner.target; do
-    render_unit "$f" | write_file "$UNIT_DIR/$(basename "$f")" 0644
+    install_unit "$f"
   done
+  # systemd reads the env file as root, so it stays root:root 0600 (it holds the confirmation token).
+  # The operator edits it with sudo.
   if [ -e "$ENV_FILE" ]; then
     log "kept existing $ENV_FILE"
   else
     sed -E -e "s|^SCANNER_HOME=.*|SCANNER_HOME=$REPO_ROOT|" \
            -e "s|^SCANNER_PYTHON=.*|SCANNER_PYTHON=$OP_HOME/scanner-venv/bin/python|" \
-      "$src/scanner.env.example" | write_file "$ENV_FILE" 0640
-    if [ "$DRY_RUN" -eq 0 ]; then chgrp "$OP_USER" "$ENV_FILE"; fi
+      "$src/scanner.env.example" | write_file "$ENV_FILE" 0600
   fi
   write_file "$TMPFILES_FILE" 0644 <<CONF
 # Written by the scanner host bootstrap: runtime directory for the limiter socket.
-d /run/scanner 0750 $OP_USER $OP_USER -
+d /run/scanner 0750 $OP_USER $OP_GROUP -
 CONF
-  run install -d -m 0750 -o "$OP_USER" -g "$OP_USER" /var/lib/scanner /var/lib/scanner/work /var/log/scanner
+  run install -d -m 0750 -o "$OP_USER" -g "$OP_GROUP" /var/lib/scanner /var/lib/scanner/work /var/log/scanner
   run systemd-tmpfiles --create "$TMPFILES_FILE"
   run systemctl daemon-reload
   log "the target is not enabled or started"
+}
+
+step_logrotate() {
+  local src="$REPO_ROOT/run/logrotate/scanner.example"
+  log "step 7b: log rotation"
+  [ -f "$src" ] || die "missing $src"
+  sed -E "s/^([[:space:]]*su )[^[:space:]]+ [^[:space:]]+\$/\\1$OP_USER $OP_GROUP/" "$src" | write_file "$LOGROTATE_FILE" 0644
 }
 
 summary() {
@@ -276,7 +336,7 @@ Still to do by the operator:
   1. Create settings.yaml and config.yaml in /var/lib/scanner/work from the run/*.example.yaml files and review them.
   2. Record the approval (approval.yaml) and the exclusion list.
   3. Run a small pilot and check its output.
-  4. Put the confirmation token printed by 'plan' into $ENV_FILE.
+  4. Put the confirmation token printed by 'plan' into $ENV_FILE (root:root 0600; edit it with sudo).
   5. Then start the campaign: sudo systemctl enable --now scanner.target
 -----------------
 NEXT
@@ -287,4 +347,5 @@ if [ "$DO_TOOLCHAIN" -eq 1 ]; then step_toolchain; fi
 if [ "$DO_SYSCTL" -eq 1 ]; then step_sysctl; fi
 if [ "$DO_UNBOUND" -eq 1 ]; then step_unbound; fi
 if [ "$DO_SYSTEMD" -eq 1 ]; then step_systemd; fi
+if [ "$DO_LOGROTATE" -eq 1 ]; then step_logrotate; fi
 summary
