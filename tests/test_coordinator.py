@@ -98,6 +98,8 @@ class Cluster:
 def run(cfg, cluster, tmp_path, **kw):
     kw.setdefault("egress", lambda c: c.vantage.public_egress_ip)
     kw.setdefault("alive", lambda pid: False)
+    kw.setdefault("allow_per_process_limits", True)
+    kw.setdefault("zmap_lock", tmp_path / "zmap.lock")
     return coordinator.run_decoupled(cfg, config_path=tmp_path / "scale.yaml", confirm="tok", log=lambda *_: None,
                                      spawn=cluster.spawn, tick=0, sleep=kw.pop("sleep", lambda _: None), **kw)
 
@@ -142,7 +144,7 @@ def test_worker_limits_hold(tmp_path):
         return proc
     result = coordinator.run_decoupled(cfg, config_path=tmp_path / "scale.yaml", confirm="tok", log=lambda *_: None, spawn=spawn, tick=0,
                                        sleep=lambda _: None, egress=lambda c: c.vantage.public_egress_ip, alive=lambda p: False,
-                                       network_workers=2, favicon_workers=1)
+                                       network_workers=2, favicon_workers=1, allow_per_process_limits=True, zmap_lock=tmp_path / "zmap.lock")
     assert result["complete"]
     assert peaks["network"] == 2 and peaks["favicon"] == 1
 
@@ -316,12 +318,11 @@ def test_derived_status_keeps_the_existing_values():
 
 
 @posix
+@posix
 def test_zmap_start_waits_while_an_earlier_sweep_holds_the_lock(tmp_path):
     import fcntl
     cfg = make_cfg(tmp_path, shards=2)
-    cdir = campaign.campaign_dir(cfg)
-    cdir.mkdir(parents=True, exist_ok=True)
-    held = os.open(cdir / coordinator.LOCK_NAME, os.O_CREAT | os.O_RDWR)
+    held = os.open(tmp_path / "zmap.lock", os.O_CREAT | os.O_RDWR)
     fcntl.flock(held, fcntl.LOCK_EX)
     cluster = Cluster(cfg)
     ticks = []
@@ -341,16 +342,17 @@ def test_lock_survives_in_a_child_after_the_coordinator_closes_its_descriptor(tm
     import fcntl
     import subprocess
     import sys
-    fd = coordinator._try_zmap_lock(tmp_path)
-    assert isinstance(fd, int) and coordinator._try_zmap_lock(tmp_path) is False
+    lock = tmp_path / "zmap.lock"
+    fd = coordinator._try_zmap_lock(lock)
+    assert isinstance(fd, int) and coordinator._try_zmap_lock(lock) is False
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], pass_fds=(fd,))
     try:
         os.close(fd)
-        assert coordinator._try_zmap_lock(tmp_path) is False     # the worker still holds the sweep lock
+        assert coordinator._try_zmap_lock(lock) is False     # the worker still holds the sweep lock
     finally:
         child.kill()
         child.wait()
-    again = coordinator._try_zmap_lock(tmp_path)
+    again = coordinator._try_zmap_lock(lock)
     assert isinstance(again, int)
     fcntl.flock(again, fcntl.LOCK_UN)
     os.close(again)
@@ -432,3 +434,265 @@ def test_decoupled_flags_are_refused_with_other_campaign_modes(tmp_path, capsys)
     for extra in (["--pipeline", "2"], ["--stop-after-network"]):
         assert cli.main(["campaign", "--decoupled", "--config", str(path), "--confirm", token, "--skip-pilot-check", *extra]) == 2
         assert "--decoupled does not combine" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------------ restarts, overrides, identity, limits, kill
+
+def fail_state(cfg, reason="crashed"):
+    entry = coordinator._entry_for(cfg, 0, None)
+    entry["stages"]["zmap"] = {**coordinator._done_stage()}
+    entry["stages"]["network"].update(status="failed", attempts=coordinator.MAX_ATTEMPTS, error="exited with code 1", stop_reason=reason)
+    entry["status"] = "zmap_done"
+    seed_state(cfg, {0: entry})
+
+
+def test_failed_stage_stays_failed_across_a_restart(tmp_path):
+    cfg = make_cfg(tmp_path, shards=2)
+    fail_state(cfg)
+    cluster = Cluster(cfg)
+    result = run(cfg, cluster, tmp_path)
+    assert not result["complete"] and result["stopped"]["reason"] == "crashed"
+    assert ("start", "network", 0) not in cluster.events and ("start", "zmap", 1) not in cluster.events
+    st = state_of(cfg)["shard_states"]["0"]["stages"]["network"]
+    assert st["status"] == "failed" and st["attempts"] == coordinator.MAX_ATTEMPTS
+
+
+def test_failed_stage_keeps_its_stop_reason_and_retry_failed_resets_it(tmp_path):
+    cfg = make_cfg(tmp_path, shards=2)
+    fail_state(cfg, "zero_responsive")
+    assert run(cfg, Cluster(cfg), tmp_path)["stopped"]["reason"] == "zero_responsive"
+    cluster = Cluster(cfg)
+    result = run(cfg, cluster, tmp_path, retry_failed=True)
+    assert result["complete"] and ("start", "network", 0) in cluster.events
+    assert state_of(cfg)["shard_states"]["0"]["stages"]["network"]["attempts"] == 0
+
+
+def test_attempts_survive_a_restart_before_the_cap(tmp_path):
+    cfg = make_cfg(tmp_path, shards=2)
+    cluster = Cluster(cfg, fail={("zmap", 0): 1})
+    first = run(cfg, cluster, tmp_path, max_attempts=2)
+    assert first["stopped"]["reason"] == "crashed"
+    again = Cluster(cfg)
+    assert run(cfg, again, tmp_path, max_attempts=2)["stopped"]["reason"] == "crashed"
+    assert again.events == []
+
+
+def test_unit_does_not_restart_on_the_stop_codes_the_cli_returns():
+    unit = (Path(__file__).resolve().parents[1] / "run" / "systemd" / "scanner-coordinator.service").read_text(encoding="utf-8")
+    line = next(l for l in unit.splitlines() if l.startswith("RestartPreventExitStatus="))
+    codes = {int(c) for c in line.split("=", 1)[1].split()}
+    needed = {cli.CAMPAIGN_EXIT["preflight_failed"], cli.CAMPAIGN_EXIT["zero_responsive"], cli.EXIT_STOPPED, cli.EXIT_DISK}
+    assert needed <= codes and 0 not in codes
+    assert "to be wired" not in unit and "both exit 0" not in unit
+
+
+def test_stage_command_passes_the_overlay_and_extra_arguments(tmp_path):
+    import dataclasses
+    cfg = dataclasses.replace(make_cfg(tmp_path), exclusions_overlay_file=tmp_path / "optout.txt")
+    cmd = coordinator.stage_command(cfg, tmp_path / "c.yaml", "network", 1, tmp_path / "run", "tok",
+                                    extra_args=("--favicon-processes", "4"))
+    assert cmd[cmd.index("--exclusions-overlay") + 1] == str(tmp_path / "optout.txt")
+    assert cmd[-2:] == ["--favicon-processes", "4"]
+    assert "--exclusions-overlay" not in coordinator.stage_command(make_cfg(tmp_path), tmp_path / "c.yaml", "network", 1, tmp_path / "run", "tok")
+
+
+def test_every_spawned_worker_gets_the_overlay_and_the_worker_arguments(tmp_path):
+    import dataclasses
+    cfg = dataclasses.replace(make_cfg(tmp_path, shards=2), exclusions_overlay_file=tmp_path / "optout.txt")
+    cluster = Cluster(cfg)
+    seen = []
+
+    def spawn(cmd, fds):
+        seen.append(cmd)
+        return cluster.spawn(cmd, fds)
+    result = coordinator.run_decoupled(cfg, config_path=tmp_path / "scale.yaml", confirm="tok", log=lambda *_: None, spawn=spawn, tick=0,
+                                       sleep=lambda _: None, egress=lambda c: c.vantage.public_egress_ip, alive=lambda p: False,
+                                       allow_per_process_limits=True, zmap_lock=tmp_path / "zmap.lock", worker_args=("--favicon-processes", "2"))
+    assert result["complete"] and len(seen) == 6
+    assert all("--exclusions-overlay" in c and c[-2:] == ["--favicon-processes", "2"] for c in seen)
+
+
+def test_stage_worker_applies_the_favicon_overrides(tmp_path, monkeypatch):
+    path = _cfg(tmp_path, sample={"fraction": 0.0001, "seed": 4, "shards": 3})
+    cfg = load_config(path)
+    argv, run_dir = _worker_args(path, cfg, "favicon", extra=("--favicon-processes", "2", "--favicon-max-active-requests", "40"))
+    seen = {}
+
+    def fake_favicon(c, rd, **kw):
+        seen["favicon"] = c.favicon
+        (rd / "manifest.json").write_text(json.dumps({"complete": True}))
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(cli.pipeline, "run_favicon_only", fake_favicon)
+    from scanner.internet import supervisor
+    monkeypatch.setattr(supervisor, "_die_with_parent", lambda pid: True)
+    assert cli.main(argv) == 0
+    assert seen["favicon"].processes == 2 and seen["favicon"].max_active_requests == 40
+
+
+def test_stale_pid_after_a_reboot_or_reuse_counts_as_dead(tmp_path, monkeypatch):
+    now = {"owner_start": "500", "owner_boot": "boot-b"}
+    monkeypatch.setattr(coordinator, "process_identity", lambda pid: now)
+    always = lambda pid: True        # noqa: E731 - the pid exists
+    st = {"owner_pid": 7, "owner_start": "500", "owner_boot": "boot-b"}
+    assert coordinator.owner_alive(st, always)
+    assert not coordinator.owner_alive({**st, "owner_boot": "boot-a"}, always)       # recorded before a reboot
+    assert not coordinator.owner_alive({**st, "owner_start": "123"}, always)         # the pid was reused
+    assert coordinator.owner_alive({"owner_pid": 7}, always)                         # no identity recorded: pid check only
+    assert not coordinator.owner_alive(st, lambda pid: False)
+
+
+def test_coordinator_resumes_over_a_stage_whose_pid_was_reused(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path, shards=2)
+    entry = coordinator._entry_for(cfg, 0, None)
+    entry["stages"]["zmap"].update(status="running", attempts=1, owner_pid=777, owner_start="1", owner_boot="old")
+    seed_state(cfg, {0: entry})
+    monkeypatch.setattr(coordinator, "process_identity", lambda pid: {"owner_start": "99", "owner_boot": "new"})
+    result = run(cfg, Cluster(cfg), tmp_path, alive=lambda pid: True)
+    assert result["complete"]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_process_identity_reads_proc():
+    ident = coordinator.process_identity(os.getpid())
+    assert ident and ident["owner_start"].isdigit() and ident["owner_boot"]
+    assert coordinator.process_identity(None) is None
+
+
+def test_decoupled_with_several_workers_needs_a_limiter_socket(tmp_path, monkeypatch):
+    monkeypatch.delenv("SCANNER_LIMITER_SOCKET", raising=False)
+    cfg = make_cfg(tmp_path, shards=2)
+    with pytest.raises(ValueError, match="limiter"):
+        run(cfg, Cluster(cfg), tmp_path, allow_per_process_limits=False)
+    assert not (campaign.campaign_dir(cfg) / "campaign.lock").exists()
+    monkeypatch.setenv("SCANNER_LIMITER_SOCKET", str(tmp_path / "l.sock"))
+    assert run(cfg, Cluster(cfg), tmp_path, allow_per_process_limits=False)["complete"]
+
+
+def test_single_worker_or_explicit_flag_needs_no_limiter_socket(tmp_path, monkeypatch):
+    monkeypatch.delenv("SCANNER_LIMITER_SOCKET", raising=False)
+    cfg = make_cfg(tmp_path, shards=2)
+    assert coordinator.limiter_refusal(cfg, 1, 0, False) is None
+    assert coordinator.limiter_refusal(cfg, 2, 3, True) is None
+    assert "limiter" in coordinator.limiter_refusal(cfg, 2, 3, False)
+
+
+def test_cli_refuses_decoupled_without_a_limiter_socket(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("SCANNER_LIMITER_SOCKET", raising=False)
+    path = _cfg(tmp_path, sample={"fraction": 0.0001, "seed": 4, "shards": 3})
+    cfg = load_config(path)
+    token = pipeline.confirm_token(cfg, pipeline.build_policy(cfg)[1])
+    assert cli.main(["campaign", "--decoupled", "--config", str(path), "--confirm", token, "--skip-pilot-check"]) == 2
+    assert "limiter" in capsys.readouterr().err
+
+
+def test_escalation_kills_the_whole_tree_of_every_worker(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    cluster = Cluster(cfg, durations={("network", 0): 10000, ("zmap", 1): 10000})
+    killed = []
+    monkeypatch.setattr(coordinator, "_kill_tree", lambda proc: killed.append(proc.pid))
+    monkeypatch.setattr(coordinator, "STOP_GRACE_SECONDS", -1.0)
+    switch = Path(cfg.kill_switch_file)
+    switch.parent.mkdir(parents=True, exist_ok=True)
+
+    def sleep(_):
+        if ("start", "zmap", 1) in cluster.events and ("start", "network", 0) in cluster.events:
+            switch.write_text("stop")
+        if killed:
+            for p in cluster.procs:
+                p.rc = p.rc if p.rc is not None else -9
+    result = run(cfg, cluster, tmp_path, sleep=sleep)
+    assert result["stopped"]["reason"] == "kill_switch"
+    assert {p.pid for p in cluster.procs if p.stage in ("zmap", "network") and p.signals} <= set(killed)
+    assert killed
+
+
+def test_unexpected_error_kills_the_tree_of_running_workers(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    cluster = Cluster(cfg, durations={("zmap", 0): 10000})
+    killed = []
+    monkeypatch.setattr(coordinator, "_kill_tree", lambda proc: killed.append(proc.pid))
+
+    def sleep(_):
+        raise RuntimeError("boom")
+    with pytest.raises(RuntimeError):
+        run(cfg, cluster, tmp_path, sleep=sleep)
+    assert killed == [cluster.procs[0].pid]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists() or os.name != "posix", reason="needs /proc and POSIX sessions")
+def test_kill_tree_reaches_a_child_in_its_own_session(tmp_path):
+    import subprocess
+    import sys
+    import time
+    pidfile = tmp_path / "child.pid"
+    code = ("import subprocess, sys, time\n"
+            "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\n"
+            f"open({str(pidfile)!r}, 'w').write(str(c.pid))\n"
+            "time.sleep(60)\n")
+    worker = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    try:
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text():
+                break
+            time.sleep(0.1)
+        child = int(pidfile.read_text())
+        assert child in coordinator._descendants(worker.pid)
+        coordinator._kill_tree(worker)
+        worker.wait(timeout=10)
+        for _ in range(100):
+            if coordinator.process_identity(child) is None or Path(f"/proc/{child}/stat").read_text().split(")")[1].split()[0] == "Z":
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("the grandchild survived")
+    finally:
+        worker.kill()
+
+
+@posix
+def test_lock_is_tried_before_the_egress_lookup(tmp_path):
+    import fcntl
+    cfg = make_cfg(tmp_path, shards=2)
+    lock = tmp_path / "zmap.lock"
+    held = os.open(lock, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    cluster = Cluster(cfg)
+    lookups, ticks = [], []
+
+    def egress(c):
+        lookups.append(1)
+        return c.vantage.public_egress_ip
+
+    def sleep(_):
+        ticks.append(1)
+        if len(ticks) == 6:
+            assert lookups == []                      # nothing was looked up while the sweep of another campaign ran
+            os.close(held)
+    assert run(cfg, cluster, tmp_path, sleep=sleep, egress=egress)["complete"]
+    assert lookups
+
+
+@posix
+def test_lock_is_released_when_the_egress_check_stops_the_start(tmp_path):
+    import fcntl
+    cfg = make_cfg(tmp_path, shards=2)
+    result = run(cfg, Cluster(cfg), tmp_path, egress=lambda c: "203.0.113.99")
+    assert result["stopped"]["reason"] == "egress_changed"
+    fd = coordinator._try_zmap_lock(tmp_path / "zmap.lock")
+    assert isinstance(fd, int)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def test_zmap_lock_path_is_shared_by_all_campaigns(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    monkeypatch.delenv(coordinator.LOCK_ENV, raising=False)
+    monkeypatch.setattr(coordinator, "RUN_DIR", tmp_path / "no-such-run-dir")
+    assert coordinator.zmap_lock_path(cfg) == Path(cfg.output_dir) / coordinator.LOCK_NAME
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setattr(coordinator, "RUN_DIR", run_dir)
+    assert coordinator.zmap_lock_path(cfg) == run_dir / coordinator.LOCK_NAME
+    monkeypatch.setenv(coordinator.LOCK_ENV, str(tmp_path / "env.lock"))
+    assert coordinator.zmap_lock_path(cfg) == tmp_path / "env.lock"
+    assert coordinator.zmap_lock_path(cfg, tmp_path / "flag.lock") == tmp_path / "flag.lock"

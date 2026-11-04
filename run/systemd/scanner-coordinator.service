@@ -11,10 +11,15 @@ EnvironmentFile=/etc/scanner/scanner.env
 Environment=SCANNER_LIMITER_SOCKET=/run/scanner/limiter.sock
 ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet campaign --decoupled --config "$${SCANNER_CONFIG}" --confirm "$${SCANNER_CONFIRM}" --network-workers "$${SCANNER_NETWORK_WORKERS}" --favicon-workers "$${SCANNER_FAVICON_WORKERS}"'
 # The coordinator starts every worker process itself and restarts a worker that exits with the recycle
-# code 75, so systemd only supervises the coordinator. It restarts it after a crash or a signal, not after
-# a clean exit (the kill switch and a finished campaign both exit 0).
+# code 75, so systemd only supervises the coordinator. A finished campaign and a DRAIN stop exit 0. The
+# coordinator ends with a code that needs an operator when a stage was refused or kept failing (2: preflight
+# failed, 5: crashed), no endpoint answered (4), the kill switch was set, the egress address changed or it was
+# interrupted (all 5), or the disk is full (6). Those are not restarted, because the campaign would only
+# stop again or send more traffic than intended. Any other failure (an unexpected error, a signal) is restarted
+# after RestartSec; stages that failed before stay failed until `--retry-failed` is given by hand.
 Restart=on-failure
 RestartSec=30
+RestartPreventExitStatus=2 4 5 6
 # A stop or restart signals the whole group so no ZMap sender or worker outlives the coordinator.
 KillMode=control-group
 TimeoutStopSec=120
@@ -23,8 +28,8 @@ CPUWeight=200
 # Memory limits apply to the coordinator and all its workers together. run/bootstrap-host.sh sets MemoryHigh
 # (about 78 % of RAM, where reclaim and throttling start) and MemoryMax (about 85 %) from the host's RAM when it
 # installs the unit; the values below suit a 16 GiB host if the unit is copied by hand.
-# The recycling thresholds the coordinator applies to each worker are set in the coordinator's own
-# settings (to be wired); keep their sum for all workers below MemoryHigh.
+# A worker that exceeds its own recycling thresholds (scanner.internet.recycle.Recycler) exits with code 75 and
+# the coordinator starts it again; keep the sum of the thresholds of all workers below MemoryHigh.
 MemoryHigh=12G
 MemoryMax=14G
 
