@@ -36,7 +36,8 @@ def cfgview():
     return SimpleNamespace(
         vantage=SimpleNamespace(id="v", interface="eth0", source_ipv4="192.168.1.10"),
         measurement=SimpleNamespace(zmap_rate=100, zmap_max_runtime=100, zmap_cooldown=1, zgrab_batch_size=1, zgrab_senders=1,
-                                    zgrab_connect_timeout=1, zgrab_target_timeout=1),
+                                    zgrab_connect_timeout=1, zgrab_target_timeout=1,
+                                    zmap_output_fields="saddr,window,ttl,timestamp-str"),
         fetch=SimpleNamespace(user_agent="ua"))
 
 

@@ -154,7 +154,7 @@ def test_tool_timeouts_cover_a_shard_ten_times_larger(tmp_path):
 def test_favicon_stage_overrides_apply_outside_the_checksum(tmp_path):
     from argparse import Namespace
     from scanner.internet.__main__ import _favicon_overrides
-    from scanner.internet.config import shared_checksum
+    from scanner.internet.config import shared_config_checksum as shared_checksum
     cfg = load_config(_cfg(tmp_path))
     none = Namespace(favicon_workers=None, favicon_processes=None, favicon_max_active_requests=None)
     assert _favicon_overrides(none, cfg) is cfg
