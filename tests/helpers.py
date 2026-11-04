@@ -241,13 +241,15 @@ def _log_grants(pacer, log: str) -> bool:
     """Log each release the pacer makes, with the pacer's own clock reading, instead of the time the caller wakes up.
 
     The pacer guarantees the gap between releases; a thread that is slow to run after its release (a busy CPU) would
-    log a later time and make a correct gap look short. Returns False when the pacer has no release to follow.
+    log a later time and make a correct gap look short. Returns False when the pacer has no release to follow (no hook, another clock, or no pause and no limiter).
     """
     import os
     import time
     grant = getattr(pacer, "_grant_locked", None)
     if grant is None or getattr(pacer, "_now", None) is not time.monotonic:
         return False
+    if getattr(pacer, "min_interval", 0) <= 0 and getattr(pacer, "limiter", None) is None:
+        return False                       # an unpaced pacer releases without a grant: the fetcher logs the contact itself
     if getattr(pacer, "_grants_logged_to", None) == log:
         return True
 
