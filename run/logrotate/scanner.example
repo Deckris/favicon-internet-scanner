@@ -1,0 +1,13 @@
+# Installed to /etc/logrotate.d/scanner by run/bootstrap-host.sh with the operator user and group on the `su` line.
+# copytruncate keeps the log open in the running worker, so no restart or signal is needed.
+/var/log/scanner/*.log /var/lib/scanner/work/campaign-*/*.log {
+    daily
+    rotate 14
+    maxsize 500M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su scanner scanner
+}

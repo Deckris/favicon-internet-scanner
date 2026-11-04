@@ -1,5 +1,5 @@
 """CLI: ``python -m scanner.internet {preflight|plan|run|campaign|favicon-refetch|selftest} --config FILE``
-and ``python -m scanner.internet export-csv RUN_DIR [--out FILE]``.
+and ``python -m scanner.internet export-csv RUN_DIR [--out FILE]``; ``status CAMPAIGN_DIR [--json]`` summarises a campaign.
 
 Exit codes: 0 complete, 2 refused (config, approval, preflight, confirmation, or a prior run of this config),
 3 run error, 4 run finished but found zero responsive endpoints, 5 run ended early or with stage errors
@@ -275,11 +275,12 @@ def main(argv: list[str] | None = None) -> int:
     _profile.raise_open_file_limit()
     ap = argparse.ArgumentParser(prog="scanner.internet")
     ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact", "prune-raw",
-                                    "favicon-stage", "export-network", "import-favicons", "export-shard", "limiterd") + SETTINGS_COMMANDS)
+                                    "favicon-stage", "export-network", "import-favicons", "export-shard", "limiterd", "status") + SETTINGS_COMMANDS)
     ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact, prune-raw, export-shard: the finished run; "
-                    "favicon-stage, export-network, import-favicons: a network-only run")
+                    "favicon-stage, export-network, import-favicons: a network-only run; status: the campaign directory")
     ap.add_argument("dest", nargs="?", type=Path, help="export-network: new directory for the copy; import-favicons: the favicon run "
                     "to take the outputs from; export-shard: directory to copy the run into")
+    ap.add_argument("--json", action="store_true", help="status: print the summary as JSON")
     ap.add_argument("--out", type=Path, help="export-csv: output file (default: normalized/hostname_resolution.csv in the run)")
     ap.add_argument("--config", type=Path)
     ap.add_argument("--workdir", type=Path, default=Path("."), help="init, apply, exclusions: folder holding settings.yaml")
@@ -391,6 +392,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.limiter_socket is not None:       # child processes of a campaign inherit it
         import os
         os.environ["SCANNER_LIMITER_SOCKET"] = str(args.limiter_socket)
+    if args.command == "status":
+        from scanner.internet import status as _status
+        if args.run_dir is None:
+            print("REFUSED: status needs the campaign directory (<output dir>/campaign-<checksum prefix>)", file=sys.stderr)
+            return 2
+        try:
+            summary = _status.collect(args.run_dir)
+        except ValueError as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(summary, indent=2) if args.json else _status.render(summary))
+        return 0
     if args.command == "export-csv":
         if args.run_dir is None:
             ap.error("export-csv needs RUN_DIR")

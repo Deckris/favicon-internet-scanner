@@ -138,6 +138,48 @@ The exclusions file is bound into the config checksum and the approval, so addin
 - Each run records what happened. `manifest.json` has `exclusion_overlay` (checksum, entry count, reloads, rejections, addresses dropped by stage), and `normalized/exclusion_overlay.jsonl` lists every load and rejection with its time, the SHA-256 and entry count, and for each batch or sweep its size, the number of addresses dropped and the overlay checksum in force. `normalized/policy_refusals.jsonl` shows each dropped address with reason `excluded_overlay`.
 - Favicon worker processes read the file themselves and enforce it, but their drop counts are not added to the manifest.
 
+### Running the campaign as systemd services
+
+[`run/systemd/`](run/systemd) holds templates for a decoupled campaign on one Linux host as two services: `scanner-limiterd.service` (the limiter daemon, `Restart=always`, protected from the OOM killer) and `scanner-coordinator.service` (`campaign --decoupled`, which starts the ZMap, network and favicon worker processes itself). `scanner.target` groups them. The coordinator wants and starts after the limiter but does not require it, so a limiter restart does not stop the campaign; the workers find the limiter through `SCANNER_LIMITER_SOCKET`. `KillMode=control-group` makes a stop signal every process of the coordinator, so no sender outlives it.
+
+Install (or run [`run/bootstrap-host.sh`](run/bootstrap-host.sh), below):
+
+1. Create the user the units run as (`User=scanner` in each unit) and the directories named in the env file.
+2. `sudo cp run/systemd/*.service run/systemd/scanner.target /etc/systemd/system/`
+3. `sudo install -D -m 0600 run/systemd/scanner.env.example /etc/scanner/scanner.env`, then replace every placeholder (paths, confirmation token, worker counts). systemd reads the file as root, so it can stay `root:root` and unreadable for the operator.
+4. `sudo systemctl daemon-reload && sudo systemctl enable --now scanner.target`
+
+Check with `systemctl status 'scanner-*'` and `python -m scanner.internet status <campaign dir> [--json]`. `status` prints shards per state and per stage, the queue per stage, the last heartbeat of each worker, the ZMap send rate when the state records one, free disk and the RSS of the scanner processes (read from `/proc`, so only on Linux; ZMap, ZGrab2 and ZDNS are matched by program name, and the value after `--confirm` is masked). It reads `campaign.json` and tolerates a per-shard `stages` mapping (`{stage: {status, attempts, owner_pid, heartbeat}}`).
+
+To stop everything, either create the kill-switch file named in the config (`operations.kill_switch_file`; the workers stop, and remove the file before starting again), or run `sudo systemctl stop scanner.target`. A `DRAIN` file in the campaign directory stops between shards. Stopping the target does not disable it; `systemctl disable scanner.target` keeps it from starting at boot. The coordinator unit has `Restart=on-failure`: it comes back after a crash but not after the clean exit of a kill switch or a finished campaign.
+
+`MemoryHigh` and `MemoryMax` sit on the coordinator unit and cover it and all its workers together; the example values suit 16 GiB, so size them from the host's RAM and leave headroom for the kernel, unbound and the limiter. A worker can bound its own growth with `scanner.internet.recycle.Recycler(max_shards, max_rss_mib)`: `after_shard()` after each shard (or `check()` at any time) exits the worker with code 75 once the shard count or the resident memory is over its limit, and the coordinator restarts that worker. The per-worker thresholds are set by the coordinator (to be wired) and must stay below the cgroup limits.
+
+[`run/logrotate/scanner.example`](run/logrotate/scanner.example) rotates the campaign logs (`copytruncate`, so no restart is needed).
+
+Certificates with a zero or negative serial number no longer flood the log with `CryptographyDeprecationWarning`; only that message is filtered, other warnings still appear, and `scanner.certificates.nonpositive_serial_count()` returns how many were parsed.
+
+### Host bootstrap
+
+One command turns a fresh Ubuntu 24.04+ or Debian 13 x86-64 host into a scanner host. Run it from a checkout of this repository, as root, naming the unprivileged user that will run the scan:
+
+    sudo bash run/bootstrap-host.sh <user>
+
+[`run/bootstrap-host.sh`](run/bootstrap-host.sh) is idempotent and can be repeated. `--dry-run` prints what it would change and changes nothing. `--no-upgrade`, `--no-toolchain`, `--no-sysctl`, `--no-unbound`, `--no-systemd` and `--no-logrotate` skip the matching parts. It never reboots the host and never enables or starts the campaign.
+
+| Step | What it changes | How to undo |
+| --- | --- | --- |
+| Upgrade | `apt-get update` and `full-upgrade` keeping existing config files, then installs packages that only phased updates were holding back. Prints whether a reboot is required. | Not reversible; use `--no-upgrade` to skip. |
+| Unattended reboots | `/etc/apt/apt.conf.d/52scanner-no-reboot` sets `Unattended-Upgrade::Automatic-Reboot "false"`. | Delete the file. |
+| Toolchain | Runs `run/setup-wsl.sh`: pinned ZMap, ZGrab2, ZDNS and Go under `/opt`, `/usr/local/bin`, and the venv and `BUILD_INFO` in the user's home. | Remove `/opt/scanner`, `/opt/src`, `/usr/local/bin/zgrab2`, `/usr/local/bin/zdns` and the user's `scanner-venv` and `.scanner`. |
+| Network sysctl | `/etc/sysctl.d/90-scanner.conf`: `ip_local_port_range = 10000 59999`, `tcp_tw_reuse = 1`, `tcp_fin_timeout = 15`. Ports 60000-65535 are left to the local resolver. | Delete the file and run `sysctl --system` or reboot. |
+| Open files | `/etc/security/limits.d/90-scanner.conf` sets the user's soft and hard `nofile` to 65536; every unit also has `LimitNOFILE=65536`. | Delete the file. |
+| Resolver | Installs `unbound` and writes [`run/unbound/scanner.conf`](run/unbound/scanner.conf) to `/etc/unbound/unbound.conf.d/scanner.conf`, with threads and slabs set to the largest power of two that is at most 8 and at most half the cores, the message cache at RAM / 32 (16m to 1g), the rrset cache at twice that (up to 2g) and `outgoing-range` at 5536 divided by the threads, so all threads fit the permitted source ports. Listens on 127.0.0.1:53 only, uses source ports 60000-65535 and runs `unbound-checkconf` before the restart. It stops with a message if another process listens on 0.0.0.0:53, [::]:53 or 127.0.0.1:53; the systemd-resolved stub on 127.0.0.53 and 127.0.0.54 does not conflict. `/etc/resolv.conf` is not changed. | Delete the file, `systemctl restart unbound`, or `systemctl disable --now unbound`. |
+| systemd | Copies the two units and `scanner.target` to `/etc/systemd/system` with `User=` set to the operator (a unit edited locally is kept with a warning, and checksums of installed units are in `/etc/scanner/unit-checksums.sha256`; use `systemctl edit` drop-ins for changes), writes `/etc/scanner/scanner.env` as `root:root` 0600 from `scanner.env.example` (an existing env file is never overwritten), `/etc/tmpfiles.d/scanner.conf` for `/run/scanner`, and creates `/var/lib/scanner/work` and `/var/log/scanner`. Runs `daemon-reload`. | Delete the unit files, `/etc/scanner` and `/etc/tmpfiles.d/scanner.conf`, then `systemctl daemon-reload`. |
+| Log rotation | Installs [`run/logrotate/scanner.example`](run/logrotate/scanner.example) as `/etc/logrotate.d/scanner` with the operator's user and group on the `su` line. | Delete the file. |
+
+The summary at the end lists the toolchain versions, the sysctl values, the resolver status and whether a reboot is needed. Still to do by hand: write `settings.yaml` and `config.yaml`, record the approval, run a small pilot, put the confirmation token from `plan` into `/etc/scanner/scanner.env`, and only then `sudo systemctl enable --now scanner.target`.
+
 ## Choosing how much of the Internet to scan
 
 The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:

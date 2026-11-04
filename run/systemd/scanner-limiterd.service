@@ -1,0 +1,25 @@
+[Unit]
+Description=Scanner limiter daemon
+After=network-online.target
+Wants=network-online.target
+PartOf=scanner.target
+# Allow a restart every two seconds, but give up after ten failures in a minute so a broken
+# configuration shows up as a failed unit instead of a tight loop.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=scanner
+EnvironmentFile=/etc/scanner/scanner.env
+ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet limiterd --socket "$${SCANNER_LIMITER_SOCKET}" --config "$${SCANNER_CONFIG}"'
+# The limiter holds the shared rate state, so it comes back after any exit, a clean one included.
+Restart=always
+RestartSec=2
+# Protect it from the OOM killer. A negative value needs CAP_SYS_RESOURCE in the service manager,
+# which the system manager has; systemd writes it before it drops to User=, so the unit user needs no privilege.
+OOMScoreAdjust=-500
+LimitNOFILE=65536
+
+[Install]
+WantedBy=scanner.target
