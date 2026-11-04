@@ -332,7 +332,7 @@ python -m scanner.ct log-coverage --watched logs.txt --fetch --json
 
 Politeness rules, built in and not switched off by an option:
 
-- crt.sh is a shared public database. At least 1 s passes between two statements (`--min-gap` can only raise it), the User-Agent must carry a contact address, and each statement is capped (`--statement-cap`, default 5000 rows). A window that reaches the cap stops the command with exit code 1 and what was read so far is still written. Failed statements are retried with exponential back-off.
+- crt.sh is a shared public database. At least 1 s passes between two statements (`--min-gap` can only raise it), the User-Agent must carry a contact address, and a run is capped at a number of statements (`--statement-cap`, default 5000). A run that reaches the cap, or a statement that still fails after its retries, stops the command with exit code 1, and what was read so far is still written. Statements that fail on the connection are retried with exponential back-off.
 - Live feeds reconnect with a back-off and give up after a fixed number of attempts. Use `--max-messages` to bound a collection.
 - Each live subcommand prints a notice about this when it starts.
 

@@ -1,5 +1,6 @@
 """The ``python -m scanner.ct`` command line, driven through ``main(argv)`` with fakes; no socket is opened."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,7 @@ from scanner.ct import certstream, crtsh, logcoverage
 from scanner.ct.models import Observation, ObservationTable
 
 NOW = "2026-01-01T00:00:00+00:00"
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def obs(name, source="crtsh", cert_id=None):
@@ -247,14 +249,14 @@ def test_log_coverage_from_file_json(monkeypatch, tmp_path, capsys):
 
     def fake_compare(urls, log_list):
         seen["watched"] = list(urls)
-        return {"covered": ["https://ct.example.com/log1/"], "missing": ["https://ct.example.com/log2/"], "unknown": ["https://ct.example.com/old/"]}
+        return {"covered": ["https://ct.example.com/log1/"], "missing": [{"url": "https://ct.example.com/log2/", "type": "standard"}], "unknown": ["https://ct.example.com/old/"]}
 
     monkeypatch.setattr(logcoverage, "load_log_list", lambda source: LOG_LIST)
     monkeypatch.setattr(logcoverage, "compare", fake_compare)
     assert cli.main(["log-coverage", "--watched", str(watched), "--log-list", str(listing), "--json"]) == 0
     assert seen["watched"] == ["https://ct.example.com/log1/", "https://ct.example.com/old/"]
     captured = capsys.readouterr()
-    assert json.loads(captured.out)["missing"] == ["https://ct.example.com/log2/"]
+    assert json.loads(captured.out)["missing"] == [{"url": "https://ct.example.com/log2/", "type": "standard"}]
     assert "1 covered, 1 missing, 1 unknown" in captured.err
 
 
@@ -289,3 +291,63 @@ def test_usage_errors(capsys):
     assert cli.main([]) == 2
     assert cli.main(["nonsense"]) == 2
     assert cli.main(["--help"]) == 0
+
+
+def test_crtsh_connect_hands_the_user_agent_to_the_connector(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(crtsh, "default_connect", lambda user_agent, *a, **k: calls.append(user_agent) or object())
+    seen = {}
+    monkeypatch.setattr(crtsh, "CrtShWindows", fake_windows([], seen))
+    assert cli.main([*CRTSH_ARGS, "--out", str(tmp_path / "o.jsonl")]) == 0
+    seen["connect"]()
+    assert calls == ["tester (mailto:ops@example.com)"]
+
+
+def test_crtsh_statement_failure_keeps_partial_and_fails(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(crtsh, "CrtShWindows", fake_windows([obs("a.example.com")], raises=crtsh.StatementFailed("x")))
+    out = tmp_path / "o.jsonl"
+    assert cli.main([*CRTSH_ARGS, "--out", str(out)]) == 1
+    assert names_in(out) == ["a.example.com"]
+    assert "statement failed" in capsys.readouterr().err
+
+
+def test_crtsh_with_real_reader_stops_at_the_statement_cap(monkeypatch, tmp_path, capsys):
+    class Conn:
+        def execute(self, sql, params):
+            class Cursor:
+                def fetchall(self):
+                    return []
+            return Cursor()
+
+        def close(self):
+            pass
+
+    opened = []
+    monkeypatch.setattr(crtsh, "default_connect", lambda user_agent, *a, **k: opened.append(user_agent) or Conn())
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    out = tmp_path / "o.jsonl"
+    assert cli.main([*CRTSH_ARGS, "--statement-cap", "3", "--out", str(out)]) == 1
+    assert opened == ["tester (mailto:ops@example.com)"]
+    assert "statement cap" in capsys.readouterr().err
+    assert out.exists()
+
+
+def test_log_coverage_with_real_comparison(tmp_path, capsys):
+    watched = tmp_path / "watched.txt"
+    watched.write_text("https://ct.alpha.example/2026/" + chr(10) + "https://ct.nowhere.example/" + chr(10), encoding="utf-8")
+    assert cli.main(["log-coverage", "--watched", str(watched), "--log-list", str(FIXTURES / "log_list.json")]) == 0
+    out = capsys.readouterr().out
+    assert "covered: 1" in out and "  https://ct.alpha.example/2026/" in out
+    assert "  https://ct.beta.example/log/" in out and "{" not in out
+    assert "unknown: 1" in out
+
+
+def test_offline_end_to_end_import_then_names(tmp_path):
+    table_path, names_path, final = tmp_path / "obs.jsonl", tmp_path / "names.txt", tmp_path / "final.txt"
+    export = FIXTURES / "crtsh_export.json"
+    assert cli.main(["import", "--crtsh-export", str(export), "--out", str(table_path), "--names-out", str(names_path)]) == 0
+    expected = ["alpha.example", "beta.test", "www.alpha.example", "xn--bcher-kva.example"]
+    assert sorted(names_path.read_text(encoding="utf-8").split()) == expected
+    assert cli.main(["names", "--in", str(table_path), "--out", str(final)]) == 0
+    assert sorted(final.read_text(encoding="utf-8").split()) == expected
+    assert names_in(table_path) == expected

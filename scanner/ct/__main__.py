@@ -20,7 +20,7 @@ from pathlib import Path
 
 POLITENESS_CRTSH = (
     "crt.sh is a shared public service: at most one statement per {gap:g} s, a contact in the User-Agent "
-    "is required, at most {cap} rows per statement, with back-off on errors."
+    "is required, at most {cap} statements per run, with back-off on connection errors."
 )
 POLITENESS_STREAM = (
     "live feed: you must pass the feed URL yourself; reconnects back off, "
@@ -103,7 +103,7 @@ def _cmd_crtsh(args) -> int:
     flt = TermFilter.from_file(args.terms, label_boundary=args.label_boundary) if args.terms else None
     _say(POLITENESS_CRTSH.format(gap=args.min_gap, cap=args.statement_cap))
     source = crtsh.CrtShWindows(
-        connect=crtsh.default_connect, user_agent=args.user_agent, min_gap_s=args.min_gap, statement_cap=args.statement_cap
+        connect=lambda: crtsh.default_connect(args.user_agent), user_agent=args.user_agent, min_gap_s=args.min_gap, statement_cap=args.statement_cap
     )
     table = ObservationTable()
     seen = 0
@@ -115,6 +115,8 @@ def _cmd_crtsh(args) -> int:
                 table.add(obs)
     except crtsh.StatementCapReached as exc:
         error = f"statement cap reached, window incomplete: {exc}"
+    except crtsh.StatementFailed as exc:
+        error = f"statement failed, window incomplete: {exc}"
     except KeyboardInterrupt:
         error = "interrupted"
     status = _finish(table, args, extra=f"{seen} read")
@@ -193,7 +195,7 @@ def _cmd_log_coverage(args) -> int:
         for key in ("covered", "missing", "unknown"):
             print(f"{key}: {len(result[key])}")
             for item in result[key]:
-                print(f"  {item}")
+                print(f"  {item['url'] if isinstance(item, dict) else item}")
     _say(
         f"{len(watched)} watched: {len(result['covered'])} covered, "
         f"{len(result['missing'])} missing, {len(result['unknown'])} unknown"
@@ -210,7 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--end", required=True, help="window end, ISO 8601 (UTC if no zone)")
     c.add_argument("--user-agent", required=True, help="identifies you to crt.sh; include a contact address")
     c.add_argument("--min-gap", type=float, default=1.0, help="seconds between statements (minimum and default 1)")
-    c.add_argument("--statement-cap", type=int, default=5000, help="rows one statement may return before the window is split")
+    c.add_argument("--statement-cap", type=int, default=5000, help="statements one run may send before it stops")
     c.add_argument("--terms", type=Path, help="keep only names that match a term in this file")
     c.add_argument("--label-boundary", action="store_true", help="match terms only at label or hyphen boundaries")
     _add_outputs(c)
