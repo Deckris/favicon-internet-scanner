@@ -41,6 +41,41 @@ def job_from_dict(d: dict[str, Any]) -> ToolJob:
     return ToolJob(**{**d, "command": tuple(d.get("command") or ())})
 
 
+def stored_identity(run_dir: Path) -> dict[str, Any] | None:
+    """The run identity recorded in the fact store of ``run_dir``, or None when there is no readable store with one."""
+    src = Path(run_dir) / "work" / "facts.sqlite"
+    if not src.is_file():
+        return None
+    try:
+        db = sqlite3.connect(str(src), timeout=5)
+        try:
+            row = db.execute("SELECT value FROM meta WHERE key = 'identity'").fetchone()
+        finally:
+            db.close()
+        return json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def missing_zmap_ports(run_dir: Path, cfg: Any) -> list[int]:
+    """The configured ports without a finished ZMap sweep unit in the fact store of ``run_dir`` (all of them without a store)."""
+    m = cfg.measurement
+    book = UnitBook(None, run_identity(cfg))
+    wanted = {port: book.unit_id("zmap", port, m.zmap_rate, m.zmap_probes) for port in m.ports}
+    src = Path(run_dir) / "work" / "facts.sqlite"
+    have: set[str] = set()
+    if src.is_file():
+        try:
+            db = sqlite3.connect(str(src), timeout=5)
+            try:
+                have = {r[0] for r in db.execute("SELECT unit FROM units WHERE stage = 'zmap'")}
+            finally:
+                db.close()
+        except sqlite3.Error:
+            have = set()
+    return [port for port, unit in wanted.items() if unit not in have]
+
+
 def adopt_store(source: Path, run_dir: Path, identity: dict[str, Any]) -> str | None:
     """Move the fact store of the unfinished attempt in ``source`` into ``run_dir/work``.
 

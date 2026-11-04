@@ -43,6 +43,7 @@ from scanner.internet import preflight as pre
 from scanner.internet import resume as resume_mod
 from scanner.internet import tls as tlsmod
 from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, sha256_file, shared_config_checksum
+from scanner.internet import runner as runner_mod
 from scanner.internet.runner import ManagedExecutor
 from scanner.internet.shardstore import EndpointFacts, IpFacts, ShardStore
 from scanner.models import ToolJob, canonical_json, write_jsonl
@@ -204,6 +205,10 @@ class _Stages:
         self.phases = contextlib.ExitStack()
         self.network_only = False                # stop after the network stages and keep the fact store (see ``run``)
         self.replay: dict[str, Any] | None = None    # favicon-only finish of a network-only run: its manifest, see ``run_favicon_only``
+        self.stop_after_zmap = False             # end after the ZMap stage and its early PTR lookups (see ``run``)
+        self.from_zmap = False                   # the ZMap sweeps are on file: send none, run the rest (see ``run``)
+        self.continue_in_place = False           # continue the unfinished work of this shard in its own directory
+        self.zmap_meta: dict[str, Any] = {}      # zmap_done, zmap_started_at, zmap_finished_at once the sweeps are on file
 
     def progress(self) -> None:
         """Called whenever a stage gets a result; a run that stops calling it for ``stall_minutes`` is aborted."""
@@ -471,6 +476,10 @@ def run(
     resume_from: Path | None = None,
     network_only: bool = False,
     resume: bool = True,
+    stop_after_zmap: bool = False,
+    from_zmap: bool = False,
+    continue_in_place: bool = False,
+    zmap_lock_fd: int | None = None,
 ) -> Path:
     """``resume_from``: the run directory (or the ``favicon_records.jsonl`` itself) of an earlier unfinished attempt of
     this shard; the favicon lookups it completed are reused instead of being sent again. When that directory also
@@ -479,25 +488,61 @@ def run(
 
     ``network_only`` ends the run where the favicon stage would start: the network stages are written out as usual, the
     fact store ``work/facts.sqlite`` is kept, and the manifest says ``network_done`` instead of ``complete``. The
-    favicon stage is then run by ``run_favicon_only`` (on this host or another one)."""
+    favicon stage is then run by ``run_favicon_only`` (on this host or another one).
+
+    ``stop_after_zmap`` ends the run after the sample and ZMap stages (and the PTR lookups that overlap them): the fact
+    store is kept and the manifest says ``zmap_done``. ``from_zmap`` takes such a run directory and runs everything after
+    ZMap up to the SNI confirmation, like ``network_only``; it never sends ZMap and raises ConfigError when a sweep is
+    not on file. ``continue_in_place`` lets ``run`` work in a directory that already holds this shard's manifest or
+    store of the same run identity, continuing through the finished units of that store (``from_zmap`` implies it).
+    ``zmap_lock_fd`` is an advisory lock the ZMap child inherits, so that it outlives this process."""
     if cfg.approval is None:
         raise ConfigError("run requires an authorized config (approval not loaded)")
+    if stop_after_zmap and from_zmap:
+        raise ConfigError("stop_after_zmap and from_zmap cannot be combined")
+    continue_in_place = continue_in_place or from_zmap
+    if continue_in_place and not resume:
+        raise ConfigError("continue_in_place needs resume")
+    network_only = network_only or from_zmap
     started = datetime.now(UTC)
     wall = time.monotonic()
     policy, splan, exclusions = build_policy(cfg)
     shard_tag = f"-s{cfg.shard:03d}of{cfg.shards:03d}" if cfg.shards > 1 else ""
     run_id = run_id or f"scanner-{cfg.run_label}{shard_tag}-{started.strftime('%Y%m%dT%H%M%SZ')}"
     run_dir = Path(cfg.output_dir) / run_id
-    if (run_dir / "manifest.json").exists():
-        raise ConfigError(f"run directory {run_dir} already holds a run; refusing to mix two runs in one directory")
+    zmap_meta: dict[str, Any] = {}
+    if (run_dir / "manifest.json").exists() or (continue_in_place and (run_dir / "work" / "facts.sqlite").exists()):
+        if not continue_in_place:
+            raise ConfigError(f"run directory {run_dir} already holds a run; refusing to mix two runs in one directory")
+        prior: dict[str, Any] = {}
+        try:
+            prior = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if prior.get("complete"):
+            raise ConfigError(f"run directory {run_dir} holds a finished run")
+        stored = resume_mod.stored_identity(run_dir)
+        if stored is not None and stored != resume_mod.run_identity(cfg):
+            raise ConfigError(f"run directory {run_dir} holds a store of a different run identity")
+        zmap_meta = {k: prior[k] for k in ("zmap_done", "zmap_started_at", "zmap_finished_at") if k in prior}
+    if from_zmap:
+        gone = resume_mod.missing_zmap_ports(run_dir, cfg) if run_dir.is_dir() else list(cfg.measurement.ports)
+        if gone:
+            raise ConfigError(f"zmap results missing for port(s) {', '.join(map(str, gone))} in {run_dir}; ZMap is not sent in this mode")
     for sub in ("raw", "normalized", "report"):
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
     (run_dir / "config.snapshot.json").write_text(json.dumps(cfg.raw, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
     st = _Stages(cfg, run_dir, guards=not offline_preflight)
     st.network_only = network_only
+    st.stop_after_zmap, st.from_zmap, st.continue_in_place = stop_after_zmap, from_zmap, continue_in_place
+    st.zmap_meta = zmap_meta
     executor = executor or ManagedExecutor(cfg, run_dir, st.killed)
+    if from_zmap:
+        executor = _NoZmap(executor)
     st.executor = executor
+    if zmap_lock_fd is not None:
+        runner_mod.hold_fd(zmap_lock_fd)      # the ZMap child inherits it and keeps the singleton lock if this process dies
     restore_signals = _install_signal_handlers(lambda: st.flag_stop("interrupt"))
     release_stacks = _register_stack_dump(run_dir)
     st.start_monitor()
@@ -508,23 +553,41 @@ def run(
             st.phase_gate = phase_gate
             with st.queued():
                 st.phases.enter_context(phase_gate("a"))
-        report = pre.run_preflight(cfg, splan, run_dir=run_dir, executor=executor, offline=offline_preflight)
+        report = pre.run_preflight(cfg, splan, run_dir=run_dir, executor=executor, offline=offline_preflight,
+                                   sends_zmap=not from_zmap)
         (run_dir / "preflight.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
         if not report["ok"] and not skip_preflight:
             raise pre.PreflightFailed(report)
         finished = _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
                                started, wall, run_id, resume_from, fetcher_factory, resume)
     finally:
+        if zmap_lock_fd is not None:
+            runner_mod.drop_fd(zmap_lock_fd)
         st.phases.close()
         st.stop_monitor()
         release_stacks()
         restore_signals()
-    if cfg.compact_outputs:         # after the phase locks are released: the next shard does not wait for it
+    if cfg.compact_outputs and not stop_after_zmap:         # after the phase locks are released: the next shard does not wait for it
         try:
             outputs.compact_run(finished)
         except Exception as exc:    # the plain files stay and the manifest is untouched
             print(f"[scanner] could not compact the outputs of {finished.name}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
     return finished
+
+
+class _NoZmap:
+    """Executor wrapper of a ``from_zmap`` run: ZMap is never started here, only asked for its version."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __call__(self, command: list[str], *args: Any, **kw: Any) -> Any:
+        if Path(command[0]).name.lower().removesuffix(".exe") == "zmap" and "--version" not in command:
+            raise ConfigError("ZMap must not be sent when the sweeps are taken from the fact store")
+        return self._inner(command, *args, **kw)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 def shared_checksum(raw: dict[str, Any]) -> str:
@@ -606,13 +669,14 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     # What the stages learn about each endpoint goes to disk, not into dictionaries: memory then stays flat in the shard size.
     identity = resume_mod.run_identity(cfg)
     taken, refused = False, None
+    in_place = st.continue_in_place and st.replay is None and (run_dir / "work" / "facts.sqlite").is_file()
     if st.replay is None and resume and resume_from is not None and Path(resume_from).is_dir():
         refused = resume_mod.adopt_store(Path(resume_from), run_dir, identity)
         taken = refused is None
     try:
-        store = ShardStore(run_dir / "work" / "facts.sqlite", reset=st.replay is None and not taken)
+        store = ShardStore(run_dir / "work" / "facts.sqlite", reset=st.replay is None and not taken and not in_place)
         if st.replay is None:
-            if taken:
+            if taken or in_place:
                 store.clear_for_resume()
             else:
                 store.set_meta("identity", json.dumps(identity, sort_keys=True))
@@ -622,12 +686,46 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     book = resume_mod.UnitBook(store, identity, enabled=resume and st.replay is None, source=resume_from if taken else None, run_dir=run_dir)
     try:
         return _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                                started, wall, run_id, resume_from, fetcher_factory, book=book, continued=taken, not_reused=refused)
+                                started, wall, run_id, resume_from, fetcher_factory, book=book, continued=taken or in_place, not_reused=refused)
     except Exception as exc:               # whatever escaped the stages: the run still ends with a manifest
         st.errors["run"] = f"{type(exc).__name__}: {exc}"[:500]
         return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
     finally:
         st.guard("store_close", store.close)
+
+
+def _zmap_done(store, cfg, st, splan, run_dir, jobs, counts, ptr_early, ptr_pool, store_problem, started, wall, run_id,
+               zmap_started, gateway_mac) -> Path:
+    """End of a ``stop_after_zmap`` run: the early PTR lookups are finished, the fact store stays, the manifest says what is on file."""
+    try:
+        for future in ptr_early:
+            try:
+                future.result()
+            except Exception as exc:       # its addresses are looked up again by the network worker
+                counts["ptr_early_failed"] = f"{type(exc).__name__}: {exc}"[:300]
+    finally:
+        ptr_pool.shutdown(wait=True, cancel_futures=True)
+    st.check_now()
+    problem = store_problem()
+    if problem:
+        st.errors.setdefault("store", problem)
+    st.guard("store_close", store.close)
+    tool_errors = [j.job_id for j in jobs if j.error]
+    done = not (st.errors or st.skipped or tool_errors or st.reason or st.interrupted or store.dropped_rows)
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "instrument_version": INSTRUMENT_VERSION, "experiment": "scanner",
+        "run_id": run_id, "started_at": started.isoformat(), "finished_at": datetime.now(UTC).isoformat(),
+        "elapsed_seconds": round(time.monotonic() - wall, 3), "stage_seconds": st.timings,
+        "stage_errors": st.errors, "stages_skipped": st.skipped, "abort_reason": st.reason,
+        "status": "zmap_done" if done else "zmap_incomplete", "complete": False, "tool_job_errors": tool_errors,
+        **(({"zmap_done": True, "zmap_started_at": zmap_started.isoformat(), "zmap_finished_at": datetime.now(UTC).isoformat()})
+           if done else {}),
+        "config_checksum": cfg.checksum, "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
+        "shard": {"index": cfg.shard, "of": cfg.shards, "total_targets": splan.total_targets},
+        "stage_counts": counts, "output_schema": outputs.OUTPUT_SCHEMA, "limitations": LIMITATIONS,
+    }
+    (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
+    return run_dir
 
 
 def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Path:
@@ -642,6 +740,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
         "shard": {"index": cfg.shard, "of": cfg.shards}, "stage_counts": counts,
         "output_schema": outputs.OUTPUT_SCHEMA, "limitations": LIMITATIONS,
         **({"network_done": True} if st.replay is not None else {}),     # the favicon stage can be repeated
+        **st.zmap_meta,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
     return run_dir
@@ -688,6 +787,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             "complete": False, "started_at": started.isoformat(), "config_checksum": cfg.checksum,
             "shard": {"index": cfg.shard, "of": cfg.shards},
             "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
+            **st.zmap_meta,
         }, indent=2), encoding="utf-8")
     # A full scan gives ZMap no target count: each shard then covers its whole slice of the allowed space.
     full = cfg.sample_fraction >= 1.0 and not cfg.target_ips
@@ -702,8 +802,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     cfgview = SimpleNamespace(vantage=cfg.vantage, measurement=mview, fetch=cfg.fetch)
 
     # ---- Stage 0: the complete list of sampled targets (ZMap --dryrun prints targets, sends nothing) --
+    zmap_started = datetime.now(UTC)
     sample_ips: list[str] = []
-    if st.replay is not None and (run_dir / "scanned_ips.txt").is_file():
+    if (st.replay is not None or st.from_zmap) and (run_dir / "scanned_ips.txt").is_file():
         sample_ips.extend((run_dir / "scanned_ips.txt").read_text(encoding="utf-8").split())
     send_order: dict[str, int] = {}       # ZMap's send position of each target (the dry run lists them in order)
 
@@ -745,7 +846,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
             st.errors["sample_list"] = f"dry run listed {len(sample_ips)} targets, the plan expects {expected}"
         (run_dir / "scanned_ips.txt").write_text("".join(f"{ip}\n" for ip in sample_ips), encoding="utf-8")
 
-    st.run("sample_list", sample_stage, None)
+    if not st.from_zmap:        # the list of the ZMap stage is on file
+        st.run("sample_list", sample_stage, None)
     counts["sample_listed"] = len(sample_ips)
 
     # ---- Stage 1: ZMap L4 discovery (same seed -> same sample on every port) ----------------
@@ -776,7 +878,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     gate: ovl.OverlapGate | None = None
     tls_ports: queue.Queue[int | None] = queue.Queue()
-    if m.overlap_tls_with_zmap:
+    if m.overlap_tls_with_zmap and not (st.stop_after_zmap or st.from_zmap):    # TLS belongs to the network worker then
         if send_order:
             gate = ovl.OverlapGate(ovl.ZmapProgress(m.zmap_probes), send_order, sweeps_total=len(m.ports),
                                    rate_targets=m.zmap_rate / m.zmap_probes, pace=pace)
@@ -816,6 +918,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                     gate.progress.add_finished_sweep()
                 after_sweep(port, [ip for ip, _ in store.iter_endpoints(port)])
                 continue
+            if st.from_zmap:
+                raise ConfigError(f"zmap results missing for port {port}; ZMap is not sent in this mode")
             # Every port probes the same seeded sample, so a pause between port runs keeps one address's SYNs apart.
             if not gap.wait():
                 st.skipped.append(f"zmap:{port}")
@@ -945,6 +1049,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         except KeyboardInterrupt as exc:      # signals reach the main thread only; the tool is stopped via killed()
             st.interrupted = True
             st.errors.setdefault("tls_direct", f"interrupted: {exc}"[:200])
+    if st.stop_after_zmap:
+        return _zmap_done(store, cfg, st, splan, run_dir, jobs, counts, ptr_early, ptr_pool, store_problem, started, wall,
+                          run_id, zmap_started, gateway_mac)
     by_port = st.guard("store:count_endpoints_by_port", store.count_endpoints_by_port, {})
     counts["l4_per_port"] = {str(p): by_port.get(p, 0) for p in m.ports}
     counts["l4_endpoints"] = st.guard("store:count_endpoints", store.count_endpoints, 0)
@@ -1354,6 +1461,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         "status": "network_done" if keep_store else "finished",
         "complete": not (incomplete or st.reason or st.interrupted or keep_store), "tool_job_errors": tool_errors,
         **({"network_done": True} if keep_store else {}),
+        **st.zmap_meta,
         # "nothing answered" is only a finding when ZMap actually ran cleanly on every port
         "zero_responsive": counts.get("l4_endpoints", 0) == 0 and st.reason is None and not st.errors,
         "config_checksum": cfg.checksum, "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
