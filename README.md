@@ -295,6 +295,58 @@ A shard that finished cleanly has its record files (`normalized/*.jsonl`, `raw/f
 
 To fit a long campaign on a smaller disk, `output.prune_raw_keep_every: N` (default 0, off) deletes the `raw/` directory (the raw tool output, about 260 MB per shard) of every compacted shard whose index is not a multiple of N, so N = 50 keeps `raw/` for shards 0, 50, 100 and so on as a sample. `raw/` is removed only when the manifest says the run is complete without stage errors, every file of its `compaction` block is on disk with the recorded SHA-256 (re-hashed), and `ip_results.csv`, `normalized/endpoints.jsonl`, `hostname_resolution.jsonl`, `tool_jobs.jsonl` and `policy_refusals.jsonl` are present; otherwise the campaign logs why it kept `raw/` and carries on. `python -m scanner.internet prune-raw RUN_DIR` does the same for one run (exit code 2 and `REFUSED` on stderr when it refuses). The manifest is not changed, so its checksum stays valid; `raw_pruned.json` in the run records when `raw/` was removed, how many files and bytes, and the checksums the manifest holds for them. This includes `raw/favicon_records.jsonl.zst`, which `favicon-refetch --source-run` reads, so keep `raw/` of runs you may want to refetch from. The key is part of the config, so adding it to a config that has already started a campaign starts a new campaign (see above); a config without it keeps its checksum.
 
+## Certificate Transparency hostnames (optional)
+
+Reverse DNS and certificate names are what the scanner knows about an address. `python -m scanner.ct` collects further hostnames from public Certificate Transparency data into a local table, and writes a plain names file the scanner can read. It sends nothing to the scanned addresses. It is off by default, and a run without it produces the same output as before.
+
+Install the extra packages once (the live and database sources need them; the offline subcommands do not):
+
+```bash
+pip install -r requirements-ct.txt
+```
+
+Every subcommand writes an observation table (`--out`, JSON Lines) and can also write the distinct names (`--names-out`). A short summary goes to stderr; exit code 0 is success, 1 a runtime error, 2 a usage error.
+
+```bash
+# crt.sh over a time window, one minute at a time; the contact in the User-Agent is required
+python -m scanner.ct crtsh --start 2026-01-01T00:00 --end 2026-01-01T06:00     --user-agent "ct-collector (mailto:ops@example.com)" --terms terms.txt --out obs.jsonl
+
+# live feeds; there is no default URL, pass the feed you chose to use
+python -m scanner.ct certstream  --url wss://certstream.example.com/ --max-messages 10000 --out obs.jsonl
+python -m scanner.ct zonestream  --url wss://zonestream.example.com/ --max-messages 10000 --out obs.jsonl
+
+# a crt.sh export you already have (no network)
+python -m scanner.ct import --crtsh-export export.csv --out obs.jsonl
+
+# keep only observations whose name contains a term (--label-boundary: whole labels or hyphen parts)
+python -m scanner.ct filter --in obs.jsonl --terms terms.txt --out filtered.jsonl
+
+# the names file for the scanner
+python -m scanner.ct names --in filtered.jsonl --out ct_names.txt
+
+# which of the logs you watch are in the published log list (--log-list FILE instead of --fetch works offline)
+python -m scanner.ct log-coverage --watched logs.txt --fetch --json
+```
+
+`terms.txt` has one term per line (for example `example`); with no `--terms` every name is kept. `logs.txt` has one log URL per line.
+
+Politeness rules, built in and not switched off by an option:
+
+- crt.sh is a shared public database. At least 1 s passes between two statements (`--min-gap` can only raise it), the User-Agent must carry a contact address, and each statement is capped (`--statement-cap`, default 5000 rows). A window that reaches the cap stops the command with exit code 1 and what was read so far is still written. Failed statements are retried with exponential back-off.
+- Live feeds reconnect with a back-off and give up after a fixed number of attempts. Use `--max-messages` to bound a collection.
+- Each live subcommand prints a notice about this when it starts.
+
+To use the names, add a `ct_names` section to the config (it is ignored when absent or `enabled: false`):
+
+```yaml
+ct_names:
+  enabled: true
+  names_file: ct_names.txt
+  max_names_per_domain: 20
+```
+
+A CT name is attached to an endpoint only when its registrable domain matches a PTR name or certificate name already found at that address. The scanner never contacts a name just because it appears in the file, and it does not add endpoints.
+
 ## Limits
 
 - Tested offline and on loopback; it has not been run from an institutional scanner host.
