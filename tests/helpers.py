@@ -237,12 +237,36 @@ class FakeFetcher:
 _LOG_LOCK = __import__("threading").Lock()
 
 
+def _log_grants(pacer, log: str) -> bool:
+    """Log each release the pacer makes, with the pacer's own clock reading, instead of the time the caller wakes up.
+
+    The pacer guarantees the gap between releases; a thread that is slow to run after its release (a busy CPU) would
+    log a later time and make a correct gap look short. Returns False when the pacer has no release to follow.
+    """
+    import os
+    import time
+    grant = getattr(pacer, "_grant_locked", None)
+    if grant is None or getattr(pacer, "_now", None) is not time.monotonic:
+        return False
+    if getattr(pacer, "_grants_logged_to", None) == log:
+        return True
+
+    def logged(ip, now):
+        grant(ip, now)
+        with _LOG_LOCK, open(f"{log}.{os.getpid()}", "a", encoding="ascii") as fh:
+            fh.write(f"{ip} {now:.6f}\n")
+    pacer._grant_locked = logged
+    pacer._grants_logged_to = log
+    return True
+
+
 class ProcessFetcher(FakeFetcher):
     """FakeFetcher that waits on the per-process pacer and logs when each address was contacted (one file per process)."""
 
     def __init__(self, pacer, log: str | None, crash_ip: str | None, hang_ip: str | None, delay: float) -> None:
         super().__init__()
         self.pacer, self.log, self.crash_ip, self.hang_ip, self.delay = pacer, log, crash_ip, hang_ip, delay
+        self._logs_grants = bool(log) and _log_grants(pacer, log)
 
     def fetch(self, url: str, *, connect_ip: str | None, kind: str, context: str = ""):
         import os
@@ -253,7 +277,7 @@ class ProcessFetcher(FakeFetcher):
             time.sleep(600)
         if not self.pacer.wait(connect_ip):
             raise RuntimeError("stopped")
-        if self.log:
+        if self.log and not self._logs_grants:
             with _LOG_LOCK, open(f"{self.log}.{os.getpid()}", "a", encoding="ascii") as fh:
                 fh.write(f"{connect_ip} {time.monotonic():.6f}\n")
         try:

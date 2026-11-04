@@ -147,7 +147,8 @@ def test_pause_between_requests_to_one_address_holds_across_processes(tmp_path):
             stamps.setdefault(ip, []).append(float(t))
     assert len(stamps) == 16
     gaps = [b - a for s in stamps.values() for a, b in zip(sorted(s), sorted(s)[1:])]
-    assert gaps and min(gaps) >= interval - 0.03, f"two requests to one address {min(gaps):.3f} s apart"
+    # the times are the pacer's own releases on its monotonic clock, which it keeps at least ``interval`` (less its 1e-6 s rounding) apart
+    assert gaps and min(gaps) >= interval - 1e-5, f"two requests to one address {min(gaps):.6f} s apart"
 
 
 def test_stop_reaches_every_process_quickly():

@@ -152,9 +152,20 @@ def test_manifest_summary_and_checksums(cfg):
 def test_deterministic_outputs_for_same_inputs(cfg):
     a = go(cfg, tools())
     b = pipeline.run(cfg, run_id="t2", executor=tools(), fetcher=FakeFetcher(), skip_preflight=True, offline_preflight=True)
+    ages = []
+
+    def without_ages(rec):
+        """A reused page's age runs from the HTTP stage to the favicon stage, so it follows the clock: it is checked by range."""
+        ages.extend(rec[k] for k in rec if k.endswith("_age_seconds") and rec[k] is not None)
+        return {k: v for k, v in rec.items() if not k.endswith("_age_seconds")}
+
     for name in ("hostname_resolution.jsonl", "endpoints.jsonl"):
-        assert (a / "normalized" / name).read_bytes() == (b / "normalized" / name).read_bytes()
-    assert list(outputs.iter_hostname_rows(a)) == list(outputs.iter_hostname_rows(b))
+        lines = [(d / "normalized" / name).read_text(encoding="utf-8").splitlines() for d in (a, b)]
+        assert len(lines[0]) == len(lines[1])
+        for first, second in zip(*lines):
+            assert json.dumps(without_ages(json.loads(first))) == json.dumps(without_ages(json.loads(second)))
+    assert list(map(without_ages, outputs.iter_hostname_rows(a))) == list(map(without_ages, outputs.iter_hostname_rows(b)))
+    assert ages and all(0 <= age < 60 for age in ages)
 
 
 # ------------------------------------------------------------------ failure isolation
@@ -296,8 +307,12 @@ def overlap_cfg(tmp_path, on=True, **over):
     return load_config(p)
 
 
-def timed(ft, slow_port="8080", seconds=1.5, after=None):
-    """ZMap writes its status file (every target sent) and, on ``slow_port``, keeps sweeping for ``seconds``."""
+def timed(ft, slow_port="8080", seconds=1.5, after=None, until=None):
+    """ZMap writes its status file (every target sent) and, on ``slow_port``, keeps sweeping for ``seconds``.
+
+    With ``until`` the sweep lasts until that check of the events so far holds (``seconds`` is then only the limit), so a
+    test that needs other work to happen during the sweep does not depend on how fast the machine is.
+    """
     import time
     events = []
     orig_zmap, orig_call = ft._zmap, ft.__call__
@@ -311,7 +326,13 @@ def timed(ft, slow_port="8080", seconds=1.5, after=None):
         if port == slow_port:
             if after:
                 after()
-            time.sleep(seconds)
+            if until:
+                deadline = time.monotonic() + seconds
+                while not until(events) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                time.sleep(1.0)        # the results of the finished batches are stored just after the tool returns
+            else:
+                time.sleep(seconds)
         events.append(("zmap_end", port, time.monotonic()))
         return out
     ft._zmap = zmap
@@ -321,7 +342,10 @@ def timed(ft, slow_port="8080", seconds=1.5, after=None):
             if command[0] == "zgrab2":
                 port = command[command.index("--port") + 1] if "--port" in command else None
                 events.append((f"zgrab2-{command[1]}", port, time.monotonic()))
-            return orig_call(command, **kw)
+            result = orig_call(command, **kw)
+            if command[0] == "zgrab2" and command[1] == "tls":
+                events.append(("done-tls", command[command.index("--port") + 1] if "--port" in command else None, time.monotonic()))
+            return result
     return Recorder(), events
 
 
@@ -329,7 +353,7 @@ def test_overlap_runs_tls_during_the_last_sweep_and_keeps_the_same_results(tmp_p
     (tmp_path / "on").mkdir()
     (tmp_path / "off").mkdir()
     ft = tools()
-    rec, events = timed(ft)
+    rec, events = timed(ft, seconds=60.0, until=lambda ev: {"80", "443"} <= {p for e, p, _ in ev if e == "done-tls"})
     on = go(overlap_cfg(tmp_path / "on"), rec)
     sweep_end = next(t for e, p, t in events if e == "zmap_end" and p == "8080")
     early = [p for e, p, t in events if e == "zgrab2-tls" and t < sweep_end]
