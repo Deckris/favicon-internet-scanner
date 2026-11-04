@@ -1,0 +1,19 @@
+[Unit]
+Description=Scanner coordinator
+After=network-online.target scanner-limiterd.service
+Wants=network-online.target
+Requires=scanner-limiterd.service
+PartOf=scanner.target
+
+[Service]
+Type=simple
+User=scanner
+EnvironmentFile=/etc/scanner/scanner.env
+ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet $${SCANNER_COORDINATOR_ARGS}'
+Restart=on-failure
+RestartSec=30
+CPUWeight=200
+LimitNOFILE=65536
+
+[Install]
+WantedBy=scanner.target

@@ -1,0 +1,13 @@
+# Copy to /etc/logrotate.d/scanner and set the paths to SCANNER_LOG_DIR and the campaign directory.
+# copytruncate keeps the log open in the running worker, so no restart or signal is needed.
+/var/log/scanner/*.log /var/lib/scanner/work/campaign-*/*.log {
+    daily
+    rotate 14
+    maxsize 500M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su scanner scanner
+}

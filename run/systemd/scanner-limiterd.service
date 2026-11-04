@@ -1,0 +1,18 @@
+[Unit]
+Description=Scanner limiter daemon
+After=network-online.target
+Wants=network-online.target
+PartOf=scanner.target
+
+[Service]
+Type=simple
+User=scanner
+EnvironmentFile=/etc/scanner/scanner.env
+ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet limiterd --socket "$${SCANNER_LIMITER_SOCKET}"'
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-900
+LimitNOFILE=65536
+
+[Install]
+WantedBy=scanner.target

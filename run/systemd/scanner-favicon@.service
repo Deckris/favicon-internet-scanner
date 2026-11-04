@@ -1,0 +1,25 @@
+[Unit]
+Description=Scanner favicon worker %i
+After=network-online.target scanner-limiterd.service
+Wants=network-online.target
+Requires=scanner-limiterd.service
+PartOf=scanner.target
+
+[Service]
+Type=simple
+User=scanner
+EnvironmentFile=/etc/scanner/scanner.env
+ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet stage-worker --stage favicon --instance %i $${SCANNER_STAGE_ARGS}'
+Restart=on-failure
+# Exit code 75 is a deliberate recycle (scanner.internet.recycle.EXIT_RECYCLE): restart at once.
+RestartForceExitStatus=75
+RestartSec=10
+MemoryHigh=1800M
+MemoryMax=2400M
+MemorySwapMax=0
+CPUWeight=25
+Nice=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=scanner.target

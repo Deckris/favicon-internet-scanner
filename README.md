@@ -118,6 +118,27 @@ A stopped campaign is marked partial. To resume, delete the kill-switch file and
 
 To record CPU per core, per-process and per-thread CPU, memory (including the scope's cgroup counters), network and disk figures for tuning, run [`run/measure.sh`](run/measure.sh) next to the campaign, for example `bash run/measure.sh -o measure -m 'scanner.internet campaign' -u <scope name> -l campaign.log -i 10`. It writes CSV files that are sampled every `-i` seconds until the process exits or `measure/stop` appears, and logs the stage transitions found in the log. With `py-spy` installed, `--pyspy 30` also records a flame graph and a stack dump in the background at the start of each stage.
 
+### Running the campaign as systemd services
+
+[`run/systemd/`](run/systemd) holds templates for a campaign split into long-running processes on one Linux host: the limiter daemon (`scanner-limiterd.service`, always restarted, protected from the OOM killer), the ZMap worker (`scanner-zmap.service`, high CPU weight, `KillMode=control-group` so no sender outlives a stop), the coordinator, one `scanner-stage@.service` instance per stage (`tls`, `http`, `dns`, `sni`; memory-capped and at a low CPU weight) and `scanner-favicon@.service` instances for the favicon workers (niced). `scanner.target` groups them. The subcommand names in `scanner.env.example` (`zmap-worker`, `coordinator`, `stage-worker`) are placeholders: set them to what your build provides.
+
+Install:
+
+1. Create the user the units run as (`User=scanner` in each unit) and the directories named in the env file.
+2. `sudo cp run/systemd/*.service run/systemd/scanner.target /etc/systemd/system/`
+3. `sudo install -D -m 0640 run/systemd/scanner.env.example /etc/scanner/scanner.env`, then replace every placeholder (paths, confirmation token, kill-switch file).
+4. `sudo systemctl daemon-reload && sudo systemctl enable --now scanner.target`
+
+Check with `systemctl status 'scanner-*'` and `python -m scanner.internet status <campaign dir> [--json]`. `status` prints shards per state and per stage, the queue per stage, the last heartbeat of each worker, the ZMap send rate when the state records one, free disk and the RSS of the scanner processes (the last from `/proc`, so only on Linux). It reads `campaign.json` and tolerates a per-shard `stages` mapping (`{stage: {status, attempts, owner_pid, heartbeat}}`).
+
+To stop everything, either create the kill-switch file named in `SCANNER_KILL_SWITCH` (`touch`; the workers stop, and remove the file before starting again), or run `sudo systemctl stop scanner.target`. A `DRAIN` file in the campaign directory stops between shards. Stopping the target does not disable it; `systemctl disable scanner.target` keeps it from starting at boot. A `Restart=on-failure` unit comes back after a crash, so with the kill switch in use the workers should exit 0 for it, otherwise stop the target instead.
+
+A worker can bound its own growth with `scanner.internet.recycle.Recycler(max_shards, max_rss_mib)`: `after_shard()` after each shard (or `check()` at any time) exits the process with code 75 once the shard count or the resident memory is over its limit. The stage template restarts on that code (`RestartForceExitStatus=75`); the env file carries `SCANNER_RECYCLE_SHARDS` and `SCANNER_RECYCLE_RSS_MIB` for the worker to read.
+
+[`run/logrotate/scanner.example`](run/logrotate/scanner.example) rotates the campaign logs (`copytruncate`, so no restart is needed).
+
+Certificates with a zero or negative serial number no longer flood the log with `CryptographyDeprecationWarning`; only that message is filtered, other warnings still appear, and `scanner.certificates.nonpositive_serial_count()` returns how many were parsed.
+
 ## Choosing how much of the Internet to scan
 
 The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:

@@ -1,0 +1,23 @@
+[Unit]
+Description=Scanner ZMap worker
+After=network-online.target scanner-limiterd.service
+Wants=network-online.target
+Requires=scanner-limiterd.service
+PartOf=scanner.target
+
+[Service]
+Type=simple
+User=scanner
+EnvironmentFile=/etc/scanner/scanner.env
+ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet $${SCANNER_ZMAP_ARGS}'
+Restart=on-failure
+RestartSec=30
+# ZMap runs as a child of the worker: stop the whole group so no sender keeps sending.
+KillMode=control-group
+TimeoutStopSec=60
+OOMScoreAdjust=-900
+CPUWeight=800
+LimitNOFILE=65536
+
+[Install]
+WantedBy=scanner.target
