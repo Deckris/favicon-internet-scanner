@@ -198,6 +198,16 @@ All attempts of all stages of a shard use one run directory, `scanner-<label>-<c
 
 **Resume.** Running the same command again reads `campaign.json`. A stage recorded as `running` whose `owner_pid` is gone goes back to `pending` with the same attempt (or to `done` when its manifest already shows it finished), and its next run continues in place. A stage whose owner is still alive is refused. Stages that were `failed` start again with fresh attempts.
 
+#### Pipeline flags of the decoupled stages
+
+The ZMap stage of a shard can run apart from its network stages, so that the one ZMap sweep running on a host never waits for the TLS, HTTP, DNS and favicon work of earlier shards. At the pipeline level this is three flags of `run`, all working in one run directory per shard:
+
+- `stop_after_zmap` runs the sample and ZMap stages and the PTR lookups that overlap them, keeps `work/facts.sqlite` and `scanned_ips.txt`, and writes the manifest with `status` `zmap_done`, `zmap_done: true`, `zmap_started_at` and `zmap_finished_at` (UTC). Overlapped TLS is off in this mode. If a sweep fails or the run is stopped, the status is `zmap_incomplete` and the fact store stays for the next attempt.
+- `from_zmap` takes such a directory and runs everything after ZMap up to the SNI confirmation, then ends like `network_only` (manifest `network_done`). It never sends ZMap: the sweeps come from the fact store, and a missing sweep unit for a configured port is a `ConfigError` (`zmap results missing`) before any traffic. The preflight does not refuse it because another ZMap process is running. The favicon stage is then run by `favicon-stage`.
+- `continue_in_place` allows `run` in a directory that already holds the manifest or fact store of this shard, provided the run identity (configuration checksum, shard, seeds, ports) is the same and the run is not finished. Finished units are reused from the same store and only the missing ones are sent. The pause before an address is contacted again after a lost attempt still applies. `from_zmap` implies it; `stop_after_zmap` together with `from_zmap` is an error.
+
+`zmap_lock_fd` hands the descriptor of an advisory lock to the ZMap child, so that the lock stays held for as long as the sweep runs, even if the parent process is killed.
+
 ## Choosing how much of the Internet to scan
 
 The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:

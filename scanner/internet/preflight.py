@@ -98,7 +98,7 @@ def running_zmap_pids(names: tuple[str, ...] = ("zmap",), proc: Path = Path("/pr
 
 
 def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = subprocess.run, offline: bool = False,
-                  resources: Any = None) -> dict[str, Any]:
+                  resources: Any = None, sends_zmap: bool = True) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     versions: dict[str, str] = {}
 
@@ -134,7 +134,7 @@ def run_preflight(cfg: Any, splan: Any, *, run_dir: Path, executor: Executor = s
                              f"the host has {mem_gib:.1f} GiB", warn=True))
     checks.extend(_kernel_limit_checks(need))
     others = running_zmap_pids(("zmap", Path(cfg.binaries.zmap).name))
-    if others is not None:
+    if others is not None and sends_zmap:      # a worker that never sends ZMap may run beside the one that does
         checks.append(_check("no_other_zmap", not others,
                              "no other zmap process is running" if not others else
                              f"zmap is already running on this host (pid {', '.join(map(str, others[:5]))}): a second sweep would exceed the approved "
