@@ -117,6 +117,10 @@ def run_zmap(
         "-o", str(output_path),
     ]
     command += list(getattr(measurement, "zmap_extra_args", ()))
+    source_ports = getattr(measurement, "zmap_source_ports", None)
+    if source_ports:
+        # Same option and start-end syntax in 2.1.x and 4.4.0.
+        command += [f"--source-port={source_ports}"]
     if gateway_mac:
         command += ["-G", gateway_mac]
     if status_file is not None:

@@ -42,6 +42,7 @@ host:
   interface: {interface}            # network interface that owns source_ip
   egress_check: {egress_check}      # auto | nic (no outside lookup) | url (ask a public-IP service) | off
   gateway_mac: {gateway_mac}        # optional; detected when empty
+  # zmap_source_ports: 1024-9999     # source ports of ZMap's SYNs; keep clear of the kernel's ephemeral range and the resolver's ports
 
 scope:
   exclusions_file: {exclusions_file}   # one CIDR per line: the list from the network owner plus every opt-out
@@ -442,6 +443,8 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
     m.update(ports=[int(p) for p in scope["ports"]], zmap_rate=int(rate), zmap_probes=probes, zmap_max_runtime=runtime,
              min_seconds_between_probes_per_ip=pace, overlap_tls_with_zmap=overlap, zgrab_senders=plan["zgrab_senders"],
              zgrab_parallel_batches=plan["zgrab_parallel_batches"], zgrab_batch_size=plan["zgrab_batch_size"])
+    if host.get("zmap_source_ports"):
+        m["zmap_source_ports"] = host["zmap_source_ports"]      # host-local: not part of the config checksum
     if subnet_cap is not None:
         m["max_connections_per_subnet"] = subnet_cap
     m.update(timing)

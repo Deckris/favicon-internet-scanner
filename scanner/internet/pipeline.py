@@ -1537,6 +1537,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                        "dns_threads": cfg.dns.threads, "dns_timeout": cfg.dns.timeout,
                        "zmap_version": cfg.measurement.zmap_version, "zmap_cli_rate": mview.zmap_rate,
                        "zmap_sender_threads": 1,
+                       **({"zmap_source_ports": cfg.measurement.zmap_source_ports} if cfg.measurement.zmap_source_ports else {}),
                        "dns_network_timeout": cfg.dns.network_timeout, "dns_retries": cfg.dns.retries,
                        "zgrab_senders": cfg.measurement.zgrab_senders, "zgrab_batch_size": cfg.measurement.zgrab_batch_size,
                        "zgrab_parallel_batches": cfg.measurement.zgrab_parallel_batches,
