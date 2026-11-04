@@ -61,3 +61,37 @@ def test_preflight_rejects_binary_that_disagrees_with_version_pin(tmp_path, monk
                                      executor=executor, offline=True)
     check = next(c for c in report["checks"] if c["name"] == "zmap_version_supported")
     assert check["status"] == "fail" and "configured" in check["detail"]
+
+
+def _sweep_commands(tmp_path, version, ports):
+    path = write_config(tmp_path)
+    raw = yaml.safe_load(path.read_text())
+    raw["measurement"].update(zmap_version=version)
+    if ports is not None:
+        raw["measurement"]["zmap_source_ports"] = ports
+    path.write_text(yaml.safe_dump(raw))
+    cfg = load_config(path)
+    ft = tools()
+    pipeline.run(cfg, run_id="srcport", executor=ft, fetcher=FakeFetcher(),
+                 skip_preflight=True, offline_preflight=True)
+    return [c for c in ft.commands if c[0] == "zmap" and "-p" in c and "--dryrun" not in c]
+
+
+@pytest.mark.parametrize("version", ["2.1.1", "4.4.0"])
+def test_source_port_range_reaches_the_zmap_command_only_when_set(tmp_path, version):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    with_range = _sweep_commands(tmp_path / "a", version, "1024-9999")
+    assert with_range and all("--source-port=1024-9999" in c for c in with_range)
+    without = _sweep_commands(tmp_path / "b", version, None)
+    assert without and not any(a.startswith(("--source-port", "-s")) for c in without for a in c)
+
+
+@pytest.mark.parametrize("value", ["9999-1024", "0-100", "1024-70000", "abc", "1-2-3", True, 1.5])
+def test_bad_source_port_range_is_refused(tmp_path, value):
+    path = write_config(tmp_path)
+    raw = yaml.safe_load(path.read_text())
+    raw["measurement"]["zmap_source_ports"] = value
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="zmap_source_ports"):
+        load_config(path)

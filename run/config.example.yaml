@@ -29,6 +29,7 @@ measurement:
   zmap_rate: 100                 # packets/second; conservative start. Must be <= approval max_rate_per_second
   zmap_max_runtime: 3600         # seconds per port; preflight refuses if too short for the sample
   zmap_cooldown: 8
+  # zmap_source_ports: 1024-9999 # host-local, not in the config checksum; ZMap's SYN source ports (--source-port). Unset keeps ZMap's default
   zmap_probes: 1
   min_seconds_between_probes_per_ip: 5   # pause between any two requests to the same address
   zgrab_connect_timeout: 4.0

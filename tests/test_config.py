@@ -253,6 +253,12 @@ def test_checksum_ignores_host_derived_settings(tmp_path):
     assert cfg.raw["favicon"]["workers"] == 64 and cfg.raw["dns"]["threads"] == 77       # the stored config is unchanged
 
 
+def test_checksum_ignores_the_zmap_source_ports(tmp_path):
+    base = _checksum(tmp_path)
+    cfg = load_config(_rewrite(tmp_path, lambda d: d["measurement"].update(zmap_source_ports="1024-9999")))
+    assert cfg.checksum == base and cfg.measurement.zmap_source_ports == "1024-9999"
+
+
 @pytest.mark.parametrize("mutate", [
     lambda d: d["measurement"].update(ports=[80, 443]),
     lambda d: d["sample"].update(seed=5),

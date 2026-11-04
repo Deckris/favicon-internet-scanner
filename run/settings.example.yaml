@@ -12,6 +12,7 @@ host:
   interface: eth0            # network interface that owns source_ip
   egress_check: auto      # auto | nic (no outside lookup) | url (ask a public-IP service) | off
   gateway_mac: ""        # optional; detected when empty
+  # zmap_source_ports: 1024-9999     # source ports of ZMap's SYNs; keep clear of the kernel's ephemeral range and the resolver's ports
 
 scope:
   exclusions_file: exclusions.txt   # one CIDR per line: the list from the network owner plus every opt-out

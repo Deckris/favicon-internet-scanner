@@ -131,9 +131,12 @@ def sha256_file(path: Path) -> str:
 # min_seconds_between_probes_per_ip) and overlap_tls_with_zmap, which
 # changes the traffic pattern, stay in the checksum: raising one needs a new approval. Hosts of one campaign that
 # derive overlap_tls_with_zmap differently set it explicitly in the settings so that it is the same on all of them.
+# measurement.zmap_source_ports, the range ZMap draws its SYN source ports from, depends on the host's sysctl and
+# resolver setup and changes no target or rate.
 # dns.query_resolver_version only asks the resolver to name its software for the manifest; it changes no measurement.
 HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
-    "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "limiter_socket"),
+    "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "limiter_socket",
+                    "zmap_source_ports"),
     "dns": ("threads", "query_resolver_version"),
     "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds", "worker_max_lookups"),
     # The live exclusions overlay: an opt-out must take effect without starting a new campaign.
@@ -162,6 +165,22 @@ def _socket_path(value: Any) -> str | None:
     if not isinstance(value, str):
         raise ConfigError("measurement.limiter_socket must be a path")
     return value
+
+
+def _source_ports(value: Any) -> str | None:
+    """ZMap's ``-s`` range as ``start-end`` (a single port is accepted), or None to keep ZMap's own default."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ConfigError("measurement.zmap_source_ports must be a range such as 1024-9999")
+    text = str(value).strip()
+    parts = text.split("-")
+    if len(parts) > 2 or not all(p.strip().isdigit() for p in parts):
+        raise ConfigError("measurement.zmap_source_ports must be a range such as 1024-9999")
+    start, end = int(parts[0]), int(parts[-1])
+    if not 1 <= start <= end <= 65535:
+        raise ConfigError("measurement.zmap_source_ports must lie within 1-65535 with start not above end")
+    return f"{start}-{end}"
 
 
 def config_checksum(raw: dict[str, Any]) -> str:
@@ -350,7 +369,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     m = _section(raw, "measurement", measurement_keys | {"zmap_version", "min_seconds_between_probes_per_ip", "zgrab_parallel_batches",
                                                          "max_connections_per_subnet", "retry_after_max_hold_seconds",
                                                          "subnet_wait_max_seconds",
-                                                         "overlap_tls_with_zmap", "limiter_socket"}, measurement_keys)
+                                                         "overlap_tls_with_zmap", "limiter_socket", "zmap_source_ports"}, measurement_keys)
     zmap_version = str(m.get("zmap_version", "2.1.1"))
     if not supported(zmap_version):
         raise ConfigError("measurement.zmap_version must be 2.1.x or the pinned 4.4.0")
@@ -389,6 +408,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         overlap_tls_with_zmap=_bool(m.get("overlap_tls_with_zmap", False), "measurement.overlap_tls_with_zmap"),
         # Path of the machine-wide limiter daemon's socket; without it each process limits on its own.
         limiter_socket=_socket_path(m.get("limiter_socket")),
+        # Source ports of ZMap's SYNs; None leaves ZMap's own range (32768-61000 in 4.4.0).
+        zmap_source_ports=_source_ports(m.get("zmap_source_ports")),
         zmap_seed=seed,
         zmap_max_targets=None,   # set from the sample plan at run time
     )

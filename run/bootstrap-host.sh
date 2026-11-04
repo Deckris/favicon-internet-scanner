@@ -151,7 +151,8 @@ step_sysctl() {
 # Written by the scanner host bootstrap.
 # The scanner's outgoing connections use 10000-59999. Ports 60000-65535 are
 # left to the local resolver (unbound outgoing-port-permit), so the two never
-# compete for source ports.
+# compete for source ports. Set zmap_source_ports to 1024-9999 so that ZMap's
+# SYNs use neither range.
 net.ipv4.ip_local_port_range = 10000 59999
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
