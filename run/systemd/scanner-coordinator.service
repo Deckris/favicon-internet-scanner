@@ -20,9 +20,9 @@ KillMode=control-group
 TimeoutStopSec=120
 LimitNOFILE=65536
 CPUWeight=200
-# Memory limits apply to the coordinator and all its workers together. Size them from the host's RAM,
-# leaving room for the kernel, unbound and the limiter: MemoryHigh about 80 % of RAM (reclaim and throttling
-# start there), MemoryMax about 90 %. The values below suit a 16 GiB host.
+# Memory limits apply to the coordinator and all its workers together. run/bootstrap-host.sh sets MemoryHigh
+# (about 78 % of RAM, where reclaim and throttling start) and MemoryMax (about 85 %) from the host's RAM when it
+# installs the unit; the values below suit a 16 GiB host if the unit is copied by hand.
 # The recycling thresholds the coordinator applies to each worker are set in the coordinator's own
 # settings (to be wired); keep their sum for all workers below MemoryHigh.
 MemoryHigh=12G

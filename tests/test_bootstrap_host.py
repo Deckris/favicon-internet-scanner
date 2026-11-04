@@ -72,3 +72,9 @@ def test_bash_syntax_if_available():
     except (FileNotFoundError, OSError):
         return
     assert r.returncode == 0, r.stderr
+
+
+def test_coordinator_memory_limits_are_computed_from_ram():
+    text = SCRIPT.read_text()
+    assert "memory_limits" in text and "* 78 / 100" in text and "* 85 / 100" in text
+    assert "MemoryHigh=" in text and "MemoryMax=" in text

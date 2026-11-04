@@ -14,6 +14,7 @@ import dataclasses
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from scanner.internet import pipeline
 from scanner.internet import preflight as pre
@@ -193,6 +194,26 @@ def _resource_plan(cfg, args) -> dict:
             "fits_open_files": profile.fits_open_files(plan, res.open_files)}
 
 
+def _favicon_overrides(args, cfg):
+    """The favicon sizing flags as runtime overrides of this host's config. They are host-derived keys, outside the checksum."""
+    values = {"workers": args.favicon_workers, "processes": args.favicon_processes,
+              "max_active_requests": args.favicon_max_active_requests}
+    values = {key: value for key, value in values.items() if value is not None}
+    if not values:
+        return cfg
+    merged = {**vars(cfg.favicon), **values}
+    for key, low, high in (("workers", 1, 8192), ("processes", 1, 64), ("max_active_requests", 1, 8192)):
+        if not low <= merged[key] <= high:
+            raise ConfigError(f"favicon.{key} must be between {low} and {high}")
+    for key in ("workers", "max_active_requests"):
+        if merged["processes"] > merged[key]:
+            raise ConfigError(f"favicon.processes ({merged['processes']}) cannot exceed favicon.{key} ({merged[key]}); each process needs at least one")
+    if merged["processes"] > 1 and cfg.favicon.offhost.enabled:
+        raise ConfigError("favicon.processes above 1 is refused when favicon.offhost_icons is enabled")
+    raw = {**cfg.raw, "favicon": {**(cfg.raw.get("favicon") or {}), **values}}
+    return dataclasses.replace(cfg, favicon=SimpleNamespace(**merged), raw=raw)
+
+
 def _favicon_stage(args, cfg) -> int:
     """Run the favicon stage of a network-only shard (this host's copy or the original) and finish the shard."""
     if args.run_dir is None:
@@ -202,6 +223,11 @@ def _favicon_stage(args, cfg) -> int:
     problems = split.verify_export(args.run_dir)
     if problems:
         print("REFUSED: the exported run does not match its checksums: " + "; ".join(problems[:5]), file=sys.stderr)
+        return 2
+    try:
+        cfg = _favicon_overrides(args, cfg)
+    except ConfigError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
     token = pipeline.confirm_token(cfg, pipeline.build_policy(cfg)[1])
     if args.confirm != token:
@@ -369,9 +395,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--zgrab-parallel-batches", type=int, help="init, apply: ZGrab2 processes at once (1-64)")
     ap.add_argument("--zgrab-batch-size", type=int, help="init, apply: addresses per ZGrab2 batch (1-100000)")
     ap.add_argument("--dns-threads", type=int, help="init, apply: zdns threads (1-1000)")
-    ap.add_argument("--favicon-workers", type=int, help="init, apply: favicon worker threads in all (1-8192); campaign --decoupled: favicon stages at once (default 3)")
-    ap.add_argument("--favicon-processes", type=int, help="init, apply: favicon worker processes (1-64)")
-    ap.add_argument("--favicon-max-active-requests", type=int, help="init, apply: favicon requests on the wire at once (1-8192)")
+    ap.add_argument("--favicon-workers", type=int, help="init, apply, favicon-stage: favicon worker threads in all (1-8192); campaign --decoupled: favicon stages at once (default 3)")
+    ap.add_argument("--favicon-processes", type=int, help="init, apply, favicon-stage: favicon worker processes (1-64)")
+    ap.add_argument("--favicon-max-active-requests", type=int, help="init, apply, favicon-stage: favicon requests on the wire at once (1-8192)")
     ap.add_argument("--favicon-stage-max-seconds", type=int, help="init, apply: time limit of the favicon stage (1-86400)")
     ap.add_argument("--overlap-tls-with-zmap", choices=("true", "false", "auto"),
                     help="init, apply: start TLS while ZMap sweeps later ports (auto: on from 4 cores)")

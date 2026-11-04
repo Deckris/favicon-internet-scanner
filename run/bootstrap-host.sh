@@ -243,15 +243,32 @@ $ours"
   log "unbound serves port 53 on loopback only"
 }
 
+# Memory limits of the coordinator unit from the host's RAM: MemoryHigh about 78 %, MemoryMax about 85 % (in MiB).
+# Prints nothing when the RAM cannot be read, so the unit keeps the values it ships with.
+memory_limits() {
+  local kb mib
+  kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || true)"
+  mib=$(( ${kb:-0} / 1024 ))
+  if [ "$mib" -lt 1024 ]; then return 0; fi
+  echo "$(( mib * 78 / 100 ))M $(( mib * 85 / 100 ))M"
+}
+
 # install_unit SRC: render a unit with the operator user and install it. A unit is replaced only while it is
 # still what this script wrote earlier (checksum in $UNIT_SUMS) or already identical; a locally edited unit is
 # kept and a warning points to drop-ins.
 install_unit() {
-  local src="$1" name dest tmp have want stored
+  local src="$1" name dest tmp have want stored limits high max
   name="$(basename "$src")"
   dest="$UNIT_DIR/$name"
   tmp="$(mktemp)"
   sed -E "s/^User=.*/User=$OP_USER/" "$src" > "$tmp"
+  if grep -q '^MemoryMax=' "$tmp"; then
+    limits="$(memory_limits)"
+    if [ -n "$limits" ]; then
+      high="${limits% *}"; max="${limits#* }"
+      sed -E -i -e "s/^MemoryHigh=.*/MemoryHigh=$high/" -e "s/^MemoryMax=.*/MemoryMax=$max/" "$tmp"
+    fi
+  fi
   want="$(sha256sum "$tmp" | cut -d' ' -f1)"
   if [ -f "$dest" ]; then
     have="$(sha256sum "$dest" | cut -d' ' -f1)"

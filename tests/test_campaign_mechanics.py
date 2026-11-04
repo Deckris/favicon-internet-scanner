@@ -149,3 +149,17 @@ def test_tool_timeouts_cover_a_shard_ten_times_larger(tmp_path):
     ex = ManagedExecutor.__new__(ManagedExecutor)
     ex.cfg = big
     assert ex.timeout_for("zdns", ["zdns"], "a\n" * 10) == ex.timeout_for("zdns", ["zdns"], "a\n" * 10**6)   # zdns is chunked at 50,000 names
+
+
+def test_favicon_stage_overrides_apply_outside_the_checksum(tmp_path):
+    from argparse import Namespace
+    from scanner.internet.__main__ import _favicon_overrides
+    from scanner.internet.config import shared_checksum
+    cfg = load_config(_cfg(tmp_path))
+    none = Namespace(favicon_workers=None, favicon_processes=None, favicon_max_active_requests=None)
+    assert _favicon_overrides(none, cfg) is cfg
+    new = _favicon_overrides(Namespace(favicon_workers=64, favicon_processes=4, favicon_max_active_requests=128), cfg)
+    assert (new.favicon.workers, new.favicon.processes, new.favicon.max_active_requests) == (64, 4, 128)
+    assert shared_checksum(new.raw) == shared_checksum(cfg.raw)
+    with pytest.raises(ConfigError):
+        _favicon_overrides(Namespace(favicon_workers=2, favicon_processes=4, favicon_max_active_requests=None), cfg)
