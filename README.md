@@ -118,6 +118,17 @@ A stopped campaign is marked partial. To resume, delete the kill-switch file and
 
 To record CPU per core, per-process and per-thread CPU, memory (including the scope's cgroup counters), network and disk figures for tuning, run [`run/measure.sh`](run/measure.sh) next to the campaign, for example `bash run/measure.sh -o measure -m 'scanner.internet campaign' -u <scope name> -l campaign.log -i 10`. It writes CSV files that are sampled every `-i` seconds until the process exits or `measure/stop` appears, and logs the stage transitions found in the log. With `py-spy` installed, `--pyspy 30` also records a flame graph and a stack dump in the background at the start of each stage.
 
+## Opt-outs during a campaign
+
+The exclusions file is bound into the config checksum and the approval, so adding a range to it starts a new campaign. To stop contacting a range at once without that, use the live overlay: a second file with one CIDR (or single address) per line and `#` comments. Name it in `settings.yaml` as `scope.exclusions_overlay_file`, or in `config.yaml` as `target_policy.exclusions_overlay_file`, or give `--exclusions-overlay FILE` to `plan`, `run` or `favicon-stage`. The path is a host-local setting and is not part of the config checksum, so the campaign and its run ids do not change. Add the same range to the base exclusions file as well, so that the next campaign starts with it.
+
+- The file is checked before every ZMap sweep, every ZGrab2 batch (and every chunk of one) and, at most once a second, before each favicon request, and is read again when its modification time or size changed. Write it elsewhere and rename it into place, so that a reader never sees half a file.
+- A sweep that starts after the change has the range in its ZMap blocklist. A sweep already running keeps the blocklist it started with; answers from a range opted out meanwhile are discarded and no further request is sent to it.
+- An excluded address is dropped before ZGrab2 (direct and with SNI), the favicon fetchers (including redirect targets and the third-party icon fetcher) and the HTTP fetch are given it. DNS queries go to the resolvers, not to the target, and are not filtered; the addresses the answers name are checked before anything is sent to them.
+- A file with a malformed line is rejected as a whole: the last good overlay stays in force and the error is logged. A malformed file at the start of a run stops the run.
+- Each run records what happened. `manifest.json` has `exclusion_overlay` (checksum, entry count, reloads, rejections, addresses dropped by stage), and `normalized/exclusion_overlay.jsonl` lists every load and rejection with its time, the SHA-256 and entry count, and for each batch or sweep its size, the number of addresses dropped and the overlay checksum in force. `normalized/policy_refusals.jsonl` shows each dropped address with reason `excluded_overlay`.
+- Favicon worker processes read the file themselves and enforce it, but their drop counts are not added to the manifest.
+
 ## Choosing how much of the Internet to scan
 
 The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:

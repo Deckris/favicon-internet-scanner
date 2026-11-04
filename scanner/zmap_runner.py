@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from scanner.models import L4Result, ToolJob, stable_id
+from scanner.safety import OVERLAY_REASON
 
 Executor = Callable[..., Any]
 
@@ -39,6 +40,9 @@ def run_zmap(
 
     target_cidrs = policy.target_cidrs()
     exclusion_cidrs = policy.exclusion_cidrs()
+    blocklist_cidrs = policy.blocklist_cidrs() if hasattr(policy, "blocklist_cidrs") else exclusion_cidrs   # re-reads the overlay
+    overlay = getattr(policy, "overlay", None)
+    sweep_overlay = overlay.sha256 if overlay is not None else ""      # the overlay this sweep's blocklist was written from
     vantage = cfg.vantage
     measurement = cfg.measurement
 
@@ -47,7 +51,7 @@ def run_zmap(
     blocklist_path = raw_dir / f"{job_id}-blocklist.txt"
     output_path = raw_dir / f"{job_id}.csv"
     _write_lines(allowlist_path, target_cidrs)
-    _write_lines(blocklist_path, exclusion_cidrs)
+    _write_lines(blocklist_path, blocklist_cidrs)
 
     command = [
         "zmap",
@@ -121,9 +125,11 @@ def run_zmap(
 
     l4_results: list[L4Result] = []
     observed_at = finished_at
+    overlay_dropped = 0
     for ip in found_ips:
         refusal = policy.check_ip(ip, stage="zmap", context=f"zmap:port={port}")
         if refusal is not None:
+            overlay_dropped += refusal.reason == OVERLAY_REASON
             continue
         l4_results.append(L4Result(
             target_ip=ip,
@@ -133,6 +139,10 @@ def run_zmap(
             classification="synack",
             observed_at=observed_at,
         ))
+
+    if overlay is not None:
+        # answers from addresses opted out while the sweep ran (the sweep's blocklist was fixed when it started)
+        overlay.note_batch("zmap", f"sweep:port={port}:blocklist={sweep_overlay[:12]}", len(found_ips), overlay_dropped)
 
     exit_code = getattr(result, "returncode", None)
     error = None

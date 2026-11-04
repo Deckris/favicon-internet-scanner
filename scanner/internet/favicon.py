@@ -34,6 +34,7 @@ from scanner.internet.pacing import DEFAULT_RETRY_AFTER_MAX_HOLD, DEFAULT_SUBNET
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
 from scanner.favicon_discovery import parse_icon_declarations
+from scanner.live_exclusions import overlay_for
 from scanner.models import FaviconDeclaration
 from scanner.safety import HostnamePolicyInput, ProductionPolicyInput, TargetPolicy
 from scanner.web_fetch import FetchLimits, WebFetcher, _is_ip_literal, _RequestOutcome
@@ -83,7 +84,7 @@ def fetch_policy(cfg: Any, sampled_ips: list[str]) -> TargetPolicy:
         population=tuple(f"{ip}/32" for ip in sorted(set(sampled_ips))),
         hostname_policy=HostnamePolicyInput(cfg.hostname_mode, cfg.hostname_suffixes),
         exclusions=tuple(),
-    ))
+    )).attach_overlay(overlay_for(getattr(cfg, "exclusions_overlay_file", None)))
 
 
 class RedirectResolver:
@@ -351,7 +352,7 @@ def offhost_policy(cfg: Any, exclusions: list[str]) -> TargetPolicy:
         population=tuple(population_cidrs()),
         hostname_policy=HostnamePolicyInput(cfg.hostname_mode, cfg.hostname_suffixes),
         exclusions=tuple(exclusions),
-    ))
+    )).attach_overlay(overlay_for(getattr(cfg, "exclusions_overlay_file", None)))
 
 
 def make_fetcher(cfg: Any, policy: TargetPolicy, resolver: Any, allowed_endpoints: set[tuple[str, int]],

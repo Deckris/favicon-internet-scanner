@@ -445,6 +445,8 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
         m["max_connections_per_subnet"] = subnet_cap
     m.update(timing)
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
+    if scope.get("exclusions_overlay_file"):
+        base["target_policy"]["exclusions_overlay_file"] = str(scope["exclusions_overlay_file"])
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     base["dns"]["threads"] = plan["dns_threads"]
     f = base["favicon"]
