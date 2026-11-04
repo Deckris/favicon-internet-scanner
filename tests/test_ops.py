@@ -61,6 +61,27 @@ def test_status_process_rss_from_fake_proc(tmp_path):
     assert [(p["pid"], p["rss_mib"]) for p in procs] == [(7, 200.0), (9, 1.0)]
 
 
+def test_status_masks_confirm_and_matches_argv0(tmp_path):
+    fake_proc(tmp_path / "proc", [
+        (7, "python -m scanner.internet campaign --confirm SECRET123 --config c.yaml", 1024),
+        (8, "vim zmap-notes.txt", 1024), (9, "/usr/sbin/zmap --confirm=TOK", 1024), (10, "grep zmap", 1024)])
+    procs = status.process_rss(tmp_path / "proc")
+    assert [p["pid"] for p in procs] == [7, 9]
+    text = json.dumps(procs)
+    assert "SECRET123" not in text and "TOK" not in text and "--confirm ***" in text
+
+
+def test_status_tolerates_malformed_state(tmp_path):
+    write_state(tmp_path, {"shards": 2, "shard_states": [{"status": "running", "stages": [
+        {"stage": "tls", "status": "running", "owner_pid": 3, "heartbeat": 1_500_000_000_000}, "junk", 5]}, None]})
+    s = status.collect(tmp_path, proc_root=tmp_path / "x", now=1_500_000_100)
+    assert s["shards_by_state"] == {"not_started": 1, "running": 1}
+    (w,) = s["workers"]
+    assert w["age_seconds"] == 100
+    write_state(tmp_path, {"shard_states": "bad"})
+    assert status.collect(tmp_path, proc_root=tmp_path / "x")["shards_by_state"] == {}
+
+
 def test_status_cli(tmp_path, capsys):
     write_state(tmp_path, {"shards": 1, "shard_states": {"0": {"status": "complete"}}})
     assert main(["status", str(tmp_path), "--json"]) == 0
@@ -126,19 +147,44 @@ def test_nonpositive_serial_counted():
     assert certificates.nonpositive_serial_count() == before
 
 
+def test_nonpositive_serial_parses():
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "a.example")])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(1).not_valid_before(now).not_valid_after(now + timedelta(days=1)).sign(key, hashes.SHA256()))
+    der = cert.public_bytes(serialization.Encoding.DER)
+    marker = b"\xa0\x03\x02\x01\x02\x02\x01\x01"
+    assert der.count(marker) == 1
+    for new in (b"\x00", b"\xff"):
+        patched = der.replace(marker, marker[:-1] + new)
+        before = certificates.nonpositive_serial_count()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            warnings.filterwarnings("ignore", message=r"Parsed a serial number which wasn't positive")
+            info = certificates.parse_der(patched, handshake_mode="direct", sni_sent=None, observed_at=now)
+        assert info is not None
+        assert certificates.nonpositive_serial_count() == before + 1
+
+
 def test_unit_templates():
     d = ROOT / "run" / "systemd"
     units = {p.name: p.read_text() for p in d.glob("*.service")}
-    assert {"scanner-limiterd.service", "scanner-zmap.service", "scanner-coordinator.service", "scanner-stage@.service",
-            "scanner-favicon@.service"} <= set(units)
-    assert "Restart=always" in units["scanner-limiterd.service"] and "OOMScoreAdjust=-900" in units["scanner-limiterd.service"]
-    assert "KillMode=control-group" in units["scanner-zmap.service"] and "OOMScoreAdjust=-900" in units["scanner-zmap.service"]
-    assert "MemoryMax=" in units["scanner-stage@.service"] and "RestartForceExitStatus=75" in units["scanner-stage@.service"]
-    assert "Nice=" in units["scanner-favicon@.service"]
+    assert set(units) == {"scanner-limiterd.service", "scanner-coordinator.service"}
+    lim, coord = units["scanner-limiterd.service"], units["scanner-coordinator.service"]
+    assert "Restart=always" in lim and "RestartSec=2" in lim
+    assert "Wants=" in coord and "scanner-limiterd.service" in coord and "Requires=" not in coord
+    assert "--decoupled" in coord and "KillMode=control-group" in coord and "Restart=on-failure" in coord
+    assert "SCANNER_LIMITER_SOCKET" in coord and "MemoryMax=" in coord and "MemoryHigh=" in coord
     env = (d / "scanner.env.example").read_text()
     keys = set(re.findall(r"^([A-Z_]+)=", env, re.M))
     for name, text in units.items():
-        assert "network-online.target" in text and "EnvironmentFile=" in text
-        assert set(re.findall(r"\$\{(\w+)\}", text.replace("$${", "")) ) <= keys
+        assert "network-online.target" in text and "EnvironmentFile=" in text and "LimitNOFILE=65536" in text
         assert set(re.findall(r"\$\$\{(\w+)\}", text)) <= keys, name
     assert (d / "scanner.target").exists() and (ROOT / "run" / "logrotate" / "scanner.example").exists()

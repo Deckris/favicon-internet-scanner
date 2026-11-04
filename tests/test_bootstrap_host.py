@@ -10,7 +10,7 @@ SCRIPT = ROOT / "run" / "bootstrap-host.sh"
 UNBOUND_REQUIRED = {
     "interface": "127.0.0.1", "port": "53", "do-ip6": "no", "num-threads": "8",
     "msg-cache-slabs": "8", "rrset-cache-slabs": "8", "infra-cache-slabs": "8", "key-cache-slabs": "8",
-    "msg-cache-size": "1g", "rrset-cache-size": "2g", "outgoing-range": "8192", "num-queries-per-thread": "4096",
+    "msg-cache-size": "1g", "rrset-cache-size": "2g", "outgoing-range": "692", "num-queries-per-thread": "346",
     "so-reuseport": "yes", "outgoing-port-permit": "60000-65535", "outgoing-port-avoid": "0-59999",
     "qname-minimisation": "yes", "use-syslog": "no", "verbosity": "0", "log-queries": "no",
     "log-replies": "no", "log-servfail": "no",
@@ -43,7 +43,7 @@ def test_script_references_existing_files():
         assert (ROOT / rel).exists(), rel
     assert (ROOT / "run" / "setup-wsl.sh").exists()
     assert (ROOT / "run" / "systemd" / "scanner.env.example").exists()
-    for flag in ("--dry-run", "--no-upgrade", "--no-unbound", "--no-systemd", "--no-sysctl"):
+    for flag in ("--dry-run", "--no-upgrade", "--no-unbound", "--no-systemd", "--no-sysctl", "--no-logrotate"):
         assert flag in text
 
 

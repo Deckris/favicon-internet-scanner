@@ -2,7 +2,7 @@
 
 A worker builds a ``Recycler`` and calls ``after_shard()`` once per finished shard (or ``check()`` at any time). When
 the shard budget is used up or the resident memory is above the limit, the process exits with ``EXIT_RECYCLE`` (75).
-systemd restarts it through ``RestartForceExitStatus=75``; the unit templates in ``run/systemd`` set that.
+the coordinator restarts that worker process when it sees the code.
 """
 from __future__ import annotations
 

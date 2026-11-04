@@ -2,7 +2,8 @@
 
 Reads ``campaign.json`` as written by ``campaign`` (``shard_states``: shard index -> entry). An entry may also carry
 ``stages``: ``{stage: {"status", "attempts", "owner_pid", "heartbeat"}}``; it is optional and so is every field in
-it. ``heartbeat`` is epoch seconds or an ISO 8601 time. The ZMap send rate is shown when the state records one
+it. ``stages`` may also be a list of such entries with a ``stage`` or ``name`` key; anything malformed is skipped.
+``heartbeat`` is epoch seconds (milliseconds when above 1e11) or an ISO 8601 time. The ZMap send rate is shown when the state records one
 (``zmap.send_rate_pps`` or a shard entry's ``send_rate_pps``). Process figures come from ``/proc`` and are left out
 where there is none.
 """
@@ -15,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-PROC_PATTERNS = ("scanner.internet", "zmap", "zgrab2", "zdns")
+PROC_NAMES = ("zmap", "zgrab2", "zdns")
 QUEUED = ("pending", "queued", "ready")
 ACTIVE = ("running", "active", "in_progress", "started")
 
@@ -24,7 +25,8 @@ def _epoch(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        v = float(value)
+        return v / 1000.0 if v > 1e11 else v  # milliseconds
     if isinstance(value, str):
         try:
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -41,8 +43,35 @@ def _read_text(path: Path) -> str | None:
         return None
 
 
-def process_rss(proc_root: Path | str = "/proc", patterns: tuple[str, ...] = PROC_PATTERNS) -> list[dict[str, Any]] | None:
-    """RSS in MiB of the processes whose command line mentions a pattern; None when there is no readable proc."""
+def _mask_confirm(args: list[str]) -> list[str]:
+    out, hide = [], False
+    for a in args:
+        if hide:
+            out.append("***")
+            hide = False
+        elif a == "--confirm":
+            out.append(a)
+            hide = True
+        elif a.startswith("--confirm="):
+            out.append("--confirm=***")
+        else:
+            out.append(a)
+    return out
+
+
+def _is_scanner_process(args: list[str]) -> bool:
+    if not args:
+        return False
+    name = args[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if name in PROC_NAMES:
+        return True
+    return name.startswith("python") and "scanner.internet" in args[1:4]
+
+
+def process_rss(proc_root: Path | str = "/proc") -> list[dict[str, Any]] | None:
+    """RSS in MiB of the scanner processes (zmap, zgrab2, zdns by argv[0]; python -m scanner.internet).
+
+    None when there is no readable proc. The token after ``--confirm`` is masked in the command shown."""
     root = Path(proc_root)
     try:
         entries = [p for p in root.iterdir() if p.name.isdigit()]
@@ -53,9 +82,10 @@ def process_rss(proc_root: Path | str = "/proc", patterns: tuple[str, ...] = PRO
         raw = _read_text(p / "cmdline")
         if not raw:
             continue
-        cmd = raw.replace("\0", " ").strip()
-        if not any(pat in cmd for pat in patterns):
+        args = [a for a in raw.split("\0") if a]
+        if not _is_scanner_process(args):
             continue
+        cmd = " ".join(_mask_confirm(args))
         rss = None
         for line in (_read_text(p / "status") or "").splitlines():
             parts = line.split()
@@ -73,7 +103,11 @@ def collect(campaign_dir: Path | str, *, proc_root: Path | str = "/proc", now: f
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError(f"cannot read {path}: {exc}") from exc
-    shard_states = state.get("shard_states") or {}
+    shard_states = state.get("shard_states")
+    if isinstance(shard_states, list):
+        shard_states = {str(i): e for i, e in enumerate(shard_states)}
+    elif not isinstance(shard_states, dict):
+        shard_states = {}
     total = state.get("shards") if isinstance(state.get("shards"), int) else None
     by_state: dict[str, int] = {}
     by_stage: dict[str, dict[str, int]] = {}
@@ -88,6 +122,9 @@ def collect(campaign_dir: Path | str, *, proc_root: Path | str = "/proc", now: f
         if entry.get("send_rate_pps") is not None:
             send_rate = entry["send_rate_pps"]
         stages = entry.get("stages")
+        if isinstance(stages, list):
+            stages = {str(i.get("stage") or i.get("name")): i for i in stages
+                      if isinstance(i, dict) and (i.get("stage") or i.get("name"))}
         for stage, info in (stages.items() if isinstance(stages, dict) else ()):
             info = info if isinstance(info, dict) else {}
             sst = str(info.get("status", "unknown"))

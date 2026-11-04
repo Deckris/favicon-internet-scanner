@@ -22,12 +22,12 @@ from scanner.models import CertificateInfo
 
 try:
     from cryptography.utils import CryptographyDeprecationWarning as _CryptoWarning
-except ImportError:  # pragma: no cover - very old cryptography
-    _CryptoWarning = DeprecationWarning
+except ImportError:  # pragma: no cover - the class moved or is missing
+    _CryptoWarning = Warning
 
 # Certificates in the wild with a zero or negative serial make cryptography warn on every parse. That input is
 # expected here, so only this message is silenced, other warnings still show, and such certificates are counted.
-warnings.filterwarnings("ignore", message=r".*serial number.*", category=_CryptoWarning)
+warnings.filterwarnings("ignore", message=r"Parsed a serial number which wasn't positive", category=_CryptoWarning)
 _nonpositive_serials = 0
 
 
@@ -180,6 +180,7 @@ def parse_der(
     target_ip: str = "",
     port: int = 0,
 ) -> CertificateInfo:
+    global _nonpositive_serials
     try:
         cert = x509.load_der_x509_certificate(der)
     except Exception as exc:  # cryptography raises various ValueError/TypeError subclasses
@@ -215,7 +216,6 @@ def parse_der(
     except Exception:
         issuer = None
     try:
-        global _nonpositive_serials
         if cert.serial_number <= 0:
             _nonpositive_serials += 1
         serial = format(cert.serial_number, "x")
