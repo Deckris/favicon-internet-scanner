@@ -1,9 +1,11 @@
 """CLI: ``python -m scanner.internet {preflight|plan|run|campaign|favicon-refetch|selftest} --config FILE``
+(``stage-worker`` is started by ``campaign --decoupled``, not by hand)
 and ``python -m scanner.internet export-csv RUN_DIR [--out FILE]``; ``status CAMPAIGN_DIR [--json]`` summarises a campaign.
 
 Exit codes: 0 complete, 2 refused (config, approval, preflight, confirmation, or a prior run of this config),
 3 run error, 4 run finished but found zero responsive endpoints, 5 run ended early or with stage errors
 (outputs are partial and flagged), 6 campaign stopped before a shard for lack of free disk (resume with the same command).
+`stage-worker` also exits 75 ("start me again in a fresh process"), which the coordinator restarts without counting an attempt.
 """
 from __future__ import annotations
 
@@ -270,12 +272,54 @@ def _limiterd(args, ap) -> int:
     return 0
 
 
+def _stage_worker(args, cfg) -> int:
+    """One stage of one shard for the decoupled coordinator. Exit 0 only when the manifest shows the stage finished;
+    ``coordinator.EXIT_RECYCLE`` asks for a fresh process, 2 is a refusal, anything else a failed attempt."""
+    from dataclasses import replace
+    from scanner.internet import coordinator, supervisor
+    if args.stage is None or args.stage_run_dir is None or args.shard is None or not 0 <= args.shard < cfg.shards:
+        print("REFUSED: stage-worker needs --stage, --shard (within the config's shards) and --run-dir", file=sys.stderr)
+        return 2
+    run_dir = Path(args.stage_run_dir)
+    if run_dir.parent.resolve() != Path(cfg.output_dir).resolve():
+        print("REFUSED: --run-dir must be a directory of the configured output", file=sys.stderr)
+        return 2
+    if not supervisor._die_with_parent(args.parent_pid):
+        print("the coordinator is gone; not starting", file=sys.stderr)
+        return coordinator.EXIT_RECYCLE
+    shard_cfg = replace(cfg, shard=args.shard)
+    try:
+        if args.stage == "zmap":
+            pipeline.run(shard_cfg, run_id=run_dir.name, stop_after_zmap=True, continue_in_place=True, zmap_lock_fd=args.zmap_lock_fd)
+        elif args.stage == "network":
+            pipeline.run(shard_cfg, run_id=run_dir.name, from_zmap=True)
+        else:
+            pipeline.run_favicon_only(shard_cfg, run_dir)
+    except (ConfigError, pre.PreflightFailed) as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return coordinator.EXIT_REFUSED
+    except MemoryError:
+        print("out of memory; asking to be restarted", file=sys.stderr)
+        return coordinator.EXIT_RECYCLE
+    except Exception as exc:
+        print(f"RUN ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 3
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")) if (run_dir / "manifest.json").is_file() else {}
+    if not coordinator.stage_done_in(args.stage, manifest):
+        print(f"WARNING: the {args.stage} stage did not finish (abort_reason={manifest.get('abort_reason')}, "
+              f"errors={manifest.get('stage_errors')})", file=sys.stderr)
+        return 5
+    print(f"done: {args.stage} {run_dir}", flush=True)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     from scanner.internet import profile as _profile
     _profile.raise_open_file_limit()
     ap = argparse.ArgumentParser(prog="scanner.internet")
     ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact", "prune-raw",
-                                    "favicon-stage", "export-network", "import-favicons", "export-shard", "limiterd", "status") + SETTINGS_COMMANDS)
+                                    "favicon-stage", "export-network", "import-favicons", "export-shard", "limiterd", "status",
+                                    "stage-worker") + SETTINGS_COMMANDS)
     ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact, prune-raw, export-shard: the finished run; "
                     "favicon-stage, export-network, import-favicons: a network-only run; status: the campaign directory")
     ap.add_argument("dest", nargs="?", type=Path, help="export-network: new directory for the copy; import-favicons: the favicon run "
@@ -325,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--zgrab-parallel-batches", type=int, help="init, apply: ZGrab2 processes at once (1-64)")
     ap.add_argument("--zgrab-batch-size", type=int, help="init, apply: addresses per ZGrab2 batch (1-100000)")
     ap.add_argument("--dns-threads", type=int, help="init, apply: zdns threads (1-1000)")
-    ap.add_argument("--favicon-workers", type=int, help="init, apply: favicon worker threads in all (1-8192)")
+    ap.add_argument("--favicon-workers", type=int, help="init, apply: favicon worker threads in all (1-8192); campaign --decoupled: favicon stages at once (default 3)")
     ap.add_argument("--favicon-processes", type=int, help="init, apply: favicon worker processes (1-64)")
     ap.add_argument("--favicon-max-active-requests", type=int, help="init, apply: favicon requests on the wire at once (1-8192)")
     ap.add_argument("--favicon-stage-max-seconds", type=int, help="init, apply: time limit of the favicon stage (1-86400)")
@@ -368,6 +412,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shards-to", type=int, default=None, metavar="N",
                     help="campaign: end of the shard range, exclusive (default: all shards). "
                          "`--shards-from 0 --shards-to 50` runs shards 0 to 49, `--shards-from 50` the rest")
+
+    # decoupled campaign: ZMap, network and favicon stages of different shards at once
+    ap.add_argument("--decoupled", action="store_true",
+                    help="campaign: one ZMap stage at a time, network and favicon stages of earlier shards alongside it, as worker processes")
+    ap.add_argument("--network-workers", type=_positive_int, default=2, metavar="N",
+                    help="campaign --decoupled: network stages at once (default 2)")
+    ap.add_argument("--stage", choices=("zmap", "network", "favicon"), help="stage-worker: the stage to run (started by the coordinator)")
+    ap.add_argument("--stage-run-dir", "--run-dir", dest="stage_run_dir", type=Path, help="stage-worker: the shard's run directory")
+    ap.add_argument("--zmap-lock-fd", type=int, help="stage-worker: inherited descriptor of zmap.lock, held by ZMap while it sweeps")
+    ap.add_argument("--parent-pid", type=int, help="stage-worker: pid of the coordinator; the worker ends with it")
 
     # network-only shards and the favicon stage on a second machine
     ap.add_argument("--stop-after-network", action="store_true",
@@ -569,7 +623,12 @@ def main(argv: list[str] | None = None) -> int:
         if refusal:
             print(f"REFUSED: {refusal}", file=sys.stderr)
             return 2
+    if args.command == "stage-worker":
+        return _stage_worker(args, cfg)
     if args.command == "campaign":
+        if args.decoupled and (args.pipeline > 1 or args.stop_after_network or args.no_resume):
+            print("REFUSED: --decoupled does not combine with --pipeline, --stop-after-network or --no-resume", file=sys.stderr)
+            return 2
         if cfg.shards < 2 or cfg.target_ips:
             print("REFUSED: campaign needs a random sample split into 2 or more shards (sample.shards)", file=sys.stderr)
             return 2
@@ -583,8 +642,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.archive_to is not None:
                 from scanner.internet.campaign import ArchivePolicy
                 span["archive"] = ArchivePolicy(args.archive_to, args.archive_remove_source, args.archive_when_free_gb_below)
-            result = (run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config, **span) if args.pipeline > 1
-                      else run_campaign(cfg, **span))
+            if args.decoupled:
+                from scanner.internet import coordinator
+                result = coordinator.run_decoupled(cfg, config_path=args.config, confirm=args.confirm, network_workers=args.network_workers,
+                                                   favicon_workers=args.favicon_workers or coordinator.DEFAULT_FAVICON_WORKERS, **span)
+            else:
+                result = (run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config, **span) if args.pipeline > 1
+                          else run_campaign(cfg, **span))
         except (CampaignLocked, ValueError) as exc:
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 2
