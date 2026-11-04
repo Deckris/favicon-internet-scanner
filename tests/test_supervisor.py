@@ -1,4 +1,6 @@
 """Overlapped campaigns (--pipeline 2): phase locks, child processes, stop handling, and identical outputs."""
+import csv
+import io
 import json
 import os
 import shutil
@@ -14,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner.internet import campaign, pipeline, supervisor
+from scanner.internet.outputs import CONTEXT_FIELDS
 from scanner.internet.config import load_config
 from tests.helpers import FakeFetcher
 from tests.test_pipeline import tools
@@ -264,6 +267,19 @@ def child_kwargs():
     return {"executor": tools(), "fetcher": FakeFetcher(), "skip_preflight": True, "offline_preflight": True}
 
 
+def _without_times(path):
+    """The bytes of a table with the measurement-context times blanked: the child processes read the real clock."""
+    raw = path.read_bytes()
+    if path.suffix == ".jsonl":
+        rows = [json.loads(l) for l in raw.decode("utf-8").splitlines()]
+        return [{k: (None if k in CONTEXT_FIELDS or k.endswith("age_seconds") else v) for k, v in r.items()} for r in rows]
+    if path.suffix == ".csv" and path.name == "hostname_resolution.csv":
+        rows = list(csv.reader(io.StringIO(raw.decode("utf-8"), newline="")))
+        mask = {i for i, c in enumerate(rows[0]) if c in CONTEXT_FIELDS} if rows else set()
+        return [[("" if i in mask and n else v) for i, v in enumerate(r)] for n, r in enumerate(rows)]
+    return raw
+
+
 COMPARED = ("normalized/endpoints.jsonl", "normalized/hostname_resolution.jsonl", "normalized/hostname_resolution.csv",
             "normalized/policy_refusals.jsonl", "ip_results.csv", "scanned_ips.txt", "favicons/index.jsonl")
 
@@ -297,7 +313,7 @@ def test_overlapped_campaign_writes_the_same_outputs_as_one_shard_after_another(
         for rel in COMPARED:
             assert (outputs[1][shard] / rel).exists() == (outputs[2][shard] / rel).exists(), (shard, rel)
             if (outputs[1][shard] / rel).exists():
-                assert (outputs[1][shard] / rel).read_bytes() == (outputs[2][shard] / rel).read_bytes(), (shard, rel)
+                assert _without_times(outputs[1][shard] / rel) == _without_times(outputs[2][shard] / rel), (shard, rel)
         one = json.loads((outputs[1][shard] / "report" / "summary.json").read_text())
         two = json.loads((outputs[2][shard] / "report" / "summary.json").read_text())
         assert one["counts"] == two["counts"]
