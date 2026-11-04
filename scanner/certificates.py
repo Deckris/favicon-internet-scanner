@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import warnings
 from datetime import datetime, timezone
 
 from cryptography import x509
@@ -18,6 +19,22 @@ from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, p
 from cryptography.x509.oid import NameOID
 
 from scanner.models import CertificateInfo
+
+try:
+    from cryptography.utils import CryptographyDeprecationWarning as _CryptoWarning
+except ImportError:  # pragma: no cover - very old cryptography
+    _CryptoWarning = DeprecationWarning
+
+# Certificates in the wild with a zero or negative serial make cryptography warn on every parse. That input is
+# expected here, so only this message is silenced, other warnings still show, and such certificates are counted.
+warnings.filterwarnings("ignore", message=r".*serial number.*", category=_CryptoWarning)
+_nonpositive_serials = 0
+
+
+def nonpositive_serial_count() -> int:
+    """Certificates parsed so far whose serial number is zero or negative."""
+    return _nonpositive_serials
+
 
 _MAX_LABEL = 63
 _MAX_NAME = 253
@@ -198,6 +215,9 @@ def parse_der(
     except Exception:
         issuer = None
     try:
+        global _nonpositive_serials
+        if cert.serial_number <= 0:
+            _nonpositive_serials += 1
         serial = format(cert.serial_number, "x")
     except Exception:
         serial = None
