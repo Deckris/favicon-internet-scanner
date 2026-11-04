@@ -1203,6 +1203,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                                                 subnet_cap=cfg.measurement.max_connections_per_subnet,
                                                 retry_after_max_hold=cfg.measurement.retry_after_max_hold_seconds,
                                                 subnet_wait_max=wait_max,
+                                                limiter_socket=getattr(limiter, "path", None),
                                                 on_failure=lambda why, lost: worker_failures.append((why, lost)),
                                                 offhost_service=service, **common)
                 if worker_failures:

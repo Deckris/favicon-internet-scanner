@@ -124,12 +124,13 @@ def sha256_file(path: Path) -> str:
 # Settings that profile.derive sizes from the host's cores, memory and open-file limit, plus the time limit of the favicon
 # stage. They change how fast a run goes, not what it measures. They stay in the stored config and the snapshots; only
 # the checksum leaves them out, so that two hosts with different hardware get the same campaign directory and run ids.
-# Politeness limits (max_connections_per_subnet, retry_after_max_hold_seconds, subnet_wait_max_seconds,
+# measurement.limiter_socket, the path of the machine-wide limiter daemon's socket, is also left out: it names a place
+# on this host and changes no limit. Politeness limits (max_connections_per_subnet, retry_after_max_hold_seconds, subnet_wait_max_seconds,
 # min_seconds_between_probes_per_ip) and overlap_tls_with_zmap, which
 # changes the traffic pattern, stay in the checksum: raising one needs a new approval. Hosts of one campaign that
 # derive overlap_tls_with_zmap differently set it explicitly in the settings so that it is the same on all of them.
 HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
-    "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size"),
+    "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "limiter_socket"),
     "dns": ("threads",),
     "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds"),
 }
@@ -148,6 +149,14 @@ def _without_host_derived(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _digest(data: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _socket_path(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ConfigError("measurement.limiter_socket must be a path")
+    return value
 
 
 def config_checksum(raw: dict[str, Any]) -> str:
@@ -336,7 +345,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     m = _section(raw, "measurement", measurement_keys | {"zmap_version", "min_seconds_between_probes_per_ip", "zgrab_parallel_batches",
                                                          "max_connections_per_subnet", "retry_after_max_hold_seconds",
                                                          "subnet_wait_max_seconds",
-                                                         "overlap_tls_with_zmap"}, measurement_keys)
+                                                         "overlap_tls_with_zmap", "limiter_socket"}, measurement_keys)
     zmap_version = str(m.get("zmap_version", "2.1.1"))
     if not supported(zmap_version):
         raise ConfigError("measurement.zmap_version must be 2.1.x or the pinned 4.4.0")
@@ -373,6 +382,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         # Start direct-IP TLS while ZMap sweeps the remaining ports. Outbound traffic is then the ZMap rate plus
         # the concurrent ZGrab2 connections; the approval rate still caps ZMap alone.
         overlap_tls_with_zmap=_bool(m.get("overlap_tls_with_zmap", False), "measurement.overlap_tls_with_zmap"),
+        # Path of the machine-wide limiter daemon's socket; without it each process limits on its own.
+        limiter_socket=_socket_path(m.get("limiter_socket")),
         zmap_seed=seed,
         zmap_max_targets=None,   # set from the sample plan at run time
     )

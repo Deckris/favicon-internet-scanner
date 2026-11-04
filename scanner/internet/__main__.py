@@ -230,12 +230,51 @@ def _favicon_stage(args, cfg) -> int:
     return 0
 
 
+def _limiterd(args, ap) -> int:
+    """Run the connection limiter daemon until SIGTERM or SIGINT."""
+    import logging
+    from scanner.internet.limiterd import run_daemon
+
+    request_time = None
+    cap, gap, hold, path = args.max_connections_per_subnet, args.min_seconds_between_probes, args.retry_after_max_hold_seconds, args.socket
+    if args.config is not None:
+        try:
+            loaded = load_config(args.config, require_approval=False)
+        except ConfigError as exc:
+            print(f"REFUSED: {exc}", file=sys.stderr)
+            return 2
+        m = loaded.measurement
+        cap = m.max_connections_per_subnet if cap is None else cap
+        gap = m.min_seconds_between_probes_per_ip if gap is None else gap
+        hold = m.retry_after_max_hold_seconds if hold is None else hold
+        path = Path(m.limiter_socket) if path is None and m.limiter_socket else path
+        request_time = loaded.fetch.total_timeout
+    if path is None:
+        ap.error("limiterd needs --socket (or measurement.limiter_socket in --config)")
+    if not hasattr(__import__("socket"), "AF_UNIX"):
+        print("REFUSED: limiterd needs Unix domain sockets", file=sys.stderr)
+        return 2
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    kwargs = {} if hold is None else {"retry_after_max_hold": hold}
+    gap = 5.0 if gap is None else gap
+    start_hold = args.startup_hold_seconds
+    if start_hold is None:
+        start_hold = gap + (30.0 if request_time is None else request_time)
+    try:
+        run_daemon(path, 4 if cap is None else cap, gap, lease_ttl=args.lease_ttl_seconds, bucket=args.bucket_seconds,
+                   grace=args.grace_seconds, startup_hold=start_hold, **kwargs)
+    except RuntimeError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     from scanner.internet import profile as _profile
     _profile.raise_open_file_limit()
     ap = argparse.ArgumentParser(prog="scanner.internet")
     ap.add_argument("command", choices=("preflight", "plan", "run", "campaign", "favicon-refetch", "selftest", "export-csv", "compact", "prune-raw",
-                                    "favicon-stage", "export-network", "import-favicons", "export-shard") + SETTINGS_COMMANDS)
+                                    "favicon-stage", "export-network", "import-favicons", "export-shard", "limiterd") + SETTINGS_COMMANDS)
     ap.add_argument("run_dir", nargs="?", type=Path, help="export-csv, compact, prune-raw, export-shard: the finished run; "
                     "favicon-stage, export-network, import-favicons: a network-only run")
     ap.add_argument("dest", nargs="?", type=Path, help="export-network: new directory for the copy; import-favicons: the favicon run "
@@ -287,9 +326,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--favicon-stage-max-seconds", type=int, help="init, apply: time limit of the favicon stage (1-86400)")
     ap.add_argument("--overlap-tls-with-zmap", choices=("true", "false", "auto"),
                     help="init, apply: start TLS while ZMap sweeps later ports (auto: on from 4 cores)")
-    ap.add_argument("--max-connections-per-subnet", type=int, help="init, apply: connections open at once to one /24 (1-64)")
+    ap.add_argument("--max-connections-per-subnet", type=int,
+                    help="init, apply, limiterd: connections open at once to one /24 (1-64; limiterd default: the config's, else 4)")
     ap.add_argument("--retry-after-max-hold-seconds", type=float,
-                    help="init, apply: longest a network is left alone after a 429/503 with Retry-After (0-900)")
+                    help="init, apply, limiterd: longest a network is left alone after a 429/503 with Retry-After (0-900)")
     ap.add_argument("--subnet-wait-max-seconds", type=float,
                     help="init, apply: longest a request waits for room in its network before it is skipped (1-3600)")
     ap.add_argument("--icon-selection", choices=("first_image", "browser_models"), help="init, apply: which declared icons the favicon stage fetches")
@@ -299,6 +339,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--javascript-page-timeout-seconds", type=float, help="init, apply: time limit per rendered page (1-120)")
     ap.add_argument("--javascript-concurrency", help="init, apply: browsers at once (1-64 or auto)")
     ap.add_argument("--javascript-wait-ms", type=int, help="init, apply: wait after page load for scripts, in ms (0-30000)")
+
+    # machine-wide connection limiter, for processes that run stages side by side
+    ap.add_argument("--socket", type=Path, help="limiterd: Unix socket to listen on (default: measurement.limiter_socket of --config)")
+    ap.add_argument("--min-seconds-between-probes", type=float, metavar="S",
+                    help="limiterd: pause between two requests to one address (default: the config's, else 5)")
+    ap.add_argument("--lease-ttl-seconds", type=float, default=300.0,
+                    help="limiterd: a client silent for this long loses the slots it holds (default 300)")
+    ap.add_argument("--grace-seconds", type=float, default=30.0,
+                    help="limiterd: a client whose connection broke keeps its slots this long so that it can reconnect (default 30)")
+    ap.add_argument("--startup-hold-seconds", type=float,
+                    help="limiterd: refuse every claim for this long after the start, while clients report what they hold "
+                         "(default: the pause plus fetch.total_timeout of --config, else plus 30)")
+    ap.add_argument("--bucket-seconds", type=float, default=1.0,
+                    help="limiterd: width of the time buckets of the per-address ledger (default 1; the pause can run this much longer)")
+    ap.add_argument("--limiter-socket", type=Path,
+                    help="run, campaign, favicon-stage: take the per-network cap and the per-address pause from the limiter daemon "
+                         "at this socket, shared with other processes on this host (also measurement.limiter_socket)")
 
     # campaign: which shards this invocation covers (several hosts can share one campaign definition)
     ap.add_argument("--shards-from", type=int, default=0, metavar="N",
@@ -325,6 +382,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in SETTINGS_COMMANDS:
         return _settings_command(args)
+    if args.command == "limiterd":
+        return _limiterd(args, ap)
+    if args.limiter_socket is not None:       # child processes of a campaign inherit it
+        import os
+        os.environ["SCANNER_LIMITER_SOCKET"] = str(args.limiter_socket)
     if args.command == "export-csv":
         if args.run_dir is None:
             ap.error("export-csv needs RUN_DIR")

@@ -12,6 +12,12 @@ Lock order: a ``ContactLedger`` or ``IpPacer`` lock may be held while taking the
 way round. The limiter lock is a leaf: nothing is called while it is held, and a waiter never sleeps holding a
 lock. The limiter is only ever asked without blocking (``try_acquire``) from inside the ledger or pacer lock,
 so a caller that waits for a slot holds no address and no slot while it waits.
+
+When the stages run as several processes, ``limiter_for`` can return a ``LimiterClient`` instead (see
+``limiterd.py``): the same interface, with the counts, the tickets and the pause between two contacts of an address
+held machine-wide by a daemon. The callers then pass the addresses along (``ips=``) and the client talks to the
+daemon; the ledger and the pacer ask it outside their own locks (marking the addresses as being claimed first), and
+the daemon never calls back, so the lock order is unchanged.
 """
 from __future__ import annotations
 
@@ -125,6 +131,7 @@ class IpPacer:
         self._poll = min(max(float(poll), 0.01), _CHECK)    # longest sleep between looks at the kill switch
         self._next: dict[str, float] = {}       # first unreserved slot per address
         self._last: dict[str, float] = {}       # when each address was actually released last
+        self._claiming: set[str] = set()        # addresses whose slot is being asked for outside the lock
         self._lock = threading.Lock()
         self.limiter = limiter
         self._grants = 0
@@ -133,6 +140,17 @@ class IpPacer:
         """Forget addresses whose pause has passed: an absent address is due at once."""
         self._next = {ip: due for ip, due in self._next.items() if due > now}
         self._last = {ip: at for ip, at in self._last.items() if at + self.min_interval > now}
+
+    def _grant_locked(self, ip: str, now: float) -> None:
+        last = self._last.get(ip, float("-inf"))
+        if last != float("-inf") and now - last < self.min_interval - 1e-6:
+            _violation(f"{ip} contacted again {now - last:.3f} s after its last contact")
+        if self.min_interval > 0:
+            self._last[ip] = now
+            self._next[ip] = max(self._next.get(ip, now), now + self.min_interval)
+            self._grants += 1
+            if self._grants % (1 << 16) == 0:
+                self._prune(now)
 
     def wait(self, ip: str) -> bool:
         """Block until a request to ``ip`` may start. False means do not send (a stop, or a network kept busy too long)."""
@@ -148,6 +166,7 @@ class IpPacer:
         while True:
             if self._killed() or (self._stop is not None and self._stop.is_set()):
                 return WAIT_STOPPED
+            claiming = False
             with self._lock:
                 now = self._now()
                 if slot is None:
@@ -158,24 +177,33 @@ class IpPacer:
                 earliest = max(slot, last + self.min_interval) if self.min_interval > 0 else slot
                 if now < earliest - 1e-9:
                     delay = earliest - now
-                elif counts is not None and not self.limiter.try_acquire(counts):
-                    if blocked_since is None:
-                        blocked_since = now
-                    if self.max_wait is not None and now - blocked_since >= self.max_wait:
-                        return WAIT_BUSY
-                    delay = _LIMIT_POLL
-                    if self.max_wait is not None:
-                        delay = min(delay, max(blocked_since + self.max_wait - now, 0.01))
-                else:
-                    if last != float("-inf") and now - last < self.min_interval - 1e-6:
-                        _violation(f"{ip} contacted again {now - last:.3f} s after its last contact")
-                    if self.min_interval > 0:
-                        self._last[ip] = now
-                        self._next[ip] = max(self._next.get(ip, now), now + self.min_interval)
-                        self._grants += 1
-                        if self._grants % (1 << 16) == 0:
-                            self._prune(now)
+                elif ip in self._claiming:
+                    delay = 0.01            # another thread is asking the limiter for this address
+                elif counts is None:
+                    self._grant_locked(ip, now)
                     return WAIT_OK
+                else:
+                    self._claiming.add(ip)
+                    claiming = True
+            if claiming:
+                # The limiter may be a daemon behind a socket: ask without holding the pacer lock.
+                try:
+                    got = self.limiter.try_acquire(counts, ips=[ip])
+                finally:
+                    with self._lock:
+                        self._claiming.discard(ip)
+                if got:
+                    with self._lock:
+                        self._grant_locked(ip, self._now())
+                    return WAIT_OK
+                now = self._now()
+                if blocked_since is None:
+                    blocked_since = now
+                if self.max_wait is not None and now - blocked_since >= self.max_wait:
+                    return WAIT_BUSY
+                delay = _LIMIT_POLL
+                if self.max_wait is not None:
+                    delay = min(delay, max(blocked_since + self.max_wait - now, 0.01))
             _nap(min(self._poll, delay), self._sleep, self._stop)
 
     def done(self, ip: str, result: Any = None) -> None:
@@ -354,8 +382,11 @@ class SubnetLimiter:
         with self._lock:
             return len(self._active), len(self._states)
 
-    def try_acquire(self, counts: Mapping[str, int], ticket: int | None = None) -> bool:
-        """Take the slots without waiting; False (nothing taken) if any network is full, held or has earlier waiters."""
+    def try_acquire(self, counts: Mapping[str, int], ticket: int | None = None, ips: list[str] | None = None,
+                    exclusive: bool = False) -> bool:
+        """Take the slots without waiting; False (nothing taken) if any network is full, held or has earlier waiters.
+
+        ``ips`` and ``exclusive`` say which addresses the slots are for; only a machine-wide limiter uses them."""
         with self._lock:
             now = self._now()
             fits = not self._behind_locked(ticket, counts)
@@ -378,7 +409,14 @@ class SubnetLimiter:
                     _violation(f"network {key} has {total} connections in flight, above the cap of {self.cap}")
             return True
 
-    def try_acquire_some(self, ips: list[str], ticket: int | None = None) -> list[str]:
+    def adopt(self, counts: Mapping[str, int]) -> None:
+        """Count slots that are already in use (a client re-registering after a restart), whatever the limit says."""
+        with self._lock:
+            for key, n in counts.items():
+                if n > 0:
+                    self._active[key] = self._active.get(key, 0) + n
+
+    def try_acquire_some(self, ips: list[str], ticket: int | None = None, exclusive: bool = False) -> list[str]:
         """Take a slot for each address that fits under its network's current limit and return those addresses,
         in order; the others are left to the caller. Empty (nothing taken) if no address fits."""
         with self._lock:
@@ -418,7 +456,7 @@ class SubnetLimiter:
         finally:
             self.withdraw(ticket)
 
-    def release(self, counts: Mapping[str, int]) -> None:
+    def release(self, counts: Mapping[str, int], ips: Iterable[str] | None = None) -> None:
         with self._lock:
             for key, n in counts.items():
                 left = self._active.get(key, 0) - n
@@ -472,8 +510,15 @@ class SubnetLimiter:
             self.observe(ip, timeout=status in ("connection-timeout", "io-timeout"), http_status=getattr(r, "http_status", None))
 
 
-def limiter_for(measurement: Any) -> SubnetLimiter:
-    """The per-network limiter that the ``measurement`` section of a configuration asks for."""
+def limiter_for(measurement: Any) -> Any:
+    """The per-network limiter that the ``measurement`` section of a configuration asks for: the in-process
+    ``SubnetLimiter``, or a client of the machine-wide daemon when ``limiter_socket`` (or ``SCANNER_LIMITER_SOCKET``) is set."""
+    path = getattr(measurement, "limiter_socket", None) or os.environ.get("SCANNER_LIMITER_SOCKET")
+    if path:
+        from scanner.internet.limiterclient import LimiterClient
+        client = LimiterClient(path, measurement.max_connections_per_subnet, measurement.min_seconds_between_probes_per_ip)
+        client.require()
+        return client
     return SubnetLimiter(measurement.max_connections_per_subnet, max_hold=measurement.retry_after_max_hold_seconds)
 
 
@@ -566,6 +611,16 @@ class ContactLedger:
         but its network stayed full or held for ``max_wait`` seconds: nothing is claimed and no pause clock starts."""
         return self._claim(ips, extra, partial=True)
 
+    def _take_locked(self, got: list[str], now: float, held: bool = False) -> None:
+        """Mark ``got`` in flight; ``held``: they already are, since the claim reserved them."""
+        for ip in got:
+            last = self._last.get(ip)
+            if self.seconds > 0 and last is not None and now - last < self.seconds - 1e-6:
+                _violation(f"{ip} contacted {now - last:.3f} s after its last contact, below the pause of {self.seconds:g} s")
+            if ip in self._busy and not held:
+                _violation(f"{ip} claimed while already in flight")
+        self._busy.update(got)
+
     def _claim(self, ips: list[str], extra: Callable[[float], bool] | None, partial: bool) -> list[str] | None:
         ticket = self.limiter.ticket() if self.limiter is not None else None
         blocked_since: float | None = None      # when the networks first refused a claim that was otherwise ready
@@ -573,31 +628,40 @@ class ContactLedger:
             while True:
                 if self._killed() or (self._stop is not None and self._stop.is_set()):
                     return None
+                ask = leave = False
                 with self._lock:
                     now = self._now()
                     free = not any(ip in self._busy for ip in ips)
                     due = self.seconds <= 0 or max((self._due(ip) for ip in ips), default=float("-inf")) <= now
-                    got: list[str] = []
                     if free and due and (extra is None or extra(now)):
                         if self.limiter is None:
-                            got = list(ips)
-                        elif partial:
-                            got = self.limiter.try_acquire_some(ips, ticket)
-                        elif self.limiter.try_acquire(self.limiter.counts(ips), ticket):
-                            got = list(ips)
-                    elif self.limiter is not None:
-                        self.limiter.withdraw(ticket)
-                    if got:
-                        for ip in got:
-                            last = self._last.get(ip)
-                            if self.seconds > 0 and last is not None and now - last < self.seconds - 1e-6:
-                                _violation(f"{ip} contacted {now - last:.3f} s after its last contact, below the pause of {self.seconds:g} s")
-                            if ip in self._busy:
-                                _violation(f"{ip} claimed while already in flight")
-                        self._busy.update(got)
-                        return got
+                            self._take_locked(ips, now)
+                            return list(ips)
+                        self._busy.update(ips)      # held back from other threads while the limiter is asked below
+                        ask = True
+                    else:
+                        leave = self.limiter is not None
                     wait = max((self._due(ip) for ip in ips), default=now) - now if free and not due else _SLICE
-                    if partial and self.limiter is not None and self.max_wait is not None and free and due:
+                if leave:
+                    self.limiter.withdraw(ticket)
+                if ask:
+                    # The limiter may be a daemon behind a socket: ask without holding the ledger lock.
+                    got: list[str] = []
+                    try:
+                        if partial:
+                            got = self.limiter.try_acquire_some(ips, ticket, exclusive=True)
+                        elif self.limiter.try_acquire(self.limiter.counts(ips), ticket, ips=ips, exclusive=True):
+                            got = list(ips)
+                    finally:
+                        with self._lock:
+                            self._busy.difference_update(set(ips) - set(got))
+                    if got:
+                        with self._lock:
+                            self._take_locked(got, self._now(), held=True)
+                        return got
+                    now = self._now()
+                    wait = _SLICE
+                    if partial and self.max_wait is not None:
                         if blocked_since is None:
                             blocked_since = now
                         if now - blocked_since >= self.max_wait:
@@ -618,7 +682,7 @@ class ContactLedger:
             if self._releases % _PRUNE_EVERY == 0:
                 self._prune(end)
         if self.limiter is not None:
-            self.limiter.release(self.limiter.counts(ips))
+            self.limiter.release(self.limiter.counts(ips), ips=ips)
 
     def _prune(self, now: float) -> None:
         """Forget addresses whose pause has passed: an absent address is due at once."""
