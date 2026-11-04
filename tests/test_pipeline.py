@@ -144,7 +144,7 @@ def test_manifest_summary_and_checksums(cfg):
     assert any(k.startswith("raw/zmap/") for k in m["output_checksums"])
     s = json.loads((run_dir / "report" / "summary.json").read_text())
     assert s["ips_with_verified_hostname"] == 2 and s["tls_failed_but_sni_handshake_ok"] == 1
-    assert m["output_schema"] == 2 and m["compression"] in ("zstd", "none")
+    assert m["output_schema"] == 3 and m["compression"] in ("zstd", "none")
     assert not (run_dir / "normalized" / "hostname_resolution.csv").exists()
     assert outputs.export_csv(run_dir).read_text().startswith("target_ip,port,")
 

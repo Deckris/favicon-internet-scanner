@@ -15,14 +15,14 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from scanner.internet import outputs
 from scanner.internet.runner import capture_stdout, iter_lines
-from scanner.models import ToolJob, stable_id
+from scanner.models import ToolJob, stable_id, utc_iso
 
 Executor = Callable[..., Any]
 
@@ -45,6 +45,7 @@ class ZdnsAnswer:
     error: str | None = None
     resolver: str | None = None
     raw_sha256: str = ""
+    queried_at: str | None = None   # zdns's own time of the lookup, UTC ISO 8601
 
 
 def parse_zdns_line(line: str, module: str) -> ZdnsAnswer | None:
@@ -71,6 +72,7 @@ def parse_zdns_line(line: str, module: str) -> ZdnsAnswer | None:
         return ZdnsAnswer(
             name=name, module=module, status=status, records=tuple(records),
             error=str(error) if error else None, resolver=data.get("resolver"), raw_sha256=sha,
+            queried_at=utc_iso(result.get("timestamp") or obj.get("timestamp")),
         )
     except Exception as exc:  # malformed shape: keep the name, flag the line
         return ZdnsAnswer(name=name, module=module, status="PARSE_ERROR", error=str(exc), raw_sha256=sha)
@@ -168,6 +170,7 @@ class Resolution:
     a: tuple[str, ...] = ()
     aaaa: tuple[str, ...] = ()
     error: str | None = None
+    queried_at: str | None = None     # when the A lookup of the name was made (zdns's own timestamp)
 
 
 def _walk(records: tuple[tuple[str, str, str], ...], start: str, rtype: str, max_cnames: int) -> tuple[str, list[str], list[str]]:
@@ -190,6 +193,11 @@ def _walk(records: tuple[tuple[str, str, str], ...], start: str, rtype: str, max
 
 def resolve(hostname: str, a_ans: ZdnsAnswer | None, aaaa_ans: ZdnsAnswer | None, *, max_cnames: int = 8) -> Resolution:
     """Combine the A and AAAA answers for one hostname into a single verdict."""
+    verdict = _verdict(hostname, a_ans, aaaa_ans, max_cnames)
+    return replace(verdict, queried_at=a_ans.queried_at) if a_ans is not None and a_ans.queried_at else verdict
+
+
+def _verdict(hostname: str, a_ans: ZdnsAnswer | None, aaaa_ans: ZdnsAnswer | None, max_cnames: int) -> Resolution:
     if a_ans is None:
         return Resolution(hostname, "tool_error", error="no A answer")
     status = a_ans.status

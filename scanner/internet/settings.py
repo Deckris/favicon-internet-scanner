@@ -94,6 +94,7 @@ run:
   output_dir: {output_dir}
   kill_switch_file: {kill_switch}   # `scanner stop` creates this file
   # prune_raw_keep_every: 50   # campaign: delete raw/ of each compacted shard except every 50th (0 or absent keeps all; changes the config checksum)
+  # query_resolver_version: true   # ask the resolver for its software version (version.bind, CHAOS TXT) and record it in the manifest; off by default
 """
 
 DEFAULTS: dict[str, Any] = {
@@ -464,6 +465,10 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
         raise SettingsError(f"run.prune_raw_keep_every `{keep_raw}` must be a whole number, 0 or more")
     if keep_raw:
         base["output"]["prune_raw_keep_every"] = keep_raw     # left out when off, so the config checksum is the one it was
+    if run.get("query_resolver_version"):
+        if not isinstance(run["query_resolver_version"], bool):
+            raise SettingsError("run.query_resolver_version must be true or false")
+        base["dns"]["query_resolver_version"] = True
     base["operations"] = {**base.get("operations", {}), "kill_switch_file": str(run["kill_switch_file"])}
 
     operations = ["hostname_resolution", "favicon_fetch"] + (["offhost_icon_fetch"] if offhost else [])

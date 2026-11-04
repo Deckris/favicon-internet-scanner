@@ -20,9 +20,29 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from scanner.internet import outputs
+
+
+# zgrab2 module status strings (zgrab2_schemas/zgrab2/zgrab2.py, pinned tag).
+_ZGRAB_TIMEOUT = frozenset({"connection-timeout", "io-timeout"})
+_ZGRAB_CONNECTION = frozenset({"connection-refused", "connection-closed"})
+
+
+def zgrab_batch_stats(statuses: Iterable[str]) -> dict[str, int]:
+    """Outcome counts of one ZGrab2 batch from its per-target status strings.
+
+    ``timeout`` is a connect or I/O timeout, ``connection_error`` a refused or closed connection, ``other`` every
+    other failure (protocol or application errors, missing or unparseable output).
+    """
+    out = {"targets": 0, "success": 0, "timeout": 0, "connection_error": 0, "other": 0}
+    for status in statuses:
+        out["targets"] += 1
+        key = ("success" if status == "success" else "timeout" if status in _ZGRAB_TIMEOUT
+               else "connection_error" if status in _ZGRAB_CONNECTION else "other")
+        out[key] += 1
+    return out
 
 
 def _die_with_parent() -> None:

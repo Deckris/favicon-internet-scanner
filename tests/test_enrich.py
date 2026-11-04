@@ -47,9 +47,17 @@ def test_identical_content_alone_is_low_confidence_and_never_flags():
 
 def test_synack_csv_parsing_tolerates_missing_and_bad_columns():
     got = parse_synack_csv("\n".join(["1.1.1.1,0,64", "2.2.2.2", "3.3.3.3,abc,x", "1.1.1.1,9,9", ""]))
-    assert got["1.1.1.1"] == {"window": 0, "ttl": 64}                    # first row wins
-    assert got["2.2.2.2"] == {"window": None, "ttl": None}
-    assert got["3.3.3.3"] == {"window": None, "ttl": None}
+    assert got["1.1.1.1"] == {"window": 0, "ttl": 64, "seen_at": None}      # first row wins
+    assert got["2.2.2.2"] == {"window": None, "ttl": None, "seen_at": None}
+    assert got["3.3.3.3"] == {"window": None, "ttl": None, "seen_at": None}
+
+
+def test_synack_csv_keeps_the_response_time_as_utc():
+    got = parse_synack_csv("\n".join(["1.1.1.1,1,64,2026-10-04T17:52:40.123Z", "2.2.2.2,1,64,2026-10-04T19:52:40+02:00",
+                                      "3.3.3.3,1,64,not a time", "4.4.4.4,1,64,"]))
+    assert got["1.1.1.1"]["seen_at"] == "2026-10-04T17:52:40.123000+00:00"
+    assert got["2.2.2.2"]["seen_at"] == "2026-10-04T17:52:40+00:00"
+    assert got["3.3.3.3"]["seen_at"] is None and got["4.4.4.4"]["seen_at"] is None
 
 
 def _tarpit_config(tmp_path):
@@ -76,7 +84,7 @@ def test_pipeline_flags_tarpits_by_window_and_silence_but_not_single_port_hosts(
     assert all(eps[(MIXED, p)]["tarpit_confidence"] == "high" and "zero_window" in eps[(MIXED, p)]["tarpit_signals"] for p in (80, 443, 8080))
     assert eps[(MIXED, 80)]["synack_window"] == 0 and eps[(MIXED, 443)]["synack_window"] == 64240 and eps[(ONE, 80)]["synack_ttl"] == 64
     assert not eps[(ONE, 80)]["tarpit_suspect"]
-    assert any(c[0].endswith("zmap") and "saddr,window,ttl" in c for c in ft.commands if "--dryrun" not in c)
+    assert any(c[0].endswith("zmap") and "saddr,window,ttl,timestamp-str" in c for c in ft.commands if "--dryrun" not in c)
     with (run_dir / "ip_results.csv").open(encoding="utf-8") as fh:
         by_ip = {r["ip"]: r for r in csv.DictReader(fh)}
     assert by_ip[TARPIT]["tarpit_suspect"] == "yes" and "3/3" in by_ip[TARPIT]["tarpit_reason"]

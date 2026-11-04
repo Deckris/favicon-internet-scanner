@@ -8,6 +8,7 @@
   "compression": "zstd",
   "config_checksum": "<config>",
   "elapsed_seconds": "<time>",
+  "epoch_id": "<config>",
   "exclusion_count": 1,
   "exclusions_sha256": "84845936e9dc2e69bad8b13a2a1f994d4790f5566648ad16318469b659f3f165",
   "experiment": "scanner",
@@ -26,8 +27,8 @@
   ],
   "output_checksums": {
     "ip_results.csv": "f66e90d276dba73f782520622c3dabb8907891a7fa6394629b06c913b9239575",
-    "normalized/endpoints.jsonl": "50a41d4b67a7f7f8393bf557d84311e7d23f5bd2dd9495cc8c5482943804f399",
-    "normalized/hostname_resolution.jsonl": "eeb0a10c84be1ef71cd59826ef8e4e0d6af48047936463450a749547c86a3c68",
+    "normalized/endpoints.jsonl": "9b7c7d9eb5d5aabf5fee891b4e682887bff0dc339b7805cf0c424c2a4548e183",
+    "normalized/hostname_resolution.jsonl": "2791b7043f0f747991a10d81d429bcbc661bb9720e896978cd88f21d53ea8ba7",
     "normalized/policy_refusals.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "normalized/tarpit_rejections.jsonl": "567a57ac994bd19fc80fefb9f009911a26cdda9f650b38caf720e890fea30a3f",
     "raw/zdns/ZDNS-dd2f0c13a4b08dce.jsonl.zst": "b16428c43f6771f571eb9d27dffdef808f59057899569c992c96876bf33d65fe",
@@ -39,18 +40,18 @@
     "raw/zgrab/ZGRABTLS-d838ef7ebacd5184.jsonl.zst": "187ae8bd21127174a82cb873b59bc8b1a1845bda177ea347dd6362be891c3a83",
     "raw/zmap/ZMAP-1e5849e157781cd0-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
     "raw/zmap/ZMAP-1e5849e157781cd0-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
-    "raw/zmap/ZMAP-1e5849e157781cd0.csv": "3125e75742595e9fdfe6ef9d00e88064a32c82efbd7f9e272b0c23d5b471ff47",
+    "raw/zmap/ZMAP-1e5849e157781cd0.csv": "b547dea94f5bebb7efc25cca3a3d68381bdb9d35ec686dc20d592e98e9f299e8",
     "raw/zmap/ZMAP-33c994c137fd01d8-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
     "raw/zmap/ZMAP-33c994c137fd01d8-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
-    "raw/zmap/ZMAP-33c994c137fd01d8.csv": "3125e75742595e9fdfe6ef9d00e88064a32c82efbd7f9e272b0c23d5b471ff47",
+    "raw/zmap/ZMAP-33c994c137fd01d8.csv": "b547dea94f5bebb7efc25cca3a3d68381bdb9d35ec686dc20d592e98e9f299e8",
     "raw/zmap/ZMAP-c033b5e44ecbda0c-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
     "raw/zmap/ZMAP-c033b5e44ecbda0c-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
-    "raw/zmap/ZMAP-c033b5e44ecbda0c.csv": "18d517a12325d7ce2886a0de4e34009bf5114b887ad39d59a5089b48491388dd",
+    "raw/zmap/ZMAP-c033b5e44ecbda0c.csv": "73cad5fa52230f5fc659962a71168bde0485119689e308f8e963e5c89b1f32f6",
     "raw/zmap/sample-allowlist.txt": "2474c035fab384213a83fb18f84e23093c93aa60b9a214ee02f05789c8003bf9",
     "raw/zmap/sample-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
     "scanned_ips.txt": "986f7b37a75a3a4e95680d7621dd8d43267d7904642ed6ab324b7c8042aeb76f"
   },
-  "output_schema": 2,
+  "output_schema": 3,
   "parameters": {
     "dns_network_timeout": 5.0,
     "dns_resolvers": [
@@ -113,6 +114,14 @@
     "zmap_sender_threads": 1,
     "zmap_version": "2.1.1"
   },
+  "resolvers": [
+    {
+      "address": "9.9.9.9:53"
+    },
+    {
+      "address": "1.1.1.1"
+    }
+  ],
   "run_id": "t1",
   "sample": {
     "allowed_addresses": 3702258176,

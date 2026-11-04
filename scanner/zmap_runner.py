@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,6 +23,42 @@ Executor = Callable[..., Any]
 
 def _write_lines(path: Path, lines: list[str]) -> None:
     path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
+
+
+# Columns of ZMap's once-a-second status file (-u) that make up the per-sweep counts.
+_STATUS_COLUMNS = {"sent": "sent-total", "received": "recv-total", "received_success": "recv-success-total",
+                   "dropped": "pcap-drop-total", "send_failed": "sendto-fail-total"}
+_SUMMARY_FIELDS = {"sent": re.compile(r"\bsend: (\d+)"), "received": re.compile(r"\brecv: (\d+)"),
+                   "dropped": re.compile(r"\bdrops: (\d+)")}
+
+
+def sweep_stats(status_file: Path | None, stderr: str | None) -> dict[str, int] | None:
+    """Packets sent, responses received and packets dropped by one sweep, or None when ZMap reported none.
+
+    The last row of the status file wins; without one the final status line on stderr is read.
+    """
+    if status_file is not None and Path(status_file).is_file():
+        try:
+            rows = [r for r in csv.reader(Path(status_file).read_text(encoding="utf-8", errors="replace").splitlines()) if r]
+        except csv.Error:
+            rows = []
+        if len(rows) >= 2:
+            header, last = rows[0], rows[-1]
+            out: dict[str, int] = {}
+            for key, column in _STATUS_COLUMNS.items():
+                if column in header and header.index(column) < len(last):
+                    try:
+                        out[key] = int(last[header.index(column)])
+                    except ValueError:
+                        pass
+            if out:
+                return out
+    lines = [ln for ln in (stderr or "").splitlines() if "send:" in ln]
+    if lines:
+        out = {key: int(m.group(1)) for key, rx in _SUMMARY_FIELDS.items() if (m := rx.search(lines[-1]))}
+        if out:
+            return out
+    return None
 
 
 def run_zmap(
@@ -152,8 +189,9 @@ def run_zmap(
         started_at=started_at,
         finished_at=finished_at,
         error=error,
+        stats=sweep_stats(status_file, getattr(result, "stderr", None)),
     )
     return job, l4_results
 
 
-__all__ = ["run_zmap"]
+__all__ = ["run_zmap", "sweep_stats"]

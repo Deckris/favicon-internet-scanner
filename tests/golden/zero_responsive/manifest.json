@@ -8,6 +8,7 @@
   "compression": "zstd",
   "config_checksum": "<config>",
   "elapsed_seconds": "<time>",
+  "epoch_id": "<config>",
   "exclusion_count": 1,
   "exclusions_sha256": "84845936e9dc2e69bad8b13a2a1f994d4790f5566648ad16318469b659f3f165",
   "experiment": "scanner",
@@ -42,7 +43,7 @@
     "raw/zmap/sample-blocklist.txt": "db5460ec36f0de231b591bee771dfae49179c2413e96e28eb4d12195c78f711c",
     "scanned_ips.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "output_schema": 2,
+  "output_schema": 3,
   "parameters": {
     "dns_network_timeout": 5.0,
     "dns_resolvers": [
@@ -105,6 +106,14 @@
     "zmap_sender_threads": 1,
     "zmap_version": "2.1.1"
   },
+  "resolvers": [
+    {
+      "address": "9.9.9.9:53"
+    },
+    {
+      "address": "1.1.1.1"
+    }
+  ],
   "run_id": "t1",
   "sample": {
     "allowed_addresses": 3702258176,

@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from scanner.internet import outputs
-from scanner.internet.runner import capture_stdout, iter_lines
-from scanner.models import CertificateInfo, ToolJob, ZGrabResult, stable_id
+from scanner.internet.runner import capture_stdout, iter_lines, zgrab_batch_stats
+from scanner.models import CertificateInfo, ToolJob, ZGrabResult, stable_id, utc_iso
 
 # Go network errors name the local ephemeral port ("tcp 192.0.2.10:59130->");
 # it changes on every run and carries no measurement meaning.
@@ -158,6 +158,7 @@ def _parse_line(
             certificate=certificate,
             error=zgrab_error,
             raw_line_sha256=raw_sha,
+            requested_at=utc_iso(top.get("timestamp")),
         )
     except Exception as exc:
         return ZGrabResult(
@@ -279,6 +280,7 @@ def run_zgrab_batches(
                 started_at=started_at,
                 finished_at=finished_at,
                 error=error,
+                stats=zgrab_batch_stats(r.status for r in chunk_results),
             ))
             results.extend(chunk_results)
 

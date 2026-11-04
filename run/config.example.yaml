@@ -65,6 +65,7 @@ dns:
   threads: 50
   max_cnames: 8
   canary_name: example.com
+  # query_resolver_version: false   # true: ask each resolver for its software version (version.bind, CHAOS TXT) for the manifest
 
 hostnames:
   max_candidates_per_ip: 20
