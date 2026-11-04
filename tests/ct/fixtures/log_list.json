@@ -1,0 +1,24 @@
+{
+  "version": "1.0",
+  "log_list_timestamp": "2026-01-01T00:00:00Z",
+  "operators": [
+    {
+      "name": "Example Operator One",
+      "logs": [
+        {"description": "alpha", "log_id": "AAAA", "url": "https://ct.alpha.example/2026/", "state": {"usable": {"timestamp": "2025-01-01T00:00:00Z"}}},
+        {"description": "beta", "log_id": "BBBB", "url": "https://ct.beta.example/log/", "state": {"qualified": {"timestamp": "2025-01-01T00:00:00Z"}}},
+        {"description": "old", "log_id": "CCCC", "url": "https://ct.old.example/", "state": {"retired": {"timestamp": "2024-01-01T00:00:00Z"}}}
+      ],
+      "tiled_logs": [
+        {"description": "tile", "log_id": "DDDD", "submission_url": "https://submit.tile.example/", "monitoring_url": "https://mon.tile.example/", "state": {"usable": {"timestamp": "2025-06-01T00:00:00Z"}}}
+      ]
+    },
+    {
+      "name": "Example Operator Two",
+      "logs": [
+        {"description": "gamma", "log_id": "EEEE", "url": "https://ct.gamma.example/", "state": {"pending": {"timestamp": "2026-01-01T00:00:00Z"}}},
+        {"description": "delta", "log_id": "FFFF", "url": "https://ct.delta.example/", "state": {"usable": {"timestamp": "2025-01-01T00:00:00Z"}}}
+      ]
+    }
+  ]
+}
