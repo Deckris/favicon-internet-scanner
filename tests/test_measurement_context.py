@@ -78,7 +78,7 @@ def test_a_missing_timestamp_stays_missing(tmp_path):
 
 def test_zmap_asks_for_its_own_receive_time():
     assert response_fields("2.1.1").split(",") == ["saddr", "window", "ttl", "timestamp-str"]
-    assert response_fields("4.4.0") == response_fields("2.1.1")
+    assert response_fields("4.4.0").split(",")[:3] == response_fields("2.1.1").split(",")[:3]
     with pytest.raises(ValueError):
         response_fields("3.0.0")
 
@@ -266,3 +266,8 @@ def test_a_store_written_before_the_column_existed_is_upgraded(tmp_path):
 def test_l4_time_survives_the_store_round_trip(tmp_path):
     run_dir, _ = _run(tmp_path)
     assert {r["l4_seen_at"] for r in outputs.iter_endpoint_rows(run_dir)} == {"2026-10-04T17:52:40.123000+00:00"}
+
+
+def test_zmap_440_names_the_receive_time_with_an_underscore():
+    # `zmap --list-output-fields` of 4.4.0 lists timestamp_str; the hyphenated name is refused there.
+    assert response_fields("4.4.0").split(",") == ["saddr", "window", "ttl", "timestamp_str"]

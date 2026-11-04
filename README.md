@@ -183,7 +183,7 @@ Every row says when each of its measurements was made, so that the age of the da
 
 | Field | Row | Taken from |
 |---|---|---|
-| `l4_seen_at` | endpoint | ZMap's `timestamp-str` output field: when the SYN-ACK arrived |
+| `l4_seen_at` | endpoint | ZMap's receive-time output field (`timestamp_str` in 4.4.0, `timestamp-str` in 2.1.x): when the SYN-ACK arrived |
 | `tls_at` | endpoint | ZGrab2's own timestamp of the direct-IP handshake (the time the target was started, not the end of the batch) |
 | `http_at` | endpoint | ZGrab2's timestamp of the plain HTTP request; null when TLS answered and no HTTP request was made |
 | `dns_at` | hostname | ZDNS's timestamp of the forward (A) lookup of the name |

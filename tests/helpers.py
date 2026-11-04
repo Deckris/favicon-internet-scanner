@@ -142,7 +142,7 @@ class FakeTools:
         port = int(c[c.index("-p") + 1])
         out = Path(c[c.index("-o") + 1])
         assert c[c.index("-f") + 1].split(",")[0] == "saddr"          # the address must stay the first column
-        assert c[c.index("-f") + 1] == "saddr,window,ttl,timestamp-str"
+        assert c[c.index("-f") + 1] in ("saddr,window,ttl,timestamp-str", "saddr,window,ttl,timestamp_str")
         out.write_text("".join(f"{ip},{self.windows.get((ip, port), 64240)},64,{ZMAP_STAMP}\n" for ip in self.l4.get(port, [])), encoding="utf-8")
         return SimpleNamespace(returncode=self.zmap_rc, stdout="", stderr="" if not self.zmap_rc else "zmap boom")
 
