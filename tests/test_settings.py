@@ -6,7 +6,7 @@ import yaml
 
 from scanner.internet import settings as st
 from scanner.internet.__main__ import main
-from scanner.internet.config import load_config
+from scanner.internet.config import ConfigError, load_config
 
 GOOD = ["--contact", "optout@uni.example", "--info-url", "https://uni.example/scan", "--egress-ip", "93.184.216.34",
         "--interface", "eth0", "--resolver", "192.0.2.53"]
@@ -283,6 +283,15 @@ def test_ct_names_block_round_trips_and_is_absent_by_default(tmp_path):
     st.apply(tmp_path)
     cfg = load_config(tmp_path / "config.yaml")
     assert cfg.ct_names.enabled and cfg.ct_names.max_names_per_domain == 7 and cfg.ct_names.names_file.name == "ct-names.txt"
+    digest = "a" * 64
+    _set_scope(path, ct_names={"enabled": True, "names_file": "ct-names.txt", "max_domains_per_endpoint": 3, "names_sha256": digest})
+    st.apply(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.ct_names.max_domains_per_endpoint == 3 and cfg.ct_names.names_sha256 == digest
+    _set_scope(path, ct_names={"enabled": True, "names_file": "ct-names.txt", "max_names_per_domain": 1001})
+    st.apply(tmp_path)
+    with pytest.raises(ConfigError, match="max_names_per_domain"):
+        load_config(tmp_path / "config.yaml")
     _set_scope(path, ct_names={"enabled": True, "bogus": 1})
     with pytest.raises(st.SettingsError, match="ct_names"):
         st.apply(tmp_path)

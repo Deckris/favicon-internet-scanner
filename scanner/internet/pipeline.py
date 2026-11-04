@@ -518,6 +518,8 @@ def run(
     if continue_in_place and not resume:
         raise ConfigError("continue_in_place needs resume")
     network_only = network_only or from_zmap
+    if cfg.ct_names.enabled and cfg.ct_names.names_sha256 and sha256_file(cfg.ct_names.names_file) != cfg.ct_names.names_sha256:
+        raise ConfigError("ct_names.names_file does not match ct_names.names_sha256; nothing was sent")
     started = datetime.now(UTC)
     wall = time.monotonic()
     policy, splan, exclusions = build_policy(cfg)
@@ -1209,16 +1211,24 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         store.clear_names()                         # rebuilt in full from what the stages above stored
         ct_index = None
         if cfg.ct_names.enabled:                    # optional CT name list: read once for the whole shard
-            ct_index = cand.load_ct_index(cfg.ct_names.names_file, max_per_domain=cfg.ct_names.max_names_per_domain)
+            ct_index = cand.load_ct_index(cfg.ct_names.names_file, max_per_domain=cfg.ct_names.max_names_per_domain,
+                                          expected_sha256=cfg.ct_names.names_sha256)
             counts["ct_names"] = {
-                "enabled": True, "names_file": cfg.ct_names.names_file.name, "sha256": sha256_file(cfg.ct_names.names_file),
+                "enabled": True, "names_file": cfg.ct_names.names_file.name, "sha256": ct_index.sha256,
+                "size_bytes": ct_index.size_bytes, "names_sha256_pinned": cfg.ct_names.names_sha256 is not None,
                 "names_loaded": ct_index.names_loaded, "domains_indexed": ct_index.domains_indexed,
-                "max_names_per_domain": ct_index.max_per_domain, "names_dropped_by_domain_cap": ct_index.names_dropped_by_cap}
+                "max_names_per_domain": ct_index.max_per_domain, "names_dropped_by_domain_cap": ct_index.names_dropped_by_cap,
+                "names_duplicate": ct_index.names_duplicate, "names_without_registrable_domain": ct_index.names_without_domain,
+                "max_domains_per_endpoint": cfg.ct_names.max_domains_per_endpoint, "names_skipped_endpoint_cap": 0}
         for g in store.iter_ips():
             for e in g.endpoints:
-                store.put_names(g.ip, e.port, cand.build_endpoint_names(
+                names = cand.build_endpoint_names(
                     g.ptr_names, e.tls.certificate if e.tls else None, policy, max_candidates=cfg.max_candidates_per_ip,
-                    operator_names=cfg.target_hostnames, ct_names=ct_index))
+                    operator_names=cfg.target_hostnames, ct_names=ct_index,
+                    max_domains_per_endpoint=cfg.ct_names.max_domains_per_endpoint)
+                if ct_index is not None:
+                    counts["ct_names"]["names_skipped_endpoint_cap"] += names.ct_names_skipped
+                store.put_names(g.ip, e.port, names)
 
     st.run("candidates", cand_stage, None)      # an endpoint without an entry reads as having no names
 
@@ -1563,13 +1573,15 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         "output_schema": outputs.OUTPUT_SCHEMA, "compression": outputs.COMPRESSION,
         **({"compression_note": outputs.COMPRESSION_NOTE} if outputs.COMPRESSION_NOTE else {}),
         "output_checksums": checksums,
-        "limitations": LIMITATIONS + ((CT_LIMITATION,) if "ct_names" in counts else ()),
+        "limitations": limitations("ct_names" in counts),
         **({"ct_names": counts["ct_names"]} if "ct_names" in counts else {}),
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
     return run_dir
 
 
+CT_HOSTNAME_LIMITATION = ("Hostname evidence is PTR plus certificate SAN/CN, plus names from a local CT list linked by "
+                          "registrable domain; no passive DNS or ASN matching.")
 CT_LIMITATION = ("Names from the configured Certificate Transparency list are added only for domains already seen in the "
                  "endpoint's PTR or certificate names and are labelled ct; they are evidence of a name, not of a mapping.")
 
@@ -1584,6 +1596,13 @@ LIMITATIONS = (
     "protocol=https means a TLS handshake completed (bare IP or with SNI); it does not prove the service speaks HTTP.",
     "Approval rate limits cover ZMap packets only; ZGrab2, ZDNS and favicon concurrency are bounded by configuration, not by the approval.",
 )
+
+
+def limitations(ct_names: bool = False) -> tuple[str, ...]:
+    """The manifest limitations; with a CT name list the hostname-evidence line names it and the CT note follows."""
+    if not ct_names:
+        return LIMITATIONS
+    return tuple(CT_HOSTNAME_LIMITATION if x.startswith("Hostname evidence is") else x for x in LIMITATIONS) + (CT_LIMITATION,)
 
 
 def _job_counts(jobs: list[ToolJob]) -> dict[str, int]:

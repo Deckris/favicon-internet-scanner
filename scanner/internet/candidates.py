@@ -8,17 +8,22 @@ Rules (scanner scope):
 * every name passes ``TargetPolicy.check_hostname`` before it can be queried;
 * a per-IP cap keeps the work bounded and the truncation is recorded;
 * names from an optional Certificate Transparency list (``ct_names``) are added to an endpoint only when their
-  registrable domain equals that of a PTR or certificate name already found for it; they rank below every name
-  with PTR or certificate evidence and are capped per registrable domain when the list is indexed.
+  registrable domain equals that of a PTR or certificate name already found for it (a wildcard links through its
+  base name; a public suffix links nothing). They rank below every name with PTR or certificate evidence, never
+  count as corroboration, and are bounded per registrable domain, per endpoint domain count and per endpoint total
+  before any of them reaches the hostname policy.
 """
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from scanner.certificates import normalize_hostname
+from scanner.internet.config import ConfigError
 from scanner.models import CertificateInfo
 from scanner.zdns_runner import Resolution
 
@@ -40,6 +45,7 @@ class EndpointNames:
     dropped: list[str] = field(default_factory=list)               # unusable raw names (IP SANs, malformed, policy-refused)
     truncated: bool = False
     source_count: int = 0
+    ct_names_skipped: int = 0       # CT names left out by the per-endpoint caps; counted, not refused
 
 
 def _add(ep: EndpointNames, raw: str, source: str, policy: Any) -> None:
@@ -56,42 +62,101 @@ def _add(ep: EndpointNames, raw: str, source: str, policy: Any) -> None:
     ep.names.setdefault(norm, set()).add(source)
 
 
+def _strip_wildcard(raw: str) -> str | None:
+    return raw[2:] if raw.startswith("*.") else None
+
+
 @dataclass
 class CtIndex:
     """Names of a Certificate Transparency list grouped by registrable domain, at most ``max_per_domain`` each."""
     by_domain: dict[str, list[str]]
     registrable_domain: Callable[[str], str | None]
-    names_loaded: int = 0           # distinct normalized names read from the file
+    names_loaded: int = 0           # valid name lines read from the file, repeats included
     names_dropped_by_cap: int = 0   # names left out because their domain already had max_per_domain
     max_per_domain: int = 50
+    sha256: str = ""                # digest of exactly the bytes that were parsed
+    size_bytes: int = 0
+    names_duplicate: int = 0        # repeats of a name already held for its domain
+    names_without_domain: int = 0   # names with no registrable domain (public suffixes); they link nothing
+    wildcard_base: Callable[[str], str | None] = _strip_wildcard
 
     @property
     def domains_indexed(self) -> int:
         return len(self.by_domain)
 
 
-def load_ct_index(path: Path, *, max_per_domain: int) -> CtIndex:
-    """Read a names file once. Per domain the alphabetically first ``max_per_domain`` names are kept."""
+def _name_lines(handle: Any, jsonl: bool, digest: Any):
+    """Raw names from an open binary file; every byte read is fed to ``digest``."""
+    for chunk in handle:
+        digest.update(chunk)
+        line = chunk.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        if jsonl:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get("name"), str):
+                yield row["name"]
+        elif not line.startswith("#"):
+            yield line
+
+
+def load_ct_index(path: Path, *, max_per_domain: int, expected_sha256: str | None = None) -> CtIndex:
+    """Read a names file once, hashing the very bytes that are parsed.
+
+    Per domain the alphabetically first ``max_per_domain`` names are kept. A digest that differs from
+    ``expected_sha256``, or a list without a single name that has a registrable domain, is refused."""
     from scanner.ct import names as ctnames           # imported only when the CT source is switched on
     by_domain: dict[str, list[str]] = {}
-    loaded = 0
-    for name in ctnames.iter_names(path):
-        loaded += 1
-        dom = ctnames.registrable_domain(name)
-        if dom is None:
-            continue
-        bucket = by_domain.setdefault(dom, [])
-        bisect.insort(bucket, name)
-        if len(bucket) > max_per_domain:
-            bucket.pop()
-    kept = sum(len(v) for v in by_domain.values())
-    return CtIndex(by_domain, ctnames.registrable_domain, names_loaded=loaded,
-                   names_dropped_by_cap=loaded - kept, max_per_domain=max_per_domain)
+    loaded = dropped = duplicate = no_domain = 0
+    digest = hashlib.sha256()
+    jsonl = str(path).lower().endswith(".jsonl")
+    size = 0
+    with open(path, "rb") as handle:
+        for raw in _name_lines(handle, jsonl, digest):
+            name = ctnames.normalize_name(raw)
+            if name is None:
+                continue
+            loaded += 1
+            dom = ctnames.registrable_domain(name)
+            if dom is None:
+                no_domain += 1
+                continue
+            bucket = by_domain.setdefault(dom, [])
+            at = bisect.bisect_left(bucket, name)
+            if at < len(bucket) and bucket[at] == name:
+                duplicate += 1
+                continue
+            bucket.insert(at, name)
+            if len(bucket) > max_per_domain:
+                bucket.pop()
+                dropped += 1
+        size = handle.tell()
+    sha = digest.hexdigest()
+    if expected_sha256 and sha != expected_sha256.lower():
+        raise ConfigError(f"ct_names.names_file does not match ct_names.names_sha256 (the file hashes to {sha})")
+    if not by_domain:
+        raise ConfigError("ct_names.names_file holds no usable name with a registrable domain")
+    extra: dict[str, Any] = {}
+    base = getattr(ctnames, "wildcard_base", None)
+    if base is not None:
+        extra["wildcard_base"] = base
+    return CtIndex(by_domain, ctnames.registrable_domain, names_loaded=loaded, names_dropped_by_cap=dropped,
+                   max_per_domain=max_per_domain, sha256=sha, size_bytes=size,
+                   names_duplicate=duplicate, names_without_domain=no_domain, **extra)
+
+
+def _core(sources: set[str]) -> set[str]:
+    """The sources that count as evidence: a CT hit corroborates nothing."""
+    return sources - {SRC_CT}
 
 
 def name_rank(name: str, sources: set[str]) -> tuple[bool, int, bool, str]:
-    """Sort key, best first: any PTR/certificate/operator evidence before CT-only, several sources, PTR, then alphabetical."""
-    return (sources == {SRC_CT}, -len(sources), SRC_PTR not in sources, name)
+    """Sort key, best first: PTR/certificate/operator evidence before CT-only, several non-CT sources, PTR, then alphabetical."""
+    core = _core(sources)
+    return (not core, -len(core), SRC_PTR not in sources, name)
 
 
 def cert_raw_names(cert: CertificateInfo | None) -> list[tuple[str, str]]:
@@ -104,6 +169,37 @@ def cert_raw_names(cert: CertificateInfo | None) -> list[tuple[str, str]]:
     return out
 
 
+def _add_ct_names(ep: EndpointNames, index: CtIndex, policy: Any, operator_names: tuple[str, ...],
+                  max_candidates: int, max_domains: int) -> None:
+    """Link CT names through the registrable domains of the endpoint's PTR/certificate names.
+
+    At most ``max_domains`` domains are used (alphabetically first) and at most as many new names as still fit under
+    ``max_candidates``. Both limits are applied before a name reaches the policy; what they leave out is counted in
+    ``ct_names_skipped`` and produces no refusal records."""
+    evidence = {n for n, src in ep.names.items() if src & {SRC_PTR, SRC_SAN, SRC_CN}}
+    wild = set(ep.wildcards)
+    for name in operator_names:
+        norm = normalize_hostname(name)
+        if norm is not None and norm.startswith("*."):
+            wild.discard(norm)                   # an operator-supplied wildcard is not evidence either
+    bases = {b for b in (index.wildcard_base(w) for w in wild) if b}
+    domains = sorted({d for d in (index.registrable_domain(n) for n in evidence | bases) if d})
+    room = max(0, max_candidates - len(ep.names))
+    for pos, dom in enumerate(domains):
+        names = index.by_domain.get(dom, ())
+        if pos >= max_domains:
+            ep.ct_names_skipped += sum(1 for n in names if n not in ep.names)
+            continue
+        for name in names:
+            if name in ep.names:
+                ep.names[name].add(SRC_CT)       # already a candidate: only its provenance grows
+            elif room > 0:
+                room -= 1
+                _add(ep, name, SRC_CT, policy)
+            else:
+                ep.ct_names_skipped += 1
+
+
 def build_endpoint_names(
     ptr_names: list[str],
     cert: CertificateInfo | None,
@@ -112,6 +208,7 @@ def build_endpoint_names(
     max_candidates: int,
     operator_names: tuple[str, ...] = (),
     ct_names: CtIndex | None = None,
+    max_domains_per_endpoint: int = 8,
 ) -> EndpointNames:
     ep = EndpointNames()
     for name in operator_names:
@@ -121,21 +218,14 @@ def build_endpoint_names(
     for raw, source in cert_raw_names(cert):
         _add(ep, raw, source, policy)
     if ct_names is not None:
-        evidence = {n for n, src in ep.names.items() if src & {SRC_PTR, SRC_SAN, SRC_CN}}
-        wild = {w[2:] for w in ep.wildcards}
-        for name in operator_names:
-            norm = normalize_hostname(name)
-            if norm is not None and norm.startswith("*."):
-                wild.discard(norm[2:])           # an operator-supplied wildcard is not evidence either
-        domains = {d for d in (ct_names.registrable_domain(n) for n in evidence | wild) if d}
-        for dom in sorted(domains):
-            for name in ct_names.by_domain.get(dom, ()):
-                _add(ep, name, SRC_CT, policy)
-    ep.source_count = len(ep.names)
+        _add_ct_names(ep, ct_names, policy, operator_names, max_candidates, max_domains_per_endpoint)
+    ep.source_count = len(ep.names) + ep.ct_names_skipped
     if len(ep.names) > max_candidates:
         # Names corroborated by several sources first, then PTR names, then the rest alphabetically; CT-only last.
         keep = sorted(ep.names, key=lambda n: name_rank(n, ep.names[n]))[:max_candidates]
         ep.names = {n: ep.names[n] for n in keep}
+        ep.truncated = True
+    if ep.ct_names_skipped:
         ep.truncated = True
     return ep
 
@@ -158,7 +248,8 @@ def final_status(dns_status: str, sources: set[str]) -> str:
     """verified / resolved_elsewhere / nxdomain are definite DNS outcomes.
 
     ``no_answer`` (the name exists but has no IPv4 record) keeps the evidence label of its source:
-    ptr_only_evidence / tls_only_evidence / ct_only_evidence (a name only the CT list knows). Every inconclusive DNS outcome (servfail, timeout, loop,
+    ptr_only_evidence / tls_only_evidence / ct_only_evidence (a name only the CT list knows). A CT hit next to other
+    sources changes nothing: it is not corroboration. Every inconclusive DNS outcome (servfail, timeout, loop,
     tool error) is ``unresolved`` whatever the source, so a resolver outage is never read as evidence.
     """
     if dns_status in VERIFIED:
@@ -168,14 +259,15 @@ def final_status(dns_status: str, sources: set[str]) -> str:
     if dns_status == "nxdomain":
         return "nxdomain"
     if dns_status == "no_answer":
-        if sources == {SRC_PTR}:
+        core = _core(sources)
+        if core == {SRC_PTR}:
             return "ptr_only_evidence"
-        if sources and sources <= {SRC_SAN, SRC_CN}:
+        if core and core <= {SRC_SAN, SRC_CN}:
             return "tls_only_evidence"
-        if SRC_OPERATOR in sources:
+        if SRC_OPERATOR in core:
             return "operator_evidence"
         if sources == {SRC_CT}:
             return "ct_only_evidence"
-        if sources:
+        if core:
             return "multi_source_evidence"       # e.g. PTR and certificate agree on a name that has no IPv4 record
     return "unresolved"

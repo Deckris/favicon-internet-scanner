@@ -79,7 +79,9 @@ scope:
   # ct_names:                         # optional extra hostnames from a local Certificate Transparency name list; off unless enabled (see config.example.yaml)
   #   enabled: false
   #   names_file: ct-names.jsonl
-  #   max_names_per_domain: 50
+  #   max_names_per_domain: 50          # 1 to 1000
+  #   max_domains_per_endpoint: 8       # registrable domains linked per endpoint, 1 to 64
+  #   names_sha256:                     # optional: refuse to run when the file's SHA-256 differs
 
 approval:                           # copy these from the real approval; they cap what a run may ask for
   status: {approval_status}         # `blocked` until the approving authority has approved, then `approved`
@@ -115,6 +117,9 @@ DEFAULTS: dict[str, Any] = {
 
 class SettingsError(Exception):
     """Raised with a message a person can act on."""
+
+
+CT_NAMES_KEYS = frozenset({"enabled", "names_file", "max_names_per_domain", "max_domains_per_endpoint", "names_sha256"})
 
 
 def sha256_file(path: Path) -> str:
@@ -458,8 +463,8 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
         base["target_policy"]["exclusions_overlay_file"] = str(scope["exclusions_overlay_file"])
     ct = scope.get("ct_names")
     if ct is not None:
-        if not isinstance(ct, dict) or set(ct) - {"enabled", "names_file", "max_names_per_domain"}:
-            raise SettingsError("scope.ct_names must hold enabled, names_file and max_names_per_domain")
+        if not isinstance(ct, dict) or set(ct) - CT_NAMES_KEYS:
+            raise SettingsError("scope.ct_names may hold only " + ", ".join(sorted(CT_NAMES_KEYS)))
         base["ct_names"] = dict(ct)      # left out when unset, so the stored config is the one it was; validated by load_config
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     base["dns"]["threads"] = plan["dns_threads"]

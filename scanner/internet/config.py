@@ -109,7 +109,7 @@ class ScanConfig:
     max_sample_fraction: float = 0.0
     approval_sha256: str = ""
     exclusions_overlay_file: Path | None = None    # live opt-outs, re-read while a run goes; host-local, not in the checksum
-    ct_names: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(enabled=False, names_file=None, max_names_per_domain=50))
+    ct_names: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(enabled=False, names_file=None, max_names_per_domain=50, max_domains_per_endpoint=8, names_sha256=None))
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -152,6 +152,9 @@ HOST_LOCAL_POLICY_KEYS = ("exclusions_file", "approval_file", "exclusions_overla
 
 def _without_host_derived(raw: dict[str, Any]) -> dict[str, Any]:
     kept = dict(raw)
+    ct = kept.get("ct_names")
+    if not (isinstance(ct, dict) and ct.get("enabled") is True):
+        kept.pop("ct_names", None)              # a switched-off CT list changes nothing a run measures
     for section, keys in HOST_DERIVED_KEYS.items():
         if isinstance(kept.get(section), dict):
             kept[section] = {k: v for k, v in kept[section].items() if k not in keys}
@@ -466,7 +469,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     h = _section(raw, "hostnames", {"max_candidates_per_ip"})
     tp_raw = _section({"tarpit": raw.get("tarpit") or {}}, "tarpit", {"min_open_ports", "tiny_window_below"}, set())
     asn_raw = _section({"asn": raw.get("asn") or {"ipasn": ""}}, "asn", {"ipasn"}, set())
-    ct_raw = _section({"ct_names": raw.get("ct_names") or {}}, "ct_names", {"enabled", "names_file", "max_names_per_domain"}, set())
+    ct_raw = _section({"ct_names": raw.get("ct_names") or {}}, "ct_names", {"enabled", "names_file", "max_names_per_domain", "max_domains_per_endpoint", "names_sha256"}, set())
     ct_enabled = _bool(ct_raw.get("enabled", False), "ct_names.enabled")
     ct_file = None
     if ct_enabled:
@@ -475,6 +478,13 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         ct_file = rel(str(ct_raw["names_file"]))
         if not ct_file.is_file():
             raise ConfigError(f"ct_names.names_file not found: {ct_file}")
+        if ct_file.stat().st_size == 0:
+            raise ConfigError(f"ct_names.names_file is empty: {ct_file.name}")
+    ct_sha = ct_raw.get("names_sha256")
+    if ct_sha is not None:
+        ct_sha = str(ct_sha).strip().lower()
+        if len(ct_sha) != 64 or any(c not in "0123456789abcdef" for c in ct_sha):
+            raise ConfigError("ct_names.names_sha256 must be a 64-digit hexadecimal SHA-256")
     sc = _section(raw, "sni_confirm", {"enabled", "max_per_endpoint"})
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
                                    "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images",
@@ -576,7 +586,9 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
                                tiny_window_below=_int(tp_raw.get("tiny_window_below", 246), "tarpit.tiny_window_below", 1, 4096)),
         asn_ipasn=rel(str(asn_raw["ipasn"])) if asn_raw.get("ipasn") else None,
         ct_names=SimpleNamespace(enabled=ct_enabled, names_file=ct_file,
-                                 max_names_per_domain=_int(ct_raw.get("max_names_per_domain", 50), "ct_names.max_names_per_domain", 1, 100000)),
+                                 max_names_per_domain=_int(ct_raw.get("max_names_per_domain", 50), "ct_names.max_names_per_domain", 1, 1000),
+                                 max_domains_per_endpoint=_int(ct_raw.get("max_domains_per_endpoint", 8), "ct_names.max_domains_per_endpoint", 1, 64),
+                                 names_sha256=ct_sha),
         checksum=checksum, raw=raw,
     )
     if require_approval:

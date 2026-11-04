@@ -49,7 +49,9 @@ scope:
   # ct_names:                         # optional extra hostnames from a local Certificate Transparency name list; off unless enabled (see config.example.yaml)
   #   enabled: false
   #   names_file: ct-names.jsonl
-  #   max_names_per_domain: 50
+  #   max_names_per_domain: 50          # 1 to 1000
+  #   max_domains_per_endpoint: 8       # registrable domains linked per endpoint, 1 to 64
+  #   names_sha256:                     # optional: refuse to run when the file's SHA-256 differs
 
 approval:                           # copy these from the real approval; they cap what a run may ask for
   status: blocked         # `blocked` until the approving authority has approved, then `approved`

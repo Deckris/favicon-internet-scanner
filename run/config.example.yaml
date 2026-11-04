@@ -74,11 +74,15 @@ hostnames:
 # Optional: extra candidate hostnames from a local list of Certificate Transparency names (one name per line, or
 # JSON lines with a "name" key). A listed name is added to an endpoint only when its registrable domain matches a
 # PTR or certificate name already found for that endpoint; it is labelled "ct" and ranks below names with PTR or
-# certificate evidence. The file is read once per run; only its base name, SHA-256 and counts are recorded.
+# certificate evidence. At most as many CT names as still fit under max_candidates_per_ip are taken per endpoint;
+# the ones left out are counted in the manifest. The file is read once per run; only its base name, SHA-256 and
+# counts are recorded.
 # ct_names:
 #   enabled: false
 #   names_file: ct-names.jsonl
-#   max_names_per_domain: 50   # names kept per registrable domain, 1 to 100000; the rest are counted, not used
+#   max_names_per_domain: 50       # names kept per registrable domain, 1 to 1000; the rest are counted, not used
+#   max_domains_per_endpoint: 8    # registrable domains of one endpoint that may link CT names, 1 to 64
+#   names_sha256:                  # optional SHA-256 of the file; a run refuses a file that hashes differently
 
 sni_confirm:
   enabled: true
