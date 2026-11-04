@@ -235,17 +235,20 @@ def _limiterd(args, ap) -> int:
     import logging
     from scanner.internet.limiterd import run_daemon
 
+    request_time = None
     cap, gap, hold, path = args.max_connections_per_subnet, args.min_seconds_between_probes, args.retry_after_max_hold_seconds, args.socket
     if args.config is not None:
         try:
-            m = load_config(args.config, require_approval=False).measurement
+            loaded = load_config(args.config, require_approval=False)
         except ConfigError as exc:
             print(f"REFUSED: {exc}", file=sys.stderr)
             return 2
+        m = loaded.measurement
         cap = m.max_connections_per_subnet if cap is None else cap
         gap = m.min_seconds_between_probes_per_ip if gap is None else gap
         hold = m.retry_after_max_hold_seconds if hold is None else hold
         path = Path(m.limiter_socket) if path is None and m.limiter_socket else path
+        request_time = loaded.fetch.total_timeout
     if path is None:
         ap.error("limiterd needs --socket (or measurement.limiter_socket in --config)")
     if not hasattr(__import__("socket"), "AF_UNIX"):
@@ -253,8 +256,13 @@ def _limiterd(args, ap) -> int:
         return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     kwargs = {} if hold is None else {"retry_after_max_hold": hold}
+    gap = 5.0 if gap is None else gap
+    start_hold = args.startup_hold_seconds
+    if start_hold is None:
+        start_hold = gap + (30.0 if request_time is None else request_time)
     try:
-        run_daemon(path, 4 if cap is None else cap, 5.0 if gap is None else gap, lease_ttl=args.lease_ttl_seconds, bucket=args.bucket_seconds, **kwargs)
+        run_daemon(path, 4 if cap is None else cap, gap, lease_ttl=args.lease_ttl_seconds, bucket=args.bucket_seconds,
+                   grace=args.grace_seconds, startup_hold=start_hold, **kwargs)
     except RuntimeError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
@@ -338,6 +346,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="limiterd: pause between two requests to one address (default: the config's, else 5)")
     ap.add_argument("--lease-ttl-seconds", type=float, default=300.0,
                     help="limiterd: a client silent for this long loses the slots it holds (default 300)")
+    ap.add_argument("--grace-seconds", type=float, default=30.0,
+                    help="limiterd: a client whose connection broke keeps its slots this long so that it can reconnect (default 30)")
+    ap.add_argument("--startup-hold-seconds", type=float,
+                    help="limiterd: refuse every claim for this long after the start, while clients report what they hold "
+                         "(default: the pause plus fetch.total_timeout of --config, else plus 30)")
     ap.add_argument("--bucket-seconds", type=float, default=1.0,
                     help="limiterd: width of the time buckets of the per-address ledger (default 1; the pause can run this much longer)")
     ap.add_argument("--limiter-socket", type=Path,

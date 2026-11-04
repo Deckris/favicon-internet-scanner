@@ -934,6 +934,7 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
         if settings.get("limiter_socket") and settings.get("subnet_cap"):
             from scanner.internet.limiterclient import LimiterClient
             limiter = LimiterClient(settings["limiter_socket"], settings["subnet_cap"], settings["pace"])
+            limiter.require()
         else:
             limiter = (SubnetLimiter(settings["subnet_cap"], max_hold=settings["retry_after_max_hold"])
                        if settings.get("subnet_cap") else None)
