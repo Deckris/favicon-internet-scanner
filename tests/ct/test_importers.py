@@ -11,9 +11,9 @@ def test_json_export():
     table = load_crtsh_export(FIXTURES / "crtsh_export.json")
     rows = list(table)
     assert all(o.source == "import" for o in rows)
-    assert table.names() == {"www.alpha.example", "alpha.example", "beta.test", "xn--bcher-kva.example"}
+    assert set(table.names()) == {"www.alpha.example", "alpha.example", "beta.test", "xn--bcher-kva.example"}
     alpha = [o for o in rows if o.cert_id == "1000001"]
-    assert len(alpha) == 3  # the wildcard reduces to its base name, so alpha.example repeats
+    assert sorted(o.name for o in alpha) == ["alpha.example", "www.alpha.example"]  # the wildcard reduces to alpha.example, which the table keeps once
     assert {o.seen_at for o in alpha} == {"2025-03-01T10:15:30Z"}
     assert alpha[0].issuer == "C=XX, O=Example Test CA, CN=Example Test CA R1"
 
@@ -28,13 +28,13 @@ def test_json_falls_back_to_not_before_and_skips_invalid():
 
 def test_idna_and_trailing_dot_collapse():
     rows = [o for o in load_crtsh_export(FIXTURES / "crtsh_export.json") if o.cert_id == "1000003"]
-    assert [o.name for o in rows] == ["xn--bcher-kva.example", "xn--bcher-kva.example"]
+    assert [o.name for o in rows] == ["xn--bcher-kva.example"]  # both spellings normalise to one name, kept once
 
 
 def test_csv_export():
     table = load_crtsh_export(FIXTURES / "crtsh_export.csv")
     rows = list(table)
-    assert table.names() == {"www.gamma.example", "gamma.example", "delta.invalid"}
+    assert set(table.names()) == {"www.gamma.example", "gamma.example", "delta.invalid"}
     gamma = [o for o in rows if o.cert_id == "2000001"]
     assert {o.seen_at for o in gamma} == {"2025-04-01T08:00:00Z"}
     delta = [o for o in rows if o.cert_id == "2000002"]
