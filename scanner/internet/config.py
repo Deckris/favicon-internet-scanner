@@ -142,6 +142,8 @@ HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
     "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds", "worker_max_lookups"),
     # The live exclusions overlay: an opt-out must take effect without starting a new campaign.
     "target_policy": ("exclusions_overlay_file",),
+    # The CT name list sits at a different path on each host; the manifest records the file's SHA-256.
+    "ct_names": ("names_file",),
 }
 # Parts that also differ between hosts of one campaign and so are left out of ``shared_checksum``.
 HOST_LOCAL_SECTIONS = ("vantage", "output", "operations", "binaries")

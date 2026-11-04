@@ -9,7 +9,7 @@ import pytest
 
 from scanner.internet import candidates as cand
 from scanner.internet import outputs, pipeline
-from scanner.internet.config import ConfigError, load_config
+from scanner.internet.config import ConfigError, config_checksum, load_config, shared_config_checksum
 from scanner.safety import TargetPolicy
 from tests.helpers import FakeFetcher, write_config
 from tests.test_pipeline import IP_OK, tools
@@ -192,3 +192,17 @@ def test_config_defaults_and_checksum_unchanged_when_absent(tmp_path):
     f = _names_file(other, ["a.example.com"])
     on = load_config(write_config(other, ct_names={"enabled": True, "names_file": str(f)}))
     assert on.ct_names.enabled and on.ct_names.names_file == f
+
+
+def test_names_file_location_does_not_change_the_checksum(tmp_path):
+    first, second = tmp_path / "a", tmp_path / "b"
+    first.mkdir(), second.mkdir()
+    one = _names_file(first, ["www.example.org"])
+    other = _names_file(second, ["www.example.org", "mail.example.org"])
+    cfg_a = load_config(write_config(first, ct_names={"enabled": True, "names_file": str(one)}))
+    cfg_b = load_config(write_config(first, ct_names={"enabled": True, "names_file": str(other)}))
+    assert cfg_a.checksum == cfg_b.checksum
+    assert shared_config_checksum(cfg_a.raw) == shared_config_checksum(cfg_b.raw)
+    capped = load_config(write_config(first, ct_names={"enabled": True, "names_file": str(one), "max_names_per_domain": 5}))
+    assert capped.checksum != cfg_a.checksum
+    assert config_checksum(cfg_a.raw) == cfg_a.checksum

@@ -345,7 +345,17 @@ ct_names:
   max_names_per_domain: 20
 ```
 
-A CT name is attached to an endpoint only when its registrable domain matches a PTR name or certificate name already found at that address. The scanner never contacts a name just because it appears in the file, and it does not add endpoints.
+The `ct_names` section adds hostname candidates from a local list of Certificate Transparency names: one name per line, or JSON lines with a `name` key when the file name ends in `.jsonl`. It is off by default and never contacts a CT log; the list is a file you provide. A listed name is added to an endpoint only when its registrable domain matches a name already found for that endpoint through PTR or a certificate SAN/CN. Such names are labelled `ct` in `hostname_sources`, rank below names with PTR or certificate evidence, pass the same hostname policy as every other candidate, and are reported as `ct_only_evidence` when DNS gives no IPv4 answer. `max_names_per_domain` bounds how many names per registrable domain are used. The manifest records the list's file name, SHA-256, the number of names and domains read, and how many names the cap left out. The path of `names_file` is not part of the config checksum, so hosts of one campaign may keep the list in different places; the recorded SHA-256 shows which list a run used. The scanner never contacts a name just because it appears in the file, and it does not add endpoints.
+
+With the settings file, the same section goes under `scope`:
+
+```yaml
+scope:
+  ct_names:
+    enabled: true
+    names_file: ct-names.jsonl
+    max_names_per_domain: 50
+```
 
 ## Limits
 
