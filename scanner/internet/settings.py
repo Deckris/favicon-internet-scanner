@@ -76,6 +76,10 @@ scope:
   #   page_timeout_seconds: 20        # 1 to 120
   #   concurrency: auto               # 1 to 64; auto follows the cores and RAM of the host
   #   wait_ms: 1500                   # wait after load for scripts to add icons, 0 to 30000
+  # ct_names:                         # optional extra hostnames from a local Certificate Transparency name list; off unless enabled (see config.example.yaml)
+  #   enabled: false
+  #   names_file: ct-names.jsonl
+  #   max_names_per_domain: 50
 
 approval:                           # copy these from the real approval; they cap what a run may ask for
   status: {approval_status}         # `blocked` until the approving authority has approved, then `approved`
@@ -452,6 +456,11 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
     base["target_policy"].update(exclusions_file=str(scope["exclusions_file"]), exclusions_sha256=digest, approval_file=APPROVAL_NAME)
     if scope.get("exclusions_overlay_file"):
         base["target_policy"]["exclusions_overlay_file"] = str(scope["exclusions_overlay_file"])
+    ct = scope.get("ct_names")
+    if ct is not None:
+        if not isinstance(ct, dict) or set(ct) - {"enabled", "names_file", "max_names_per_domain"}:
+            raise SettingsError("scope.ct_names must hold enabled, names_file and max_names_per_domain")
+        base["ct_names"] = dict(ct)      # left out when unset, so the stored config is the one it was; validated by load_config
     base["dns"]["resolvers"] = [str(scope["dns_resolver"])]
     base["dns"]["threads"] = plan["dns_threads"]
     f = base["favicon"]

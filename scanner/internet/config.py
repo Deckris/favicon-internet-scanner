@@ -109,6 +109,7 @@ class ScanConfig:
     max_sample_fraction: float = 0.0
     approval_sha256: str = ""
     exclusions_overlay_file: Path | None = None    # live opt-outs, re-read while a run goes; host-local, not in the checksum
+    ct_names: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(enabled=False, names_file=None, max_names_per_domain=50))
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -296,7 +297,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     if not isinstance(raw, dict):
         raise ConfigError("config must be a mapping")
     top = {"run_label", "vantage", "sample", "measurement", "target_policy", "dns", "hostnames",
-           "sni_confirm", "favicon", "fetch", "transparency", "output", "operations", "binaries", "tarpit", "asn"}
+           "sni_confirm", "favicon", "fetch", "transparency", "output", "operations", "binaries", "tarpit", "asn", "ct_names"}
     unknown = sorted(set(raw) - top)
     if unknown:
         raise ConfigError(f"unknown top-level keys: {', '.join(unknown)}")
@@ -463,6 +464,15 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     h = _section(raw, "hostnames", {"max_candidates_per_ip"})
     tp_raw = _section({"tarpit": raw.get("tarpit") or {}}, "tarpit", {"min_open_ports", "tiny_window_below"}, set())
     asn_raw = _section({"asn": raw.get("asn") or {"ipasn": ""}}, "asn", {"ipasn"}, set())
+    ct_raw = _section({"ct_names": raw.get("ct_names") or {}}, "ct_names", {"enabled", "names_file", "max_names_per_domain"}, set())
+    ct_enabled = _bool(ct_raw.get("enabled", False), "ct_names.enabled")
+    ct_file = None
+    if ct_enabled:
+        if not ct_raw.get("names_file"):
+            raise ConfigError("ct_names.names_file is required when ct_names.enabled is true")
+        ct_file = rel(str(ct_raw["names_file"]))
+        if not ct_file.is_file():
+            raise ConfigError(f"ct_names.names_file not found: {ct_file}")
     sc = _section(raw, "sni_confirm", {"enabled", "max_per_endpoint"})
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
                                    "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images",
@@ -563,6 +573,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         tarpit=SimpleNamespace(min_open_ports=_int(tp_raw.get("min_open_ports", 4), "tarpit.min_open_ports", 3, 20),
                                tiny_window_below=_int(tp_raw.get("tiny_window_below", 246), "tarpit.tiny_window_below", 1, 4096)),
         asn_ipasn=rel(str(asn_raw["ipasn"])) if asn_raw.get("ipasn") else None,
+        ct_names=SimpleNamespace(enabled=ct_enabled, names_file=ct_file,
+                                 max_names_per_domain=_int(ct_raw.get("max_names_per_domain", 50), "ct_names.max_names_per_domain", 1, 100000)),
         checksum=checksum, raw=raw,
     )
     if require_approval:

@@ -1207,11 +1207,18 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     # ---- Stage 5: hostname candidates = PTR U cert SAN/CN ----------------------------------
     def cand_stage() -> None:
         store.clear_names()                         # rebuilt in full from what the stages above stored
+        ct_index = None
+        if cfg.ct_names.enabled:                    # optional CT name list: read once for the whole shard
+            ct_index = cand.load_ct_index(cfg.ct_names.names_file, max_per_domain=cfg.ct_names.max_names_per_domain)
+            counts["ct_names"] = {
+                "enabled": True, "names_file": cfg.ct_names.names_file.name, "sha256": sha256_file(cfg.ct_names.names_file),
+                "names_loaded": ct_index.names_loaded, "domains_indexed": ct_index.domains_indexed,
+                "max_names_per_domain": ct_index.max_per_domain, "names_dropped_by_domain_cap": ct_index.names_dropped_by_cap}
         for g in store.iter_ips():
             for e in g.endpoints:
                 store.put_names(g.ip, e.port, cand.build_endpoint_names(
                     g.ptr_names, e.tls.certificate if e.tls else None, policy, max_candidates=cfg.max_candidates_per_ip,
-                    operator_names=cfg.target_hostnames))
+                    operator_names=cfg.target_hostnames, ct_names=ct_index))
 
     st.run("candidates", cand_stage, None)      # an endpoint without an entry reads as having no names
 
@@ -1555,11 +1562,16 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         "tools": report.get("tool_versions", {}), "stage_counts": counts, "tool_job_counts": _job_counts(jobs),
         "output_schema": outputs.OUTPUT_SCHEMA, "compression": outputs.COMPRESSION,
         **({"compression_note": outputs.COMPRESSION_NOTE} if outputs.COMPRESSION_NOTE else {}),
-        "output_checksums": checksums, "limitations": LIMITATIONS,
+        "output_checksums": checksums,
+        "limitations": LIMITATIONS + ((CT_LIMITATION,) if "ct_names" in counts else ()),
+        **({"ct_names": counts["ct_names"]} if "ct_names" in counts else {}),
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
     return run_dir
 
+
+CT_LIMITATION = ("Names from the configured Certificate Transparency list are added only for domains already seen in the "
+                 "endpoint's PTR or certificate names and are labelled ct; they are evidence of a name, not of a mapping.")
 
 LIMITATIONS = (
     "Single vantage, single observation window; results describe what this vantage could observe at that time.",
@@ -1620,14 +1632,14 @@ def _verified_names(g: IpFacts, e: EndpointFacts) -> list[str]:
     """Verified names for an endpoint, best-corroborated first: several sources, then PTR, then alphabetical."""
     names = e.names.names
     ok = [h for h in names if _dns_status(g, h) in cand.VERIFIED]
-    return sorted(ok, key=lambda h: (-len(names[h]), cand.SRC_PTR not in names[h], h))
+    return sorted(ok, key=lambda h: cand.name_rank(h, names[h]))
 
 
 def _unverified_names(g: IpFacts, e: EndpointFacts) -> list[str]:
     """Candidate names that did NOT verify, best-corroborated first. Used only as Host/SNI on the scanned IP."""
     names = e.names.names
     bad = [h for h in names if _dns_status(g, h) not in cand.VERIFIED]
-    return sorted(bad, key=lambda h: (-len(names[h]), cand.SRC_PTR not in names[h], h))
+    return sorted(bad, key=lambda h: cand.name_rank(h, names[h]))
 
 
 def _ip_rows(cfg, g: IpFacts, asn, incomplete: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

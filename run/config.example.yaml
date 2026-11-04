@@ -71,6 +71,15 @@ dns:
 hostnames:
   max_candidates_per_ip: 20
 
+# Optional: extra candidate hostnames from a local list of Certificate Transparency names (one name per line, or
+# JSON lines with a "name" key). A listed name is added to an endpoint only when its registrable domain matches a
+# PTR or certificate name already found for that endpoint; it is labelled "ct" and ranks below names with PTR or
+# certificate evidence. The file is read once per run; only its base name, SHA-256 and counts are recorded.
+# ct_names:
+#   enabled: false
+#   names_file: ct-names.jsonl
+#   max_names_per_domain: 50   # names kept per registrable domain, 1 to 100000; the rest are counted, not used
+
 sni_confirm:
   enabled: true
   max_per_endpoint: 3

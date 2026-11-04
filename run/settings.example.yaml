@@ -46,6 +46,10 @@ scope:
   #   page_timeout_seconds: 20        # 1 to 120
   #   concurrency: auto               # 1 to 64; auto follows the cores and RAM of the host
   #   wait_ms: 1500                   # wait after load for scripts to add icons, 0 to 30000
+  # ct_names:                         # optional extra hostnames from a local Certificate Transparency name list; off unless enabled (see config.example.yaml)
+  #   enabled: false
+  #   names_file: ct-names.jsonl
+  #   max_names_per_domain: 50
 
 approval:                           # copy these from the real approval; they cap what a run may ask for
   status: blocked         # `blocked` until the approving authority has approved, then `approved`

@@ -274,6 +274,20 @@ def test_icon_flags_in_init_are_written_to_settings_and_applied(tmp_path):
     assert cfg.measurement.max_connections_per_subnet == 3 and cfg.favicon.offhost.enabled is True
 
 
+def test_ct_names_block_round_trips_and_is_absent_by_default(tmp_path):
+    path = _new_workdir(tmp_path)
+    st.apply(tmp_path)
+    assert "ct_names" not in _config(tmp_path)
+    (tmp_path / "ct-names.txt").write_text("api.example.com", encoding="utf-8")
+    _set_scope(path, ct_names={"enabled": True, "names_file": "ct-names.txt", "max_names_per_domain": 7})
+    st.apply(tmp_path)
+    cfg = load_config(tmp_path / "config.yaml")
+    assert cfg.ct_names.enabled and cfg.ct_names.max_names_per_domain == 7 and cfg.ct_names.names_file.name == "ct-names.txt"
+    _set_scope(path, ct_names={"enabled": True, "bogus": 1})
+    with pytest.raises(st.SettingsError, match="ct_names"):
+        st.apply(tmp_path)
+
+
 def test_offhost_icons_work_with_several_favicon_processes(tmp_path):
     path = _new_workdir(tmp_path)
     _set_scope(path, offhost_icons=True, favicon_processes=4, favicon_workers=64)

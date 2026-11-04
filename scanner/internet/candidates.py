@@ -1,4 +1,4 @@
-"""Hostname candidates: PTR names plus certificate SAN/CN, nothing else.
+"""Hostname candidates: PTR names plus certificate SAN/CN, and optionally names from a local CT list.
 
 Rules (scanner scope):
 * wildcard names are recorded as evidence and are never queried -- neither the
@@ -6,12 +6,17 @@ Rules (scanner scope):
 * IP-literal SANs and malformed names are dropped;
 * a hostname seen via several sources is one candidate with merged provenance;
 * every name passes ``TargetPolicy.check_hostname`` before it can be queried;
-* a per-IP cap keeps the work bounded and the truncation is recorded.
+* a per-IP cap keeps the work bounded and the truncation is recorded;
+* names from an optional Certificate Transparency list (``ct_names``) are added to an endpoint only when their
+  registrable domain equals that of a PTR or certificate name already found for it; they rank below every name
+  with PTR or certificate evidence and are capped per registrable domain when the list is indexed.
 """
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 from scanner.certificates import normalize_hostname
 from scanner.models import CertificateInfo
@@ -21,6 +26,7 @@ SRC_PTR = "ptr"
 SRC_SAN = "certificate_san"
 SRC_CN = "certificate_cn"
 SRC_OPERATOR = "operator_supplied"      # known-targets mode only
+SRC_CT = "ct"                           # optional local Certificate Transparency name list
 
 VERIFIED = frozenset({"verified_current_mapping", "multiple_a_including_target"})
 ELSEWHERE = frozenset({"resolved_elsewhere", "multiple_a_excluding_target"})
@@ -50,6 +56,44 @@ def _add(ep: EndpointNames, raw: str, source: str, policy: Any) -> None:
     ep.names.setdefault(norm, set()).add(source)
 
 
+@dataclass
+class CtIndex:
+    """Names of a Certificate Transparency list grouped by registrable domain, at most ``max_per_domain`` each."""
+    by_domain: dict[str, list[str]]
+    registrable_domain: Callable[[str], str | None]
+    names_loaded: int = 0           # distinct normalized names read from the file
+    names_dropped_by_cap: int = 0   # names left out because their domain already had max_per_domain
+    max_per_domain: int = 50
+
+    @property
+    def domains_indexed(self) -> int:
+        return len(self.by_domain)
+
+
+def load_ct_index(path: Path, *, max_per_domain: int) -> CtIndex:
+    """Read a names file once. Per domain the alphabetically first ``max_per_domain`` names are kept."""
+    from scanner.ct import names as ctnames           # imported only when the CT source is switched on
+    by_domain: dict[str, list[str]] = {}
+    loaded = 0
+    for name in ctnames.iter_names(path):
+        loaded += 1
+        dom = ctnames.registrable_domain(name)
+        if dom is None:
+            continue
+        bucket = by_domain.setdefault(dom, [])
+        bisect.insort(bucket, name)
+        if len(bucket) > max_per_domain:
+            bucket.pop()
+    kept = sum(len(v) for v in by_domain.values())
+    return CtIndex(by_domain, ctnames.registrable_domain, names_loaded=loaded,
+                   names_dropped_by_cap=loaded - kept, max_per_domain=max_per_domain)
+
+
+def name_rank(name: str, sources: set[str]) -> tuple[bool, int, bool, str]:
+    """Sort key, best first: any PTR/certificate/operator evidence before CT-only, several sources, PTR, then alphabetical."""
+    return (sources == {SRC_CT}, -len(sources), SRC_PTR not in sources, name)
+
+
 def cert_raw_names(cert: CertificateInfo | None) -> list[tuple[str, str]]:
     """(raw name, source) pairs from a certificate, SAN first then CN."""
     if cert is None:
@@ -67,6 +111,7 @@ def build_endpoint_names(
     *,
     max_candidates: int,
     operator_names: tuple[str, ...] = (),
+    ct_names: CtIndex | None = None,
 ) -> EndpointNames:
     ep = EndpointNames()
     for name in operator_names:
@@ -75,10 +120,21 @@ def build_endpoint_names(
         _add(ep, name, SRC_PTR, policy)
     for raw, source in cert_raw_names(cert):
         _add(ep, raw, source, policy)
+    if ct_names is not None:
+        evidence = {n for n, src in ep.names.items() if src & {SRC_PTR, SRC_SAN, SRC_CN}}
+        wild = {w[2:] for w in ep.wildcards}
+        for name in operator_names:
+            norm = normalize_hostname(name)
+            if norm is not None and norm.startswith("*."):
+                wild.discard(norm[2:])           # an operator-supplied wildcard is not evidence either
+        domains = {d for d in (ct_names.registrable_domain(n) for n in evidence | wild) if d}
+        for dom in sorted(domains):
+            for name in ct_names.by_domain.get(dom, ()):
+                _add(ep, name, SRC_CT, policy)
     ep.source_count = len(ep.names)
     if len(ep.names) > max_candidates:
-        # Names corroborated by several sources first, then PTR names, then the rest alphabetically.
-        keep = sorted(ep.names, key=lambda n: (-len(ep.names[n]), SRC_PTR not in ep.names[n], n))[:max_candidates]
+        # Names corroborated by several sources first, then PTR names, then the rest alphabetically; CT-only last.
+        keep = sorted(ep.names, key=lambda n: name_rank(n, ep.names[n]))[:max_candidates]
         ep.names = {n: ep.names[n] for n in keep}
         ep.truncated = True
     return ep
@@ -102,7 +158,7 @@ def final_status(dns_status: str, sources: set[str]) -> str:
     """verified / resolved_elsewhere / nxdomain are definite DNS outcomes.
 
     ``no_answer`` (the name exists but has no IPv4 record) keeps the evidence label of its source:
-    ptr_only_evidence / tls_only_evidence. Every inconclusive DNS outcome (servfail, timeout, loop,
+    ptr_only_evidence / tls_only_evidence / ct_only_evidence (a name only the CT list knows). Every inconclusive DNS outcome (servfail, timeout, loop,
     tool error) is ``unresolved`` whatever the source, so a resolver outage is never read as evidence.
     """
     if dns_status in VERIFIED:
@@ -118,6 +174,8 @@ def final_status(dns_status: str, sources: set[str]) -> str:
             return "tls_only_evidence"
         if SRC_OPERATOR in sources:
             return "operator_evidence"
+        if sources == {SRC_CT}:
+            return "ct_only_evidence"
         if sources:
             return "multi_source_evidence"       # e.g. PTR and certificate agree on a name that has no IPv4 record
     return "unresolved"
