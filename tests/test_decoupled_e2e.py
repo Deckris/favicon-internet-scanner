@@ -397,7 +397,7 @@ def test_opt_out_added_mid_run_is_never_contacted_afterwards(request):
     not_yet = scenario.shard_ips(SHARDS - 1)[1]   # its shard has not started
     host.start_campaign()
     wait_for(lambda: len([e for e in host.events() if e[0] == "ZMAP_END"]) >= 5, 180, "the third shard's sweep")
-    stamp = time.time()
+    stamp = time.monotonic()
     st = host.overlay.stat().st_mtime_ns
     host.overlay.write_text(f"# opt-outs\n{swept_early}\n{not_yet}\n", encoding="utf-8")
     os.utime(host.overlay, ns=(st + 5_000_000_000, st + 5_000_000_000))

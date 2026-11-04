@@ -28,9 +28,9 @@ if os.environ.get("E2E_LOG"):
                 if not self.pacer.wait(connect_ip):
                     raise RuntimeError("stopped")
                 try:
-                    log("CONNECT_START", connect_ip, 0, os.getpid(), time.time(), "favicon")
+                    log("CONNECT_START", connect_ip, 0, os.getpid(), time.monotonic(), "favicon")
                     time.sleep(float(os.environ.get("E2E_CONNECT_SECONDS", "0.4")) / 2)
-                    log("CONNECT_END", connect_ip, 0, os.getpid(), time.time(), "favicon")
+                    log("CONNECT_END", connect_ip, 0, os.getpid(), time.monotonic(), "favicon")
                     return super().fetch(url, connect_ip=connect_ip, kind=kind, context=context)
                 finally:
                     self.pacer.done(connect_ip)

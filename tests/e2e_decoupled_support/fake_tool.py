@@ -1,5 +1,6 @@
 """Executable body of the fake zmap / zgrab2 / zdns used by the decoupled end-to-end test.
 
+Event times are time.monotonic() readings (one system-wide clock on Linux; the wall clock may step during a run).
 Every invocation appends one line per event to the shared log (E2E_LOG) with a single O_APPEND write, so concurrent
 processes never need a lock. The answers come from tests.helpers.FakeTools over the scenario in ``scenario``.
 """
@@ -49,14 +50,14 @@ def zmap(cmd: list[str]) -> int:
     shard = int(arg(cmd, "--shard", "0")) if "--shards" in cmd else None
     tools = scenario.build_tools(shard)
     if "--dryrun" in cmd:
-        log("DRYRUN", os.getpid(), time.time(), parent_stage(), shard)
+        log("DRYRUN", os.getpid(), time.monotonic(), parent_stage(), shard)
         res = tools(["zmap", *cmd[1:]])
         sys.stderr.write(res.stderr)
         return res.returncode
     port = int(arg(cmd, "-p"))
     out = arg(cmd, "-o")
     me = os.getpid()
-    log("ZMAP_START", me, time.time(), port, out, parent_stage())
+    log("ZMAP_START", me, time.monotonic(), port, out, parent_stage())
     others = set()
     for line in Path(os.environ["E2E_LOG"]).read_text().splitlines():
         f = line.split()
@@ -66,10 +67,10 @@ def zmap(cmd: list[str]) -> int:
             others.discard(int(f[1]))
     for pid in sorted(others):
         if alive(pid):
-            log("ZMAP_OVERLAP", me, pid, time.time())
+            log("ZMAP_OVERLAP", me, pid, time.monotonic())
     time.sleep(float(os.environ.get("E2E_ZMAP_SECONDS", "1.0")))
     res = tools(["zmap", *cmd[1:]])
-    log("ZMAP_END", me, time.time(), port, out, res.returncode)
+    log("ZMAP_END", me, time.monotonic(), port, out, res.returncode)
     sys.stderr.write(res.stderr)
     return res.returncode
 
@@ -84,9 +85,9 @@ def zgrab2(cmd: list[str]) -> int:
     hold = float(os.environ.get("E2E_CONNECT_SECONDS", "0.4"))
 
     def one(ip: str, port: str) -> None:
-        log("CONNECT_START", ip, port, os.getpid(), time.time(), stage)
+        log("CONNECT_START", ip, port, os.getpid(), time.monotonic(), stage)
         time.sleep(hold)
-        log("CONNECT_END", ip, port, os.getpid(), time.time(), stage)
+        log("CONNECT_END", ip, port, os.getpid(), time.monotonic(), stage)
     threads = []
     for row in stdin.splitlines():
         f = (row.split(",") + ["", "", "", ""])[:4]
