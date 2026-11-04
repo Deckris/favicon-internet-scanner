@@ -122,6 +122,7 @@ def sha256_file(path: Path) -> str:
         return h.hexdigest()
 
 
+# favicon.worker_max_lookups (lookups after which a favicon worker process is replaced, 0 for never) belongs to them.
 # Settings that profile.derive sizes from the host's cores, memory and open-file limit, plus the time limit of the favicon
 # stage. They change how fast a run goes, not what it measures. They stay in the stored config and the snapshots; only
 # the checksum leaves them out, so that two hosts with different hardware get the same campaign directory and run ids.
@@ -134,7 +135,7 @@ def sha256_file(path: Path) -> str:
 HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
     "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "limiter_socket"),
     "dns": ("threads", "query_resolver_version"),
-    "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds"),
+    "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds", "worker_max_lookups"),
     # The live exclusions overlay: an opt-out must take effect without starting a new campaign.
     "target_policy": ("exclusions_overlay_file",),
 }
@@ -444,7 +445,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     sc = _section(raw, "sni_confirm", {"enabled", "max_per_endpoint"})
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
                                    "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images",
-                                   "icon_selection", "fallback", "max_active_requests", "reuse_http_document", "processes", "javascript"},
+                                   "icon_selection", "fallback", "max_active_requests", "reuse_http_document", "processes", "javascript",
+                                   "worker_max_lookups"},
                   {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page"})
     oh = _section({"offhost_icons": fv.get("offhost_icons") or {"enabled": False}}, "offhost_icons",
                   {"enabled", "max_total_fetches", "max_per_host", "min_interval_seconds", "max_bytes"}, {"enabled"})
@@ -455,6 +457,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     if not isinstance(js["enabled"], bool):
         raise ConfigError("favicon.javascript.enabled must be true or false")
     procs = _int(fv.get("processes", 1), "favicon.processes", 1, 64)
+    # Only present when set, so a config that leaves it out keeps the favicon section of its manifest as it was.
+    worker_limit = {"worker_max_lookups": _int(fv["worker_max_lookups"], "favicon.worker_max_lookups", 0, 10**7)} if "worker_max_lookups" in fv else {}
     for key, cap in (("workers", fv.get("workers")), ("max_active_requests", fv.get("max_active_requests", 512))):
         if isinstance(cap, int) and not isinstance(cap, bool) and procs > cap:
             raise ConfigError(f"favicon.processes ({procs}) cannot exceed favicon.{key} ({cap}); each process needs at least one")
@@ -500,6 +504,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         max_candidates_per_ip=_int(h["max_candidates_per_ip"], "hostnames.max_candidates_per_ip", 1, 1000),
         sni_confirm=SimpleNamespace(enabled=bool(sc["enabled"]), max_per_endpoint=_int(sc["max_per_endpoint"], "sni_confirm.max_per_endpoint", 1, 20)),
         favicon=SimpleNamespace(
+            **worker_limit,
             enabled=bool(fv["enabled"]), max_hostnames_per_endpoint=_int(fv["max_hostnames_per_endpoint"], "favicon.max_hostnames_per_endpoint", 0, 20),
             workers=_int(fv["workers"], "favicon.workers", 1, 8192), processes=procs, max_icons_per_page=_int(fv["max_icons_per_page"], "favicon.max_icons_per_page", 1, 20),
             store_images=_bool(fv.get("store_images", True), "favicon.store_images"),

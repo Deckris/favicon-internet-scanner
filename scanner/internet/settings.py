@@ -65,6 +65,7 @@ scope:
   # favicon_processes: 4              # worker processes sharing the favicon requests
   # favicon_max_active_requests: 512  # favicon requests on the wire at once (1-8192)
   # favicon_stage_max_seconds: 86400  # time limit of the favicon stage (1-86400)
+  # favicon_worker_max_lookups: 50000 # lookups after which a favicon worker process is replaced by a fresh one (0-10000000, 0 never); bounds worker memory
   try_unverified_names: false       # also request pages under certificate names that did not verify
   offhost_icons: false              # fetch icons hosted elsewhere (needs the approval to allow it); works with favicon_processes above 1
   # icon_selection: first_image       # first_image | browser_models: which declared icons are fetched; part of the config checksum
@@ -454,6 +455,11 @@ def apply(workdir: Path, cli: dict[str, Any] | None = None) -> dict[str, Any]:
     f.update(workers=int(workers), processes=processes, stage_max_seconds=plan["favicon_stage_max_seconds"],
              max_active_requests=plan["favicon_max_active_requests"],
              max_unverified_names_per_endpoint=2 if scope.get("try_unverified_names") else 0)
+    recycle = scope.get("favicon_worker_max_lookups")
+    if recycle is not None:
+        if isinstance(recycle, bool) or not isinstance(recycle, int) or not 0 <= recycle <= 10**7:
+            raise SettingsError(f"scope.favicon_worker_max_lookups `{recycle}` must be a whole number from 0 to 10000000")
+        f["worker_max_lookups"] = recycle       # left out when unset, so the stored config is the one it was
     f["offhost_icons"] = {**f.get("offhost_icons", {}), "enabled": offhost}
     if icon_selection is not None:
         f["icon_selection"] = icon_selection

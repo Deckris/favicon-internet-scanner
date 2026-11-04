@@ -158,7 +158,7 @@ def favicon_jobs(store: ShardStore, cfg: ScanConfig, counts: dict[str, Any]) -> 
     return fjobs, job_ips, job_endpoints
 
 
-def _earlier_attempt_records(resume_from: Path | None, have: dict, fjobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _earlier_attempt_records(resume_from: Path | None, have: Any, fjobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Favicon records of an earlier attempt that belong to this attempt's jobs and are not already in hand."""
     if resume_from is None:
         return []
@@ -1333,11 +1333,11 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                                             state_path=Path(cfg.output_dir) / f"campaign-{cfg.checksum[:12]}" / "offhost_state.json", pacer=pacer)
         icons = icon_store.IconStore(run_dir / "favicons") if cfg.favicon.store_images else None
         record_log = fav.RecordLog(run_dir / "raw" / "favicon_records.jsonl")
-        earlier = record_log.load()
+        earlier = record_log.load_index()      # where each finished lookup lies in the log, not the records
         carried = _earlier_attempt_records(resume_from, earlier, fjobs)
         for rec in carried:                 # logged again here: a second crash must not lose them with this attempt
             record_log.append(rec)
-            earlier[(rec["ip"], rec["port"], rec.get("hostname"))] = rec
+            earlier.put((rec["ip"], rec["port"], rec.get("hostname")), rec)
         if earlier:
             counts["favicon_lookups_resumed"] = len(earlier)
             todo = [j for j in fjobs if (j["ip"], j["port"], j.get("hostname")) not in earlier]
@@ -1363,6 +1363,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                                                 subnet_cap=cfg.measurement.max_connections_per_subnet,
                                                 retry_after_max_hold=cfg.measurement.retry_after_max_hold_seconds,
                                                 subnet_wait_max=wait_max,
+                                                worker_max_lookups=getattr(cfg.favicon, "worker_max_lookups", None),
                                                 limiter_socket=getattr(limiter, "path", None),
                                                 on_failure=lambda why, lost: worker_failures.append((why, lost)),
                                                 offhost_service=service, **common)

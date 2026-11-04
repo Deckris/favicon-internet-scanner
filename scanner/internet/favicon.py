@@ -6,12 +6,14 @@ redirect can never lead the run to a host outside the sample.
 """
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import hashlib
 import json
 import multiprocessing
 import multiprocessing.connection
+import os
 import queue
 import threading
 import time
@@ -46,10 +48,14 @@ class FingerprintCache:
     The same few icons (hosting defaults, device logos, CMS marks) turn up on a large share of the addresses of a
     scan, and decoding plus hashing one costs several milliseconds of CPU that all workers share. The fingerprint
     is a pure function of the bytes, so reusing it changes nothing in the records.
+
+    At most ``max_decodes`` icons are decoded at once: the decoded pixels of an image can be far larger than its
+    file, and with hundreds of request threads the decodes would otherwise all be in memory together.
     """
 
-    def __init__(self, capacity: int = 2048) -> None:
+    def __init__(self, capacity: int = 2048, max_decodes: int = 8) -> None:
         self._capacity = max(1, capacity)
+        self._decoding = threading.BoundedSemaphore(max(1, max_decodes))
         self._items: OrderedDict[tuple[int, bytes], Any] = OrderedDict()
         self._lock = threading.Lock()
         self.hits = self.misses = 0
@@ -63,7 +69,8 @@ class FingerprintCache:
                 self.hits += 1
                 return found
             self.misses += 1
-        result = compute_fingerprint(data)
+        with self._decoding:
+            result = compute_fingerprint(data)
         with self._lock:
             self._items[key] = result
             self._items.move_to_end(key)
@@ -75,16 +82,24 @@ class FingerprintCache:
 _FINGERPRINTS = FingerprintCache()
 
 
+FETCH_POLICY_REFUSALS_KEPT = 1000      # refusal examples a fetch policy keeps; the rest are only counted
+
+
 def fetch_policy(cfg: Any, sampled_ips: list[str]) -> TargetPolicy:
-    """Policy whose whole population is the responsive sample (/32s). Callers skip the stage when empty."""
+    """Policy whose whole population is the responsive sample (/32s). Callers skip the stage when empty.
+
+    Its refusals are not written anywhere, so it keeps the first ``FETCH_POLICY_REFUSALS_KEPT`` and counts the rest.
+    """
     if not sampled_ips:
         raise ValueError("fetch policy needs at least one sampled IP")
-    return TargetPolicy.production(ProductionPolicyInput(
+    policy = TargetPolicy.production(ProductionPolicyInput(
         approval_reference=cfg.approval.approval_reference if cfg.approval else "unapproved",
         population=tuple(f"{ip}/32" for ip in sorted(set(sampled_ips))),
         hostname_policy=HostnamePolicyInput(cfg.hostname_mode, cfg.hostname_suffixes),
         exclusions=tuple(),
-    )).attach_overlay(overlay_for(getattr(cfg, "exclusions_overlay_file", None)))
+    ))
+    policy.max_refusals = FETCH_POLICY_REFUSALS_KEPT
+    return policy.attach_overlay(overlay_for(getattr(cfg, "exclusions_overlay_file", None)))
 
 
 class RedirectResolver:
@@ -578,6 +593,47 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
     return record
 
 
+class RecordIndex:
+    """The lookups an earlier attempt completed, without holding their records.
+
+    Each key maps to the byte offset of its (last) line in the plain log and ``get`` reads that line back, so a
+    resumed stage keeps a few dozen bytes per lookup in memory instead of the record. A log that is stored compressed
+    cannot be read at an offset; its records are then held, as ``RecordLog.load`` returns them. Records added with
+    ``put`` (taken over from another attempt) are held too.
+    """
+
+    def __init__(self, path: Path | None = None, offsets: dict | None = None, held: dict | None = None) -> None:
+        self._path = path
+        self._offsets: dict[tuple[str, int, str | None], int] = offsets or {}
+        self._held: dict[tuple[str, int, str | None], dict[str, Any]] = held or {}
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._offsets or key in self._held
+
+    def __len__(self) -> int:
+        return len(self._offsets.keys() | self._held.keys()) if self._held else len(self._offsets)
+
+    def __bool__(self) -> bool:
+        return bool(self._offsets or self._held)
+
+    def put(self, key: tuple[str, int, str | None], rec: dict[str, Any]) -> None:
+        self._held[key] = rec
+
+    def get(self, key: tuple[str, int, str | None], default: Any = None) -> Any:
+        found = self._held.get(key)
+        if found is not None:
+            return found
+        offset = self._offsets.get(key)
+        if offset is None or self._path is None:
+            return default
+        try:
+            with self._path.open("rb") as fh:
+                fh.seek(offset)
+                return json.loads(fh.readline())
+        except (OSError, ValueError):
+            return default
+
+
 class RecordLog:
     """Append-only log of favicon records, one JSON line each, written the moment a lookup finishes.
 
@@ -605,6 +661,25 @@ class RecordLog:
                 except (ValueError, KeyError, TypeError):
                     continue        # a line cut short by the kill
         return found
+
+    def load_index(self) -> RecordIndex:
+        """Like ``load`` but holds only where each record lies in the log (see ``RecordIndex``)."""
+        path = outputs.resolve(self.path)
+        if not path.exists():
+            return RecordIndex()
+        if outputs.is_compressed(path):
+            return RecordIndex(held=self.load())
+        offsets: dict[tuple[str, int, str | None], int] = {}
+        at = 0
+        with path.open("rb") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    offsets[(rec["ip"], rec["port"], rec.get("hostname"))] = at
+                except (ValueError, KeyError, TypeError):
+                    pass            # a line cut short by the kill
+                at += len(line)
+        return RecordIndex(path, offsets)
 
     def append(self, rec: dict[str, Any]) -> None:
         line = json.dumps(rec, default=str) + "\n"
@@ -849,6 +924,51 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
 
 _BACKSTOP_SECONDS = 10.0      # after the stage grace, how long a worker process may take to exit before it is terminated
 
+# A worker process that has made this many lookups is replaced by a fresh one: a long-lived interpreter with hundreds of
+# threads keeps growing (allocator arenas, fragmentation) in proportion to the lookups it has made. 0 never replaces.
+DEFAULT_WORKER_MAX_LOOKUPS = 50_000
+WORKER_ARENA_MAX = "2"          # glibc malloc arenas per worker process (the default is eight per core)
+
+
+@contextlib.contextmanager
+def worker_environment():
+    """Environment in which worker processes are started: ``MALLOC_ARENA_MAX`` is set unless the operator set it.
+
+    Hundreds of threads each get their own malloc arena by default, which fragments and is rarely given back.
+    """
+    added = "MALLOC_ARENA_MAX" not in os.environ
+    if added:
+        os.environ["MALLOC_ARENA_MAX"] = WORKER_ARENA_MAX
+    try:
+        yield
+    finally:
+        if added:
+            os.environ.pop("MALLOC_ARENA_MAX", None)
+
+
+def segment_by_network(indexes: list[int], jobs: list[dict[str, Any]], limit: int) -> list[list[int]]:
+    """``indexes`` (of ``jobs``) cut into consecutive segments of at most ``limit`` jobs, a /24 (IPv6 /48) network never
+    split, so an address and its neighbours are only ever contacted from one process. A network with more jobs than
+    ``limit`` is a segment of its own. ``limit`` 0 gives one segment.
+    """
+    if not indexes:
+        return []
+    if not limit or len(indexes) <= limit:
+        return [list(indexes)]
+    chains: dict[str, list[int]] = {}
+    for k in indexes:
+        chains.setdefault(network_key(jobs[k]["ip"]), []).append(k)
+    out: list[list[int]] = []
+    current: list[int] = []
+    for chain in chains.values():
+        if current and len(current) + len(chain) > limit:
+            out.append(current)
+            current = []
+        current.extend(chain)
+    if current:
+        out.append(current)
+    return out
+
 
 def partition_by_ip(jobs: list[dict[str, Any]], parts: int) -> list[list[int]]:
     """Indexes of ``jobs`` per partition, every /24 (IPv6 /48) network in exactly one, so an address and its
@@ -935,8 +1055,9 @@ class SharedFlag:
 
 def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings: dict[str, Any], store_root: Any,
                  documents: dict[tuple[str, int], dict[str, Any]], done: dict[tuple[str, int, str | None], dict[str, Any]],
-                 stop: Any, conn: Any, offhost_conn: Any = None) -> None:
+                 stop: Any, conn: Any, offhost_conn: Any = None, owned: Any = None) -> None:
     """``conn`` is the sending end of this process's own pipe, so a process killed mid-send blocks no other.
+    ``owned``: every address of the partition this process works for, of which ``jobs`` may be only a part.
 
     Messages: ``("log", record)`` for a record fetched here, ``("rec", position, record)`` for every final record
     (position in ``jobs``), then ``("end", icon files)``, or ``("error", text)`` if the stage itself failed.
@@ -946,6 +1067,7 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
     def send(message: tuple) -> None:
         with lock:
             conn.send(message)
+    limiter = None
     try:
         stopped = stop.is_set
         if settings.get("limiter_socket") and settings.get("subnet_cap"):
@@ -958,7 +1080,7 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
         pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0, limiter=limiter,
                         max_wait=settings["subnet_wait_max"])
         store = IconStore(store_root) if store_root is not None else None
-        fetcher = factory(pacer, frozenset(j["ip"] for j in jobs), stopped)
+        fetcher = factory(pacer, owned if owned is not None else frozenset(j["ip"] for j in jobs), stopped)
         if offhost_conn is not None:       # icons on other hosts are fetched by the parent's service, once for all processes
             fetcher = RoutingFetcher(fetcher, OffhostClient(offhost_conn))
         run_favicon_stage(fetcher, jobs, workers=settings["workers"],
@@ -972,6 +1094,13 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
             send(("error", f"{type(exc).__name__}: {exc}"))
         except (OSError, ValueError):
             pass
+    finally:
+        close = getattr(limiter, "close", None)
+        if close is not None:
+            try:
+                close()         # frees the slots at once for the process that takes this one's place
+            except Exception:
+                pass
 
 
 def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, processes: int, workers: int, pace: float, max_icons: int,
@@ -983,7 +1112,8 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                                 on_failure: Any = None, subnet_cap: int = 0, offhost_service: Any = None,
                                 retry_after_max_hold: float = DEFAULT_RETRY_AFTER_MAX_HOLD,
                                 subnet_wait_max: float = DEFAULT_SUBNET_WAIT_MAX,
-                                limiter_socket: str | None = None) -> list[dict[str, Any]]:
+                                limiter_socket: str | None = None,
+                                worker_max_lookups: int | None = None) -> list[dict[str, Any]]:
     """Like ``run_favicon_stage`` but over ``processes`` worker processes; one record per job, original order.
 
     ``factory(pacer, owned, killed)`` returns the fetcher (``owned``: the addresses of the process) and must be
@@ -991,6 +1121,13 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     ``workers // processes`` threads (at least one), so the number of concurrent requests stays at most what
     ``workers`` says. Records stream back as the lookups finish: ``on_record`` and ``record_sink(job_index, record)``
     are called here, in the calling thread, as ``run_favicon_stage`` calls them.
+
+    A worker process makes at most ``worker_max_lookups`` lookups (``DEFAULT_WORKER_MAX_LOOKUPS`` when None, 0 for no
+    limit): the jobs of its partition are cut into segments at network boundaries and each segment is run by a fresh
+    process, started once the previous one of the partition has exited, so no address is ever contacted by two
+    processes at once and the pause per address and the limits per network hold across the replacement. Lookups
+    that ``done`` already holds are delivered from here and never sent to a worker, which gets only its own jobs
+    and their stored pages.
 
     One difference from a single process: a process is approved only for its own addresses, so a redirect hop to an
     endpoint owned by another process is refused (``policy_refused``), exactly like a hop to any endpoint that is not
@@ -1037,6 +1174,16 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
         settle_rest(list(range(len(jobs))), None)
         return [] if record_sink is not None else [r for r in out if r is not None]
     parts = partition_by_ip(jobs, processes)
+    # The lookups of an earlier attempt are handed on from here; a worker only gets what it still has to fetch.
+    if done:
+        for k, job in enumerate(jobs):
+            prior = prior_of(job)
+            if prior is not None:
+                deliver(k, prior)
+    limit = DEFAULT_WORKER_MAX_LOOKUPS if worker_max_lookups is None else max(0, int(worker_max_lookups))
+    segments = [segment_by_network([k for k in indexes if k not in sunk], jobs, limit) for indexes in parts]
+    owners = [frozenset(jobs[k]["ip"] for k in indexes) for indexes in parts]
+    current = [0] * len(parts)           # segment of each partition that is running (or ran last)
     store_root = icon_store.root if icon_store is not None else None
     ctx = multiprocessing.get_context("spawn")
     stop = SharedFlag(ctx)
@@ -1044,22 +1191,35 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                 "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace,
                 "subnet_cap": subnet_cap or 0, "retry_after_max_hold": retry_after_max_hold, "subnet_wait_max": subnet_wait_max,
                 "limiter_socket": limiter_socket}      # without a limiter daemon a network lives in one process, which may use the whole cap
-    procs, conns, sends = [], [], []
-    for i, indexes in enumerate(parts):
+    procs: list[Any] = [None] * len(parts)
+    conns: list[Any] = [None] * len(parts)
+    finished: set[int] = {i for i, segs in enumerate(segments) if not segs}
+    retiring: dict[int, float] = {}      # partitions whose segment reported its end and whose process is on its way out
+
+    def rest_of(i: int, after_current: bool = False) -> list[int]:
+        return [k for seg in segments[i][current[i] + (1 if after_current else 0):] for k in seg]
+
+    def start(i: int) -> None:
+        """Start the process for the current segment of partition ``i``."""
+        indexes = segments[i][current[i]]
         recv_end, send_end = ctx.Pipe(duplex=False)
-        conns.append(recv_end)
         mine = [jobs[k] for k in indexes]
-        owned = {j["ip"] for j in mine}
-        keys = {(j["ip"], j["port"]) for j in mine}
-        docs = {key: doc for key, doc in (documents or {}).items() if key in keys}
-        earlier = {key: rec for key, rec in (done or {}).items() if key[0] in owned}
+        docs = {}
+        for j in mine:
+            doc = (documents or {}).get((j["ip"], j["port"]))
+            if doc is not None:
+                docs[(j["ip"], j["port"])] = doc
         off_end = offhost_service.open_channel(ctx) if offhost_service is not None else None
-        procs.append(ctx.Process(target=_worker_main, name=f"favicon-{i}", daemon=True,
-                                 args=(i, factory, mine, settings, store_root, docs, earlier, stop, send_end, off_end)))
-        sends.append(send_end)
-        if off_end is not None:
-            sends.append(off_end)
-    finished: set[int] = set()
+        proc = ctx.Process(target=_worker_main, name=f"favicon-{i}", daemon=True,
+                           args=(i, factory, mine, settings, store_root, docs, None, stop, send_end, off_end, owners[i]))
+        procs[i], conns[i] = proc, recv_end
+        try:
+            with worker_environment():
+                proc.start()
+        finally:
+            for c in (send_end, off_end):          # only the child holds a sending end now, so its death shows as EOF
+                if c is not None:
+                    c.close()
 
     def handle(i: int, message: tuple) -> None:
         kind = message[0]
@@ -1070,23 +1230,26 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                 except OSError:
                     pass        # a full disk must not cost the lookup that already succeeded
         elif kind == "rec":
-            deliver(parts[i][message[1]], message[2])
+            deliver(segments[i][current[i]][message[1]], message[2])
         elif kind == "end":
             if icon_store is not None:
                 icon_store.adopt(message[1])
-            settle_rest(parts[i], f"favicon worker process {i}: incomplete result")
-            finished.add(i)
+            settle_rest(segments[i][current[i]], f"favicon worker process {i}: incomplete result")
+            if current[i] + 1 < len(segments[i]):
+                retiring[i] = time.monotonic()
+            else:
+                finished.add(i)
         elif kind == "error":
-            settle_rest(parts[i], f"favicon worker process {i}: {message[1]}")
+            settle_rest(rest_of(i), f"favicon worker process {i}: {message[1]}")
             finished.add(i)
 
     def lost(i: int) -> None:
         """Process ``i`` is gone without a result: error records for what it left. The others carry on."""
-        settle_rest(parts[i], f"favicon worker process {i}: exited with code {procs[i].exitcode} without a result")
+        settle_rest(rest_of(i), f"favicon worker process {i}: exited with code {procs[i].exitcode} without a result")
         finished.add(i)
 
     def drain(i: int) -> None:
-        while i not in finished:
+        while i not in finished and i not in retiring:
             try:
                 if not conns[i].poll(0):
                     return
@@ -1096,43 +1259,65 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                 lost(i)
                 return
 
+    def replace_exited(stopped: bool) -> None:
+        """A process that has ended its segment and left is replaced by one for the next segment (none once stopped)."""
+        for i in list(retiring):
+            proc = procs[i]
+            if proc.is_alive() and time.monotonic() - retiring[i] > _BACKSTOP_SECONDS:
+                proc.terminate()
+            if proc.is_alive():
+                continue
+            proc.join(2.0)
+            conns[i].close()
+            del retiring[i]
+            if stopped:
+                settle_rest(rest_of(i, after_current=True), None)
+                finished.add(i)
+            else:
+                current[i] += 1
+                start(i)
+
     try:
-        for p in procs:
-            p.start()
-        for c in sends:                                # only the child holds a sending end now, so its death shows as EOF
-            c.close()
+        for i in range(len(parts)):
+            if i not in finished:
+                start(i)
         stopped_at: float | None = None
         while len(finished) < len(parts):
-            live = [conns[i] for i in range(len(parts)) if i not in finished]
-            ready = multiprocessing.connection.wait(live, timeout=_POLL_SECONDS)
+            live = [conns[i] for i in range(len(parts)) if i not in finished and i not in retiring]
+            ready = multiprocessing.connection.wait(live, timeout=_POLL_SECONDS) if live else []
+            if not live:
+                time.sleep(0.05)
             for i, c in enumerate(conns):
                 if c in ready:
                     drain(i)
             if stopped_at is None and killed():
                 stopped_at = time.monotonic()
                 stop.set()
+            replace_exited(stopped_at is not None)
             for i, p in enumerate(procs):
-                if i not in finished and not p.is_alive():
+                if i not in finished and i not in retiring and not p.is_alive():
                     drain(i)                           # it may have answered just before exiting
-                    if i not in finished:
+                    if i not in finished and i not in retiring:
                         lost(i)
             if stopped_at is not None and time.monotonic() - stopped_at > grace + _BACKSTOP_SECONDS:
                 for i, p in enumerate(procs):
                     if i not in finished:
                         p.terminate()
                         drain(i)
-                        settle_rest(parts[i], None)
+                        settle_rest(rest_of(i, after_current=i in retiring), None)
+                        retiring.pop(i, None)
                         finished.add(i)
     finally:
         for p in procs:                 # children first: the flag is lock-free, but nothing may wait on a child that is stuck
-            if p.is_alive():
+            if p is not None and p.is_alive():
                 p.terminate()
         for p in procs:
-            if p.pid is not None:
+            if p is not None and p.pid is not None:
                 p.join(5.0)
         stop.set()
-        for c in conns + sends:
-            c.close()
+        for c in conns:
+            if c is not None:
+                c.close()
         if icon_store is not None:
             icon_store.remove_temporary()              # a terminated process leaves its half-written files behind
     return [] if record_sink is not None else [r for r in out if r is not None]
