@@ -12,15 +12,20 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from scanner.models import utc_iso
+
 APPLICATION_PROTOCOLS = {"https", "http", "tls_unestablished"}   # a service answered above TCP
 
 _TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 
 
-def parse_synack_csv(text: str) -> dict[str, dict[str, int | None]]:
-    """ZMap rows ``saddr,window,ttl`` -> first row per address. Missing or malformed columns become None."""
-    out: dict[str, dict[str, int | None]] = {}
+def parse_synack_csv(text: str) -> dict[str, dict[str, Any]]:
+    """ZMap rows ``saddr,window,ttl[,timestamp-str]`` -> first row per address.
+
+    Missing or malformed columns become None; ``seen_at`` is the response time as UTC ISO 8601.
+    """
+    out: dict[str, dict[str, Any]] = {}
     for line in text.splitlines():
         cols = [c.strip() for c in line.split(",")]
         if not cols or not cols[0] or cols[0] in out:
@@ -30,7 +35,7 @@ def parse_synack_csv(text: str) -> dict[str, dict[str, int | None]]:
                 return int(cols[i])
             except (IndexError, ValueError):
                 return None
-        out[cols[0]] = {"window": num(1), "ttl": num(2)}
+        out[cols[0]] = {"window": num(1), "ttl": num(2), "seen_at": utc_iso(cols[3]) if len(cols) > 3 else None}
     return out
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field, fields
+from datetime import UTC, datetime
 from typing import Any, Iterable, Literal
 
 SCHEMA_VERSION = 2
@@ -40,6 +41,21 @@ FailureStage = Literal[
     "policy", "l4", "protocol", "tls", "dns", "http", "redirect",
     "favicon_discovery", "favicon_fetch", "favicon_decode", "match",
 ]
+
+
+def utc_iso(stamp: Any) -> str | None:
+    """A tool's timestamp (ISO 8601, any offset; no offset is read as UTC) as UTC ISO 8601, or None when it is not one."""
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None
+    try:
+        when = datetime.fromisoformat(stamp.strip())
+    except ValueError:
+        return None
+    return (when if when.tzinfo else when.replace(tzinfo=UTC)).astimezone(UTC).isoformat()
+
+
+def now_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def _plain(value: Any) -> Any:
@@ -142,6 +158,7 @@ class ToolJob(Record):
     started_at: str = ""
     finished_at: str = ""
     error: str | None = None
+    stats: dict[str, int] | None = None     # per-batch counts: zgrab2 outcomes, zmap sent / received / dropped
 
 
 # --------------------------------------------------------------------------- TLS
@@ -193,6 +210,7 @@ class ZGrabResult(Record):
     certificate: CertificateInfo | None
     error: str | None
     raw_line_sha256: str
+    requested_at: str | None = None     # ZGrab2's own time of the request, UTC ISO 8601
 
 
 @dataclass(frozen=True)

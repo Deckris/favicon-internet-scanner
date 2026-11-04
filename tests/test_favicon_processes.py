@@ -27,6 +27,11 @@ def make_jobs(addresses: int = 24, hostnames: bool = True) -> list[dict]:
     return jobs
 
 
+def bare(records):
+    """The records without the request times, which come from the clock of the process that made the request."""
+    return [{k: v for k, v in rec.items() if k not in ("captured_at", "favicon_at")} for rec in records]
+
+
 def run(jobs, processes, **over):
     args = dict(processes=processes, workers=8, pace=0.0, max_icons=2)
     args.update(over)
@@ -71,7 +76,7 @@ def test_records_equal_a_single_process_in_order_and_content():
     jobs = make_jobs()
     single = fav.run_favicon_stage(FakeFetcher(), jobs, workers=8, max_icons=2)
     for processes in (1, 2, 3):
-        assert run(jobs, processes) == single
+        assert bare(run(jobs, processes)) == bare(single)
 
 
 def test_records_stream_to_the_sinks_as_they_finish():
@@ -79,8 +84,8 @@ def test_records_stream_to_the_sinks_as_they_finish():
     single = fav.run_favicon_stage(FakeFetcher(), jobs, workers=8, max_icons=2)
     logged, sunk = [], {}
     assert run(jobs, 3, on_record=logged.append, record_sink=sunk.__setitem__) == []
-    assert [sunk[i] for i in range(len(jobs))] == single
-    assert sorted(map(json.dumps, logged)) == sorted(map(json.dumps, single))
+    assert bare([sunk[i] for i in range(len(jobs))]) == bare(single)
+    assert sorted(map(json.dumps, bare(logged))) == sorted(map(json.dumps, bare(single)))
 
 
 def test_records_of_an_earlier_attempt_are_reused_not_fetched():
@@ -88,7 +93,7 @@ def test_records_of_an_earlier_attempt_are_reused_not_fetched():
     single = fav.run_favicon_stage(FakeFetcher(), jobs, workers=8, max_icons=2)
     earlier = {(r["ip"], r["port"], r.get("hostname")): r for r in single[:4]}
     logged = []
-    assert run(jobs, 2, done=earlier, on_record=logged.append) == single
+    assert bare(run(jobs, 2, done=earlier, on_record=logged.append)) == bare(single)
     assert len(logged) == len(jobs) - 4, "only the lookups that were not done before are logged again"
 
 
@@ -98,7 +103,7 @@ def test_icon_store_is_rebuilt_in_the_parent_and_files_are_whole(tmp_path):
     ref = fav.run_favicon_stage(FakeFetcher(), jobs, workers=8, max_icons=2, icon_store=ref_store)
     store = icon_store.IconStore(tmp_path / "multi" / "favicons")
     out = run(jobs, 3, icon_store=store)
-    assert out == ref and len(store) == len(ref_store) == 1
+    assert bare(out) == bare(ref) and len(store) == len(ref_store) == 1
     (sha,) = ref_store.files()
     assert store.path_for(sha) == ref_store.path_for(sha)
     assert sorted(p.name for p in (tmp_path / "multi" / "favicons").iterdir()) == [f"{sha}.png"], "no temporary file is left behind"
@@ -122,7 +127,7 @@ def test_stored_documents_reach_the_process_that_owns_the_address():
     docs = {(j["ip"], 80): stored() for j in jobs}
     single = fav.run_favicon_stage(FakeFetcher(), jobs, workers=2, max_icons=4, documents=docs, max_document_bytes=1 << 20)
     multi = run(jobs, 2, max_icons=4, documents=docs, max_document_bytes=1 << 20)
-    aged = lambda recs: [{k: v for k, v in r.items() if k != "document_age_seconds"} for r in recs]      # the age follows the clock
+    aged = lambda recs: [{k: v for k, v in r.items() if k not in ("document_age_seconds", "captured_at", "favicon_at")} for r in recs]      # the age follows the clock
     assert aged(multi) == aged(single) and {r["document_source"] for r in multi} == {"reused"}
     assert all(r["document_age_seconds"] >= 0 for r in multi)
 
@@ -240,7 +245,7 @@ def test_pipeline_outputs_match_between_one_and_two_processes(tmp_path):
                      skip_preflight=True, offline_preflight=True)
     # the age of a reused page follows the clock, which the worker processes do not share with this test
     def same(x, y):
-        strip = lambda rows: [{k: v for k, v in r.items() if not k.endswith("document_age_seconds")} for r in rows]
+        strip = lambda rows: [{k: v for k, v in r.items() if not k.endswith(("document_age_seconds", "favicon_at", "captured_at"))} for r in rows]
         assert strip(x) == strip(y) and x
     same(list(pipeline.outputs.iter_hostname_rows(a)), list(pipeline.outputs.iter_hostname_rows(b)))
     same(*[[json.loads(l) for l in (d / "normalized" / "endpoints.jsonl").read_text().splitlines()] for d in (a, b)])

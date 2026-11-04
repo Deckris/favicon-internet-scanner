@@ -125,6 +125,7 @@ class EndpointFacts:
     port: int
     synack_window: int | None = None
     synack_ttl: int | None = None
+    synack_seen_at: str | None = None
     tls: TlsResult | None = None
     http: ZGrabResult | None = None
     names: EndpointNames = field(default_factory=EndpointNames)
@@ -151,7 +152,7 @@ CREATE TABLE IF NOT EXISTS endpoints (ip TEXT NOT NULL, port INTEGER NOT NULL, i
     PRIMARY KEY (ip, port)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS endpoints_port ON endpoints (port, ip);
 CREATE INDEX IF NOT EXISTS endpoints_num ON endpoints (ipnum, ip);
-CREATE TABLE IF NOT EXISTS synack (ip TEXT NOT NULL, port INTEGER NOT NULL, window INTEGER, ttl INTEGER,
+CREATE TABLE IF NOT EXISTS synack (ip TEXT NOT NULL, port INTEGER NOT NULL, window INTEGER, ttl INTEGER, seen_at TEXT,
     PRIMARY KEY (ip, port)) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS synack_window ON synack (window);
 CREATE TABLE IF NOT EXISTS tarpit_ips (ip TEXT NOT NULL, port INTEGER NOT NULL, signal TEXT NOT NULL, window INTEGER NOT NULL,
@@ -185,7 +186,7 @@ CREATE TABLE IF NOT EXISTS docs (ip TEXT NOT NULL, port INTEGER NOT NULL, data T
 
 _SQL = {
     "endpoints": "INSERT OR IGNORE INTO endpoints (ip, port, ipnum) VALUES (?,?,?)",
-    "synack": "INSERT OR REPLACE INTO synack (ip, port, window, ttl) VALUES (?,?,?,?)",
+    "synack": "INSERT OR REPLACE INTO synack (ip, port, window, ttl, seen_at) VALUES (?,?,?,?,?)",
     "tarpit_ips": "INSERT OR REPLACE INTO tarpit_ips (ip, port, signal, window) VALUES (?,?,?,?)",
     "tls_direct": "INSERT OR REPLACE INTO tls_direct (ip, port, outcome, data) VALUES (?,?,?,?)",
     "http_res": "INSERT OR REPLACE INTO http_res (ip, port, data) VALUES (?,?,?)",
@@ -229,6 +230,8 @@ class ShardStore:
         self._db.execute("PRAGMA cache_size=-16384")
         self._db.execute("PRAGMA temp_store=FILE")
         self._db.executescript(_SCHEMA)
+        if "seen_at" not in {r[1] for r in self._db.execute("PRAGMA table_info(synack)")}:
+            self._db.execute("ALTER TABLE synack ADD COLUMN seen_at TEXT")      # a store written before the column existed
 
     # -------------------------------------------------------------- lifecycle
 
@@ -454,17 +457,18 @@ class ShardStore:
 
     # -------------------------------------------------------------- SYN-ACK
 
-    def put_synack(self, ip: str, port: int, window: int | None, ttl: int | None) -> None:
-        self._add("synack", (_ip(ip), int(port), window, ttl))
+    def put_synack(self, ip: str, port: int, window: int | None, ttl: int | None, seen_at: str | None = None) -> None:
+        self._add("synack", (_ip(ip), int(port), window, ttl, seen_at))
 
-    def put_synack_port(self, port: int, fields_by_ip: Mapping[str, Mapping[str, int | None]]) -> None:
+    def put_synack_port(self, port: int, fields_by_ip: Mapping[str, Mapping[str, Any]]) -> None:
         """Rows of ``enrich.parse_synack_csv`` for one port sweep."""
-        self._add_many("synack", [(_ip(ip), int(port), f.get("window"), f.get("ttl")) for ip, f in fields_by_ip.items()])
+        self._add_many("synack", [(_ip(ip), int(port), f.get("window"), f.get("ttl"), f.get("seen_at"))
+                                  for ip, f in fields_by_ip.items()])
 
-    def get_synack(self, ip: str, port: int) -> dict[str, int | None]:
-        """{"window", "ttl"}, or {} when the endpoint has no entry (as ``synack.get(ep, {})``)."""
-        rows = self._query("SELECT window, ttl FROM synack WHERE ip = ? AND port = ?", (ip, port))
-        return {"window": rows[0][0], "ttl": rows[0][1]} if rows else {}
+    def get_synack(self, ip: str, port: int) -> dict[str, Any]:
+        """{"window", "ttl", "seen_at"}, or {} when the endpoint has no entry (as ``synack.get(ep, {})``)."""
+        rows = self._query("SELECT window, ttl, seen_at FROM synack WHERE ip = ? AND port = ?", (ip, port))
+        return {"window": rows[0][0], "ttl": rows[0][1], "seen_at": rows[0][2]} if rows else {}
 
     def tarpit_ips(self, tiny_window_below: int) -> set[str]:
         """Addresses with a SYN-ACK window below the threshold on any port (the old ``tarpits()``)."""
@@ -823,7 +827,8 @@ class ShardStore:
         if not ips:
             return []
         eps = self._query_in("SELECT ip, port FROM endpoints WHERE ip IN ({})", ips)
-        synack = {(r[0], r[1]): (r[2], r[3]) for r in self._query_in("SELECT ip, port, window, ttl FROM synack WHERE ip IN ({})", ips)}
+        synack = {(r[0], r[1]): (r[2], r[3], r[4])
+                  for r in self._query_in("SELECT ip, port, window, ttl, seen_at FROM synack WHERE ip IN ({})", ips)}
         tls = {(r[0], r[1]): r[2] for r in self._query_in("SELECT ip, port, data FROM tls_direct WHERE ip IN ({})", ips)}
         http = {(r[0], r[1]): r[2] for r in self._query_in("SELECT ip, port, data FROM http_res WHERE ip IN ({})", ips)}
         names = {(r[0], r[1]): r[2] for r in self._query_in("SELECT ip, port, data FROM names WHERE ip IN ({})", ips)}
@@ -837,7 +842,7 @@ class ShardStore:
         for ip, port in sorted(eps):
             ef = EndpointFacts(ip, port)
             if (ip, port) in synack:
-                ef.synack_window, ef.synack_ttl = synack[(ip, port)]
+                ef.synack_window, ef.synack_ttl, ef.synack_seen_at = synack[(ip, port)]
             if (ip, port) in tls:
                 ef.tls = _load_obj(TlsResult, json.loads(tls[(ip, port)]))
             if (ip, port) in http:

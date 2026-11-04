@@ -49,6 +49,8 @@ from scanner.live_exclusions import OverlayError, overlay_for
 from scanner.models import ToolJob, canonical_json, write_jsonl
 from scanner.safety import OVERLAY_REASON, HostnamePolicyInput, ProductionPolicyInput, TargetPolicy
 from scanner.zdns_runner import ptr_names, resolve, run_zdns
+
+EPOCH_ID_LENGTH = 12        # the same prefix of the config checksum that names the campaign directory
 from scanner.zgrab_runner import ZGrabTarget, run_zgrab_batches
 from scanner.zmap_runner import run_zmap
 
@@ -638,6 +640,38 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
         st.guard("store_close", store.close)
 
 
+def epoch_id(cfg) -> str:
+    """Names the configuration a run was made under, so that runs of different configurations can be told apart."""
+    return cfg.checksum[:EPOCH_ID_LENGTH]
+
+
+def query_resolver_version(address: str, timeout: float = 5.0) -> str | None:
+    """The software version a resolver reports for ``version.bind`` (CHAOS TXT), or None when it says nothing."""
+    import dns.exception
+    import dns.flags
+    import dns.message
+    import dns.query
+    host, _, port = address.partition(":")
+    try:
+        query = dns.message.make_query("version.bind", "TXT", "CH")
+        reply = dns.query.udp(query, host, timeout=timeout, port=int(port) if port else 53)
+        for rrset in reply.answer:
+            for rdata in rrset:
+                text = b"".join(getattr(rdata, "strings", ())).decode("utf-8", "replace").strip()
+                if text:
+                    return text[:200]
+    except (dns.exception.DNSException, OSError, ValueError):
+        pass
+    return None
+
+
+def resolver_identity(cfg) -> list[dict[str, Any]]:
+    """The resolvers of the run for the manifest: address, and the reported version when ``dns.query_resolver_version`` is on."""
+    ask = getattr(cfg.dns, "query_resolver_version", False)
+    return [{"address": r, **({"version": query_resolver_version(r, min(cfg.dns.network_timeout, 5.0))} if ask else {})}
+            for r in cfg.dns.resolvers]
+
+
 def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Path:
     """The manifest of a run that could not get through its write-out: what is known, marked incomplete."""
     manifest = {
@@ -645,7 +679,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
         "run_id": run_id, "started_at": started.isoformat(), "finished_at": datetime.now(UTC).isoformat(),
         "elapsed_seconds": round(time.monotonic() - wall, 3), "stage_seconds": st.timings,
         "stage_errors": st.errors, "stages_skipped": st.skipped, "abort_reason": st.reason,
-        "status": "finished", "complete": False, "config_checksum": cfg.checksum,
+        "status": "finished", "complete": False, "config_checksum": cfg.checksum, "epoch_id": epoch_id(cfg),
         "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
         "shard": {"index": cfg.shard, "of": cfg.shards}, "stage_counts": counts,
         "output_schema": outputs.OUTPUT_SCHEMA, "limitations": LIMITATIONS,
@@ -657,7 +691,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
 
 def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
                      resume_from=None, fetcher_factory=None, *, book, continued=False, not_reused=None) -> Path:
-    from scanner.internet.zmap_compat import output_args, packet_rate_args
+    from scanner.internet.zmap_compat import output_args, packet_rate_args, response_fields
     killed = st.killed
     pace = cfg.measurement.min_seconds_between_probes_per_ip
 
@@ -694,13 +728,14 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         (run_dir / "manifest.json").write_text(json.dumps({
             "schema_version": SCHEMA_VERSION, "experiment": "scanner", "run_id": run_id, "status": "started",
             "complete": False, "started_at": started.isoformat(), "config_checksum": cfg.checksum,
+            "epoch_id": epoch_id(cfg),
             "shard": {"index": cfg.shard, "of": cfg.shards},
             "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
         }, indent=2), encoding="utf-8")
     # A full scan gives ZMap no target count: each shard then covers its whole slice of the allowed space.
     full = cfg.sample_fraction >= 1.0 and not cfg.target_ips
     mview = SimpleNamespace(**{**vars(cfg.measurement), "zmap_max_targets": None if full else splan.targets_per_port,
-                                                    "zmap_output_fields": "saddr,window,ttl",
+                                                    "zmap_output_fields": response_fields(cfg.measurement.zmap_version),
                                                     "zmap_shards": cfg.shards, "zmap_shard": cfg.shard,
                                                     # one sender thread is plenty (and ZMap's default of one per core burns ~12 cores)
                                                     "zmap_sender_threads": 1,
@@ -1377,7 +1412,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         **({"network_done": True} if keep_store else {}),
         # "nothing answered" is only a finding when ZMap actually ran cleanly on every port
         "zero_responsive": counts.get("l4_endpoints", 0) == 0 and st.reason is None and not st.errors,
-        "config_checksum": cfg.checksum, "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
+        "config_checksum": cfg.checksum, "epoch_id": epoch_id(cfg), "resolvers": st.guard("resolvers", lambda: resolver_identity(cfg), []),
+        "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
         "approval_sha256": cfg.approval_sha256, "approval_valid_until": cfg.approval.valid_until.isoformat() if cfg.approval else None,
         "exclusions_sha256": cfg.exclusions_sha256, "exclusion_count": len(exclusions),
         **({"exclusion_overlay": policy.overlay.summary()} if policy.overlay is not None else {}),
@@ -1502,6 +1538,7 @@ def _ip_rows(cfg, g: IpFacts, asn, incomplete: bool) -> tuple[list[dict[str, Any
             **(asn.lookup(ip) if asn else asn_context.empty_fields()),
             "protocol": protocol, **tarpit,
             "synack_window": e.synack_window, "synack_ttl": e.synack_ttl,
+            "l4_seen_at": e.synack_seen_at, "tls_at": t.requested_at if t else None, "http_at": h.requested_at if h else None,
             "tls_status": "success" if t and t.ok else ("not_tls" if t and t.outcome == tlsmod.NOT_TLS else ("failed" if t else "not_attempted")),
             "tls_outcome": t.outcome if t else None,
             "tls_failure_reason": None if (t is None or t.ok) else t.error,
@@ -1519,6 +1556,7 @@ def _ip_rows(cfg, g: IpFacts, asn, incomplete: bool) -> tuple[list[dict[str, Any
             "direct_favicon_mmh3": direct_fav.get("favicon_mmh3"), "direct_favicon_md5": direct_fav.get("favicon_md5"), "direct_favicon_url": direct_fav.get("favicon_url"),
             "direct_document_outcome": direct_fav.get("document_outcome"), "direct_document_status": direct_fav.get("http_status"),
             "direct_document_source": direct_fav.get("document_source"), "direct_document_age_seconds": direct_fav.get("document_age_seconds"),
+            "direct_document_captured_at": direct_fav.get("captured_at"), "direct_favicon_at": direct_fav.get("favicon_at"),
             "direct_document_title": direct_fav.get("document_title"), "direct_document_body_sha256": direct_fav.get("document_body_sha256"),
             "direct_icon_declared_count": direct_fav.get("icon_declared_count"), "direct_icon_offhost_hosts": direct_fav.get("icon_offhost_hosts") or [],
             "direct_icon_embedded_images": direct_fav.get("icon_embedded_images"),
@@ -1528,7 +1566,8 @@ def _ip_rows(cfg, g: IpFacts, asn, incomplete: bool) -> tuple[list[dict[str, Any
             rows.append({**base, "hostname": None, "hostname_sources": [], "dns_status": None, "cname_chain": [],
                          "a_answers": [], "aaaa_answers": [], "maps_to_scanned_ip": None,
                          "sni_confirmation_attempted": False, "sni_confirmation_result": None, "sni_confirmation_outcome": None,
-                         "sni_skipped_reason": None,
+                         "sni_skipped_reason": None, "dns_at": None, "sni_at": None,
+                         "hostname_favicon_at": None, "hostname_document_captured_at": None,
                          "sni_certificate_sha256": None, "sni_certificate_hostname_match": None,
                          "hostname_favicon_outcome": None, "hostname_favicon_is_image": False, "hostname_favicon_sha256": None, "hostname_favicon_file": None, "hostname_favicon_mmh3": None, "hostname_favicon_md5": None,
                          "hostname_favicon_url": None, "hostname_document_title": None, "hostname_icon_offhost_hosts": [],
@@ -1549,6 +1588,8 @@ def _ip_rows(cfg, g: IpFacts, asn, incomplete: bool) -> tuple[list[dict[str, Any
                 "sni_confirmation_attempted": sni is not None,
                 "sni_confirmation_result": _sni_result(sni),
                 "sni_confirmation_outcome": sni.outcome if sni else None,
+                "dns_at": res.queried_at if res else None, "sni_at": sni.requested_at if sni else None,
+                "hostname_favicon_at": hf.get("favicon_at"), "hostname_document_captured_at": hf.get("captured_at"),
                 "sni_certificate_sha256": sni.certificate.sha256 if sni and sni.certificate else None,
                 "sni_certificate_hostname_match": sni.certificate.hostname_matches if sni and sni.certificate else None,
                 "hostname_favicon_outcome": hf.get("favicon_outcome"), "hostname_favicon_is_image": bool(hf.get("favicon_is_image")),

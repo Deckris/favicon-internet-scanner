@@ -35,7 +35,7 @@ from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
 from scanner.favicon_discovery import parse_icon_declarations
 from scanner.live_exclusions import overlay_for
-from scanner.models import FaviconDeclaration
+from scanner.models import FaviconDeclaration, now_iso
 from scanner.safety import HostnamePolicyInput, ProductionPolicyInput, TargetPolicy
 from scanner.web_fetch import FetchLimits, WebFetcher, _is_ip_literal, _RequestOutcome
 
@@ -461,6 +461,12 @@ def _age_seconds(doc: dict[str, Any]) -> float | None:
     return round(max(0.0, time.time() - captured), 1) if isinstance(captured, (int, float)) else None
 
 
+def _captured_iso(doc: dict[str, Any]) -> str | None:
+    """When the HTTP stage fetched a stored page, as UTC ISO 8601 (the page's age is ``document_age_seconds``)."""
+    captured = doc.get("captured_at")
+    return datetime.fromtimestamp(captured, UTC).isoformat() if isinstance(captured, (int, float)) else None
+
+
 def _favicon_outcome(first: Any, image: Any) -> str:
     """image = a decodable image; otherwise say what came back instead (an HTTP error, an HTML page, ...)."""
     if image is not None:
@@ -484,6 +490,7 @@ def fill_icon_fields(record: dict[str, Any], fetcher: Any, *, url: str, ip: str,
                      icon_store: Any = None, selection: str = "all", fallback: str = "always_if_no_image") -> None:
     """Fetch the icons of ``declared`` for the page at ``url`` (reached through ``ip``) and write the favicon fields of ``record``."""
     selection_report: dict[str, Any] = {}
+    record["favicon_at"] = now_iso()        # just before the first icon request
     decls, resources = acquire_favicons(url, None, connect_ip=ip, fetcher=fetcher, max_icons=max_icons, declarations=declared,
                                         on_icon=icon_store.save if icon_store is not None else None,
                                         selection=selection, fallback=fallback, fingerprint=_FINGERPRINTS,
@@ -527,7 +534,7 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
     url = f"{scheme}://{host}:{port}/"
     record: dict[str, Any] = {
         "kind": "hostname" if hostname else "direct_ip", "url": url, "scheme": scheme, "hostname": hostname,
-        "document_outcome": None, "document_source": "fetched", "document_age_seconds": None, "http_status": None, "final_url": None, "content_type": None,
+        "document_outcome": None, "document_source": "fetched", "document_age_seconds": None, "captured_at": None, "favicon_at": None, "http_status": None, "final_url": None, "content_type": None,
         "favicon_url": None, "favicon_file": None, "favicon_sha256": None, "favicon_bytes": None, "favicon_content_type": None,
         "favicon_decode_status": None, "favicon_mmh3": None, "favicon_md5": None, "favicon_outcome": "not_attempted",
         "favicon_is_image": False,
@@ -543,8 +550,9 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
             record.update(document_outcome="ok", document_source="reused", http_status=200, final_url=url,
                           content_type=stored_document["content_type"], document_title=stored_document["document_title"],
                           document_body_sha256=stored_document["document_body_sha256"],
-                          document_age_seconds=_age_seconds(stored_document))
+                          document_age_seconds=_age_seconds(stored_document), captured_at=_captured_iso(stored_document))
         else:
+            requested_at = now_iso()
             result, body = fetcher.fetch(url, connect_ip=ip, kind="document", context=f"scanner:{ip}:{port}")
             record.update(document_outcome=result.outcome, http_status=result.http_status,
                           final_url=result.final_url, content_type=result.content_type)
@@ -555,6 +563,7 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
             if result.outcome == "skipped_network_busy":
                 record["favicon_outcome"] = "skipped_network_busy"      # nothing was sent; a later refetch can redo it
                 return record
+            record["captured_at"] = requested_at
             if result.outcome not in ("ok", "http_status") and result.http_status is None:
                 record["favicon_outcome"] = "document_failed"
                 return record

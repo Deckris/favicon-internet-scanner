@@ -155,7 +155,7 @@ def _scrub(value, tmp: Path):
             return [walk(x) for x in v]
         if key in TIME_KEYS:
             return "<time>"
-        if key == "config_checksum":
+        if key in ("config_checksum", "epoch_id"):
             return "<config>"
         if isinstance(v, str):
             for r in roots:
@@ -188,6 +188,8 @@ def _collect(run_dir: Path, tmp: Path) -> dict[str, bytes]:
         out[rel] = _dump(_scrub(doc, tmp))
     for rel in SCRUBBED_JSONL:
         lines = [_scrub(json.loads(l), tmp) for l in (run_dir / rel).read_text(encoding="utf-8").splitlines()]
+        for line in lines:
+            line.pop("stats", None)         # the counts follow how the targets were cut into batches; test_measurement_context pins them
         out[rel] = b"".join(json.dumps(l, sort_keys=True, ensure_ascii=False).encode() + b"\n" for l in lines)
     for rel in SORTED_LINES:
         if (run_dir / rel).exists():

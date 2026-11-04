@@ -130,9 +130,10 @@ def sha256_file(path: Path) -> str:
 # min_seconds_between_probes_per_ip) and overlap_tls_with_zmap, which
 # changes the traffic pattern, stay in the checksum: raising one needs a new approval. Hosts of one campaign that
 # derive overlap_tls_with_zmap differently set it explicitly in the settings so that it is the same on all of them.
+# dns.query_resolver_version only asks the resolver to name its software for the manifest; it changes no measurement.
 HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
     "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "limiter_socket"),
-    "dns": ("threads",),
+    "dns": ("threads", "query_resolver_version"),
     "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds"),
     # The live exclusions overlay: an opt-out must take effect without starting a new campaign.
     "target_policy": ("exclusions_overlay_file",),
@@ -410,7 +411,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         raise ConfigError("exclusions file checksum does not match target_policy.exclusions_sha256")
     read_exclusions(excl_file)
 
-    d = _section(raw, "dns", {"resolvers", "timeout", "network_timeout", "retries", "threads", "max_cnames", "canary_name"},
+    d = _section(raw, "dns", {"resolvers", "timeout", "network_timeout", "retries", "threads", "max_cnames", "canary_name", "query_resolver_version"},
                  {"resolvers", "timeout", "retries", "threads", "max_cnames"})
     resolvers = d["resolvers"]
     if not isinstance(resolvers, list) or not resolvers:
@@ -434,6 +435,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         threads=_int(d["threads"], "dns.threads", 1, 1000),
         max_cnames=_int(d["max_cnames"], "dns.max_cnames", 1, 32),
         canary_name=str(d.get("canary_name") or "example.com"),
+        query_resolver_version=_bool(d.get("query_resolver_version", False), "dns.query_resolver_version"),
     )
 
     h = _section(raw, "hostnames", {"max_candidates_per_ip"})

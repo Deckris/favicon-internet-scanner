@@ -23,7 +23,13 @@ Output schema 2 (``output_schema`` in the manifest; absent means 1) changes two 
   once the files of its manifest have been re-hashed and the tables the analysis reads are there. The manifest is left
   as it is; ``raw_pruned.json`` records what was removed.
 
-``iter_endpoint_rows`` and ``iter_hostname_rows`` yield the rows of either schema in the schema 1 shape.
+Output schema 3 only adds fields: the time each stage's request was made (``l4_seen_at``, ``tls_at``, ``http_at``,
+``direct_favicon_at``, ``direct_document_captured_at`` on endpoint rows; ``dns_at``, ``sni_at``, ``hostname_favicon_at``,
+``hostname_document_captured_at`` on hostname rows), per-batch ``stats`` on the tool jobs, and the resolver and
+``epoch_id`` in the manifest. Rows of a schema 1 or 2 run lack them; the readers here accept those runs unchanged
+and ``export_csv`` leaves the cells empty.
+
+``iter_endpoint_rows`` and ``iter_hostname_rows`` yield the rows of any schema in the schema 1 shape.
 Both files are written in the same ``(ip, port)`` order, so the join is a single streaming merge.
 """
 from __future__ import annotations
@@ -44,7 +50,7 @@ try:
 except ImportError:         # the run then stores plain files and the manifest says so
     zstandard = None
 
-OUTPUT_SCHEMA = 2
+OUTPUT_SCHEMA = 3
 ZSTD_LEVEL = 3
 COMPACT_LEVEL = 12          # about 20 times faster than level 19 for a few percent more bytes (measured); paid once per shard
 COMPRESSION = "zstd" if zstandard is not None else "none"
@@ -61,9 +67,16 @@ HOSTNAME_FIELDS = frozenset({
     "hostname_favicon_outcome", "hostname_favicon_is_image", "hostname_favicon_sha256", "hostname_favicon_file",
     "hostname_favicon_mmh3", "hostname_favicon_md5", "hostname_favicon_url", "hostname_document_title",
     "hostname_icon_offhost_hosts", "hostname_icon_embedded_images", "final_hostname_status", "icon_scope",
+    "dns_at", "sni_at", "hostname_favicon_at", "hostname_document_captured_at",
 })
 
-# Column order of hostname_resolution.csv. The columns up to ``direct_icon_embedded_images`` are the endpoint's;
+# Fields added by output schema 3; rows of an older run do not have them.
+CONTEXT_FIELDS = frozenset({
+    "l4_seen_at", "tls_at", "http_at", "direct_favicon_at", "direct_document_captured_at",
+    "dns_at", "sni_at", "hostname_favicon_at", "hostname_document_captured_at",
+})
+
+# Column order of hostname_resolution.csv. The columns up to ``direct_document_captured_at`` are the endpoint's;
 # the rest follow in the order of the first row, which differs between an address with names and one without
 # (``sni_skipped_reason`` sits before or after the other SNI columns), so the first row picks the layout.
 _ENDPOINT_COLUMNS = (
@@ -79,6 +92,7 @@ _ENDPOINT_COLUMNS = (
     "direct_favicon_mmh3", "direct_favicon_md5", "direct_favicon_url", "direct_document_outcome",
     "direct_document_status", "direct_document_title", "direct_document_body_sha256", "direct_icon_declared_count",
     "direct_icon_offhost_hosts", "direct_icon_embedded_images",
+    "l4_seen_at", "tls_at", "http_at", "direct_favicon_at", "direct_document_captured_at",
 )
 _NAME_HEAD = ("hostname", "hostname_sources", "dns_status", "cname_chain", "a_answers", "aaaa_answers", "maps_to_scanned_ip")
 _NAME_TAIL = (
@@ -86,6 +100,7 @@ _NAME_TAIL = (
     "hostname_favicon_outcome", "hostname_favicon_is_image", "hostname_favicon_sha256", "hostname_favicon_file",
     "hostname_favicon_mmh3", "hostname_favicon_md5", "hostname_favicon_url", "hostname_document_title",
     "hostname_icon_offhost_hosts", "hostname_icon_embedded_images", "final_hostname_status", "icon_scope",
+    "dns_at", "sni_at", "hostname_favicon_at", "hostname_document_captured_at",
 )
 CSV_COLUMNS_NAMED = (_ENDPOINT_COLUMNS + _NAME_HEAD
                      + ("sni_skipped_reason", "sni_confirmation_attempted", "sni_confirmation_result", "sni_confirmation_outcome")
@@ -251,7 +266,7 @@ def export_csv(run_dir: Any, out_path: Any | None = None) -> Path:
         for row in iter_hostname_rows(run_dir):
             if columns is None:
                 columns = CSV_COLUMNS_UNNAMED if row["hostname"] is None else CSV_COLUMNS_NAMED
-            sink.write({c: row[c] for c in columns})
+            sink.write({c: row.get(c) if c in CONTEXT_FIELDS else row[c] for c in columns})
     return out_path
 
 

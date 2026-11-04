@@ -119,6 +119,8 @@ class FakeTools:
         self.windows: dict[tuple[str, int], int] = {}      # SYN-ACK window per endpoint (default: a normal 64240)
         self.commands: list[list[str]] = []
         self.zdns_inputs: dict[str, list[str]] = {}
+        self.http_stamp: str | None = None                   # the timestamp the http module prints, when a test wants one
+        self.dns_stamp: str | None = None                    # the timestamp zdns prints per lookup, when a test wants one
         self.zgrab_ips: list[str] = []                       # every address ZGrab2 was asked to contact
 
     def __call__(self, command: list[str], **kw: Any) -> Any:
@@ -140,7 +142,8 @@ class FakeTools:
         port = int(c[c.index("-p") + 1])
         out = Path(c[c.index("-o") + 1])
         assert c[c.index("-f") + 1].split(",")[0] == "saddr"          # the address must stay the first column
-        out.write_text("".join(f"{ip},{self.windows.get((ip, port), 64240)},64\n" for ip in self.l4.get(port, [])), encoding="utf-8")
+        assert c[c.index("-f") + 1] in ("saddr,window,ttl,timestamp-str", "saddr,window,ttl,timestamp_str")
+        out.write_text("".join(f"{ip},{self.windows.get((ip, port), 64240)},64,{ZMAP_STAMP}\n" for ip in self.l4.get(port, [])), encoding="utf-8")
         return SimpleNamespace(returncode=self.zmap_rc, stdout="", stderr="" if not self.zmap_rc else "zmap boom")
 
     def _zgrab(self, c: list[str], stdin: str) -> Any:
@@ -158,7 +161,7 @@ class FakeTools:
                 if status is None:
                     lines.append(json.dumps({"ip": ip, "data": {"http": {"status": "connection-timeout", "error": "no http"}}}))
                 else:
-                    lines.append(json.dumps({"ip": ip, "data": {"http": {"status": "success", "result": {"response": {
+                    lines.append(json.dumps({"ip": ip, "data": {"http": {"status": "success", **({"timestamp": self.http_stamp} if self.http_stamp else {}), "result": {"response": {
                         "status_code": status, "headers": {"content_type": ["text/html"]}, "body": PAGE}}}}}))
         return SimpleNamespace(returncode=0, stdout="\n".join(lines) + ("\n" if lines else ""), stderr="")
 
@@ -176,7 +179,7 @@ class FakeTools:
             data: dict[str, Any] = {"resolver": "9.9.9.9:53", "protocol": "udp"}
             if answers:
                 data["answers"] = answers
-            return {"name": name, "results": {module: {"status": status, "data": data}}}
+            return {"name": name, "results": {module: {"status": status, "data": data, **({"timestamp": self.dns_stamp} if self.dns_stamp else {})}}}
         if module == "PTR":
             hosts = self.ptr.get(name, [])
             if not hosts:
@@ -205,6 +208,8 @@ def make_png() -> bytes:
 
 
 # The page both the HTTP stage (zgrab2) and the favicon fetcher serve, so reusing it can be compared with fetching it.
+ZMAP_STAMP = "2026-10-04T17:52:40.123Z"         # what the fake ZMap prints as the response time
+HTTP_STAMP = "2026-10-04T19:53:00+02:00"        # what the fake ZGrab2 http module prints (not UTC, as the real tool may not)
 PAGE = '<html><head><link rel="icon" href="/fav.png"></head></html>'
 
 

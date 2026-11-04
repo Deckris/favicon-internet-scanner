@@ -120,9 +120,11 @@ def test_favicon_records_feed_write_index_as_an_iterator(store, tmp_path):
 
 def test_synack_ptr_and_sent_markers(store):
     store.put_endpoints([("10.0.0.1", 80), ("10.0.0.1", 443), ("10.0.0.2", 80), ("10.0.0.3", 80)])
-    store.put_synack_port(80, {"10.0.0.1": {"window": 0, "ttl": 64}, "10.0.0.2": {"window": 64240, "ttl": None}})
+    store.put_synack_port(80, {"10.0.0.1": {"window": 0, "ttl": 64, "seen_at": "2026-10-04T17:52:40+00:00"},
+                               "10.0.0.2": {"window": 64240, "ttl": None}})
     store.put_synack("10.0.0.3", 80, None, 55)
-    assert store.get_synack("10.0.0.1", 80) == {"window": 0, "ttl": 64} and store.get_synack("10.0.0.9", 80) == {}
+    assert store.get_synack("10.0.0.1", 80) == {"window": 0, "ttl": 64, "seen_at": "2026-10-04T17:52:40+00:00"}
+    assert store.get_synack("10.0.0.2", 80)["seen_at"] is None and store.get_synack("10.0.0.9", 80) == {}
     assert store.tarpit_ips(246) == {"10.0.0.1"}
     store.put_synack("10.0.0.2", 443, 10, 1)
     assert store.tarpit_ips(246) == {"10.0.0.1", "10.0.0.2"}

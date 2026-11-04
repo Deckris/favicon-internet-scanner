@@ -24,6 +24,17 @@ def packet_rate_args(version: str, packet_rate: int, probes: int) -> int:
     return packet_rate // probes
 
 
+def response_fields(version: str) -> str:
+    """The ``-f`` list for the sweep: address first, then what each SYN-ACK carried and when it arrived.
+
+    The last field is ZMap's own receive time of the response (ISO 8601). 4.4.0 names it ``timestamp_str``
+    (``zmap --list-output-fields``); 2.1.x used ``timestamp-str``.
+    """
+    if not supported(version):
+        raise ValueError(f"unsupported ZMap version: {version}")
+    return "saddr,window,ttl,timestamp_str" if version == "4.4.0" else "saddr,window,ttl,timestamp-str"
+
+
 def output_args(version: str) -> list[str]:
     if not supported(version):
         raise ValueError(f"unsupported ZMap version: {version}")

@@ -22,8 +22,8 @@ from typing import Any, Callable
 
 from scanner.certificates import parse_der
 from scanner.internet import outputs
-from scanner.internet.runner import capture_stdout, iter_lines
-from scanner.models import CertificateInfo, ToolJob, stable_id
+from scanner.internet.runner import capture_stdout, iter_lines, zgrab_batch_stats
+from scanner.models import CertificateInfo, ToolJob, stable_id, utc_iso
 from scanner.safety import OVERLAY_REASON
 
 Executor = Callable[..., Any]
@@ -58,6 +58,7 @@ class TlsResult:
     certificate: CertificateInfo | None
     cert_parse_error: str | None
     raw_line_sha256: str
+    requested_at: str | None = None      # ZGrab2's own time of the handshake, UTC ISO 8601
 
     @property
     def ok(self) -> bool:
@@ -120,7 +121,7 @@ def parse_line(line: str, *, port: int, sni: str | None, mode: str) -> TlsResult
         outcome = classify(status, error, bool(hl))
         if outcome == OK and cert is None and cert_err:
             outcome = OK   # handshake worked; the parser error is retained separately
-        return TlsResult(ip, port, sni, status, outcome, error, version, cipher, cert, cert_err, sha)
+        return TlsResult(ip, port, sni, status, outcome, error, version, cipher, cert, cert_err, sha, utc_iso(node.get("timestamp")))
     except Exception as exc:
         return TlsResult("", port, sni, "parse_error", PARSE_ERROR, str(exc)[:300], None, None, None, None, sha)
 
@@ -214,7 +215,8 @@ def run_tls_batches(
                 res = parse_line(line, port=port, sni=key[1], mode=mode)
                 if key in wanted and not res.ip:
                     # Valid JSON for a wanted target but an unexpected shape: keep the target attached to its record.
-                    res = TlsResult(key[0], port, key[1], res.zgrab_status, PARSE_ERROR, res.error, None, None, None, None, res.raw_line_sha256)
+                    res = TlsResult(key[0], port, key[1], res.zgrab_status, PARSE_ERROR, res.error, None, None, None, None, res.raw_line_sha256,
+                                     res.requested_at)
                 if key in wanted:
                     wanted.discard(key)
                     chunk_results.append(res)
@@ -232,6 +234,7 @@ def run_tls_batches(
                 input_count=len(chunk), output_count=len(chunk_results), exit_code=code,
                 raw_path=str(out_path.relative_to(run_dir)), raw_sha256=raw_sha256,
                 started_at=started, finished_at=finished, error=error,
+                stats=zgrab_batch_stats(r.zgrab_status for r in chunk_results),
             ))
             results.extend(chunk_results)
     return jobs, results
