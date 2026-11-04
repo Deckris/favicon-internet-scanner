@@ -1,0 +1,7 @@
+[
+  {"id": 1000001, "issuer_name": "C=XX, O=Example Test CA, CN=Example Test CA R1", "name_value": "www.alpha.example\nalpha.example\n*.alpha.example", "entry_timestamp": "2025-03-01T10:15:30.123", "not_before": "2025-03-01T09:00:00"},
+  {"id": 1000002, "issuer_name": "C=XX, O=Example Test CA, CN=Example Test CA R2", "name_value": "beta.test\n198.51.100.7\nnot a name", "not_before": "2025-03-02T00:00:00"},
+  {"id": 1000003, "issuer_name": "C=XX, O=Other Test CA", "name_value": "xn--bcher-kva.example\nBÜCHER.example."},
+  {"id": 1000004, "name_value": 12345},
+  "junk"
+]
