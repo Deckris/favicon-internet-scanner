@@ -8,6 +8,7 @@ Exit codes: 0 complete, 2 refused (config, approval, preflight, confirmation, or
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -292,6 +293,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--label", help="init: run label")
     ap.add_argument("--exclusions", type=Path, help="init: exclusion list file (copied into the work folder)")
     ap.add_argument("--force", action="store_true", help="init: overwrite an existing settings.yaml")
+    ap.add_argument("--exclusions-overlay", type=Path, metavar="FILE",
+                    help="run, plan, favicon-stage: live opt-out file (one CIDR per line), re-read while the run goes; "
+                         "overrides target_policy.exclusions_overlay_file and is not part of the config checksum")
     ap.add_argument("--add", nargs="+", metavar="CIDR", help="exclusions: ranges to add")
     ap.add_argument("--from-file", type=Path, help="exclusions: file of ranges to add")
     ap.add_argument("--offline", action="store_true", help="preflight: skip the DNS canary (no network)")
@@ -467,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result["ok"] else 3
     try:
         cfg = load_config(args.config)
+        if args.exclusions_overlay:
+            cfg = dataclasses.replace(cfg, exclusions_overlay_file=args.exclusions_overlay)
     except ConfigError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

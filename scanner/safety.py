@@ -12,7 +12,7 @@ import threading
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import urlsplit
 
 from scanner.models import PolicyRefusal
@@ -140,6 +140,9 @@ class PolicyRefused(Exception):
         self.refusal = refusal
 
 
+OVERLAY_REASON = "excluded_overlay"
+
+
 @dataclass
 class TargetPolicy:
     profile: str
@@ -149,6 +152,7 @@ class TargetPolicy:
     _hostname_suffixes: tuple[str, ...] = ()
     _deny_all: bool = False
     refusals: list[PolicyRefusal] = field(default_factory=list)
+    overlay: Any = field(default=None, repr=False, compare=False)      # live exclusions (scanner.live_exclusions), or None
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _population_index: _NetSet = field(init=False, repr=False, compare=False)
     _exclusion_index: _NetSet = field(init=False, repr=False, compare=False)
@@ -256,6 +260,9 @@ class TargetPolicy:
                     return self._record(stage, ip, reason, context)
         if v4 in self._exclusion_index:
             return self._record(stage, ip, "excluded_prefix", context)
+        if self.overlay is not None and self.overlay.contains(v4):
+            self.overlay.count_drop(stage)
+            return self._record(stage, ip, OVERLAY_REASON, context)
         if not self._allow_special_use:
             for net in _LAB_TEST_NETS:
                 if v4 in net:
@@ -312,6 +319,42 @@ class TargetPolicy:
 
     def exclusion_cidrs(self) -> list[str]:
         return sorted(str(net) for net in self._exclusions)
+
+    # ---------------------------------------------------------------- live exclusions overlay
+
+    def attach_overlay(self, overlay: Any) -> "TargetPolicy":
+        self.overlay = overlay
+        return self
+
+    def refresh_overlay(self) -> None:
+        """Re-read the overlay now if its file changed. Called before every batch and every ZMap sweep."""
+        if self.overlay is not None:
+            self.overlay.refresh(force=True)
+
+    def blocklist_cidrs(self) -> list[str]:
+        """What ZMap's blocklist must hold for a sweep that starts now: the base exclusions plus the overlay."""
+        self.refresh_overlay()
+        extra = self.overlay.cidrs() if self.overlay is not None else []
+        return sorted(set(self.exclusion_cidrs()) | set(extra))
+
+    def drop_overlay(self, items: list[Any], ip_of: Any, *, stage: str, label: str) -> list[Any]:
+        """The items whose address the overlay does not exclude, checked against the overlay as it is now.
+
+        Records the batch (size, dropped, overlay checksum) when an overlay is attached; without one the list is
+        returned unchanged."""
+        if self.overlay is None:
+            return items
+        self.refresh_overlay()
+        kept = []
+        for it in items:
+            parsed = _as_ip(ip_of(it))
+            if isinstance(parsed, ipaddress.IPv4Address) and self.overlay.contains(parsed):
+                self.overlay.count_drop(stage)
+                self._record(stage, ip_of(it), OVERLAY_REASON, label)
+            else:
+                kept.append(it)
+        self.overlay.note_batch(stage, label, len(items), len(items) - len(kept))
+        return kept
 
 
 @dataclass(frozen=True)

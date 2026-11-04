@@ -22,6 +22,7 @@ from typing import Any, Callable
 from scanner.internet import outputs
 from scanner.internet.runner import capture_stdout, iter_lines
 from scanner.models import CertificateInfo, ToolJob, ZGrabResult, stable_id
+from scanner.safety import OVERLAY_REASON
 
 # Go network errors name the local ephemeral port ("tcp 192.0.2.10:59130->");
 # it changes on every run and carries no measurement meaning.
@@ -202,14 +203,21 @@ def run_zgrab_batches(
                 raise ValueError("hostname_aware targets must have a hostname")
 
     allowed: list[ZGrabTarget] = []
+    overlay = getattr(policy, "overlay", None)
+    policy.refresh_overlay() if overlay is not None else None
+    overlay_dropped = 0
     for target in targets:
-        if policy.check_ip(target.ip, stage="zgrab", context=f"zgrab:{mode}:{scheme}:port={target.port}") is not None:
+        refusal = policy.check_ip(target.ip, stage="zgrab", context=f"zgrab:{mode}:{scheme}:port={target.port}")
+        if refusal is not None:
+            overlay_dropped += refusal.reason == OVERLAY_REASON
             continue
         if target.hostname and policy.check_hostname(target.hostname, stage="zgrab", context=f"zgrab:{mode}:{scheme}") is not None:
             continue
         allowed.append(target)
 
     allowed.sort(key=lambda t: (t.ip, t.port, t.hostname or ""))
+    if overlay is not None:
+        overlay.note_batch("zgrab", f"{mode}:{scheme}", len(targets), overlay_dropped)
 
     by_port: dict[int, list[ZGrabTarget]] = {}
     for target in allowed:
@@ -224,6 +232,9 @@ def run_zgrab_batches(
 
     for port in sorted(by_port):
         for chunk in _chunks(by_port[port], batch_size):
+            chunk = policy.drop_overlay(chunk, lambda t: t.ip, stage="zgrab", label=f"{mode}:{scheme}:port={port}:chunk")
+            if not chunk:
+                continue
             job_id = stable_id("ZGRAB", scheme, mode, port, [(t.ip, t.hostname, t.port) for t in chunk])
             input_text = "".join(_input_line(t) + "\n" for t in chunk)
             output_path = raw_dir / outputs.raw_name(job_id)

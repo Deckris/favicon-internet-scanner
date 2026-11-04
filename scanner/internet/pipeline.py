@@ -45,8 +45,9 @@ from scanner.internet import tls as tlsmod
 from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, resolvers_are_local, sha256_file, shared_config_checksum
 from scanner.internet.runner import ManagedExecutor
 from scanner.internet.shardstore import EndpointFacts, IpFacts, ShardStore
+from scanner.live_exclusions import OverlayError, overlay_for
 from scanner.models import ToolJob, canonical_json, write_jsonl
-from scanner.safety import HostnamePolicyInput, ProductionPolicyInput, TargetPolicy
+from scanner.safety import OVERLAY_REASON, HostnamePolicyInput, ProductionPolicyInput, TargetPolicy
 from scanner.zdns_runner import ptr_names, resolve, run_zdns
 from scanner.zgrab_runner import ZGrabTarget, run_zgrab_batches
 from scanner.zmap_runner import run_zmap
@@ -88,6 +89,13 @@ def build_policy(cfg: ScanConfig) -> tuple[TargetPolicy, pop.SamplePlan, list[st
         hostname_policy=HostnamePolicyInput(cfg.hostname_mode, cfg.hostname_suffixes),
         exclusions=tuple(exclusions),
     ))
+    try:
+        overlay = overlay_for(cfg.exclusions_overlay_file)
+    except OverlayError as exc:
+        raise ConfigError(str(exc)) from exc
+    if overlay is not None:
+        overlay.begin_run()
+        policy.attach_overlay(overlay)
     return policy, splan, exclusions
 
 
@@ -734,11 +742,21 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         for ip in listed:
             send_order.setdefault(ip, len(send_order))
         found = sorted(set(listed), key=lambda x: tuple(int(o) for o in x.split(".")))
-        sample_ips.extend(ip for ip in found if policy.check_ip(ip, stage="zmap", context="sample_list") is None)
+        # The listing uses the base exclusions, which the plan counts; addresses opted out through the overlay are
+        # left out of the list and counted as expected.
+        overlay_dropped = 0
+        for ip in found:
+            refusal = policy.check_ip(ip, stage="zmap", context="sample_list")
+            if refusal is None:
+                sample_ips.append(ip)
+            elif refusal.reason == OVERLAY_REASON:
+                overlay_dropped += 1
+        if overlay_dropped and policy.overlay is not None:
+            policy.overlay.note_batch("zmap", "sample_list", len(found), overlay_dropped)
         expected = splan.targets_per_port
         # Shards of a full scan are slices of ZMap's permutation, so their sizes vary a little around the even share.
         low, high = (0.9, 1.1) if full and cfg.shards > 1 else (0.99, 1.0001)
-        if st.guards and not expected * low <= len(sample_ips) <= expected * high + 1:
+        if st.guards and not expected * low <= len(sample_ips) + overlay_dropped <= expected * high + 1:
             # Live runs only: a dry run that does not reproduce the plan means -n / --shards / the allowlist is not
             # doing what we think, so nothing is scanned. (The dry run sends nothing.)
             st.reason = "sample_list_mismatch"
@@ -1314,6 +1332,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                                                                        sorted(js_rows, key=lambda r: (r["ip"], r["port"])))
         if cfg.favicon.offhost.enabled:
             checksums["normalized/offhost_icon_fetches.jsonl"] = write_jsonl(normalized / "offhost_icon_fetches.jsonl", offhost_log)
+        if policy.overlay is not None:
+            checksums["normalized/exclusion_overlay.jsonl"] = write_jsonl(normalized / "exclusion_overlay.jsonl", policy.overlay.records())
         checksums["normalized/policy_refusals.jsonl"] = write_jsonl(normalized / "policy_refusals.jsonl", [r.as_dict() for r in policy.refusals])
         if tarpit_ips:
             checksums["normalized/tarpit_rejections.jsonl"] = write_jsonl(
@@ -1360,6 +1380,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         "config_checksum": cfg.checksum, "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
         "approval_sha256": cfg.approval_sha256, "approval_valid_until": cfg.approval.valid_until.isoformat() if cfg.approval else None,
         "exclusions_sha256": cfg.exclusions_sha256, "exclusion_count": len(exclusions),
+        **({"exclusion_overlay": policy.overlay.summary()} if policy.overlay is not None else {}),
         "shard": {"index": cfg.shard, "of": cfg.shards, "total_targets": splan.total_targets},
         "sample": {"fraction": cfg.sample_fraction, "seed": cfg.sample_seed, "target_ips": list(cfg.target_ips),
                    "target_hostnames": list(cfg.target_hostnames), "allowed_addresses": splan.allowed_addresses,

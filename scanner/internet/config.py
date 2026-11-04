@@ -108,6 +108,7 @@ class ScanConfig:
     tarpit: SimpleNamespace = field(default_factory=lambda: SimpleNamespace(min_open_ports=4, tiny_window_below=246))
     max_sample_fraction: float = 0.0
     approval_sha256: str = ""
+    exclusions_overlay_file: Path | None = None    # live opt-outs, re-read while a run goes; host-local, not in the checksum
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -133,10 +134,12 @@ HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
     "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "limiter_socket"),
     "dns": ("threads",),
     "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds"),
+    # The live exclusions overlay: an opt-out must take effect without starting a new campaign.
+    "target_policy": ("exclusions_overlay_file",),
 }
 # Parts that also differ between hosts of one campaign and so are left out of ``shared_checksum``.
 HOST_LOCAL_SECTIONS = ("vantage", "output", "operations", "binaries")
-HOST_LOCAL_POLICY_KEYS = ("exclusions_file", "approval_file")
+HOST_LOCAL_POLICY_KEYS = ("exclusions_file", "approval_file", "exclusions_overlay_file")
 
 
 def _without_host_derived(raw: dict[str, Any]) -> dict[str, Any]:
@@ -392,7 +395,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
 
-    tp = _section(raw, "target_policy", {"exclusions_file", "exclusions_sha256", "approval_file", "hostname_policy"})
+    tp = _section(raw, "target_policy", {"exclusions_file", "exclusions_sha256", "approval_file", "hostname_policy", "exclusions_overlay_file"},
+                  {"exclusions_file", "exclusions_sha256", "approval_file", "hostname_policy"})
     hp = tp["hostname_policy"]
     if not isinstance(hp, dict) or set(hp) - {"mode", "suffixes"} or hp.get("mode") not in ("any_public", "suffix_allowlist"):
         raise ConfigError("target_policy.hostname_policy needs mode any_public|suffix_allowlist")
@@ -487,6 +491,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
         compact_outputs=_bool(out.get("compact", True), "output.compact"),
         prune_raw_keep_every=_int(out.get("prune_raw_keep_every", 0), "output.prune_raw_keep_every", 0, 10**6),
         stall_minutes=_int(ops.get("stall_minutes", 30), "operations.stall_minutes", 0, 10**5),
+        exclusions_overlay_file=rel(tp["exclusions_overlay_file"]) if tp.get("exclusions_overlay_file") else None,
         exclusions_file=excl_file, exclusions_sha256=str(tp["exclusions_sha256"]).lower(),
         approval_file=rel(tp["approval_file"]),
         hostname_mode=hp["mode"], hostname_suffixes=suffixes, dns=dns,

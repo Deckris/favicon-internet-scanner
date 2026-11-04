@@ -24,6 +24,7 @@ from scanner.certificates import parse_der
 from scanner.internet import outputs
 from scanner.internet.runner import capture_stdout, iter_lines
 from scanner.models import CertificateInfo, ToolJob, stable_id
+from scanner.safety import OVERLAY_REASON
 
 Executor = Callable[..., Any]
 
@@ -149,13 +150,20 @@ def run_tls_batches(
     if mode == "direct_ip" and any(t[2] for t in targets):
         raise ValueError("direct_ip targets must not carry a hostname")
     allowed: list[tuple[str, int, str | None]] = []
+    overlay = getattr(policy, "overlay", None)
+    policy.refresh_overlay() if overlay is not None else None
+    overlay_dropped = 0
     for ip, port, host in targets:
-        if policy.check_ip(ip, stage="zgrab", context=f"tls:{mode}:port={port}") is not None:
+        refusal = policy.check_ip(ip, stage="zgrab", context=f"tls:{mode}:port={port}")
+        if refusal is not None:
+            overlay_dropped += refusal.reason == OVERLAY_REASON
             continue
         if host and policy.check_hostname(host, stage="zgrab", context=f"tls:{mode}") is not None:
             continue
         allowed.append((ip, port, host))
     allowed = sorted(set(allowed), key=lambda t: (t[1], t[0], t[2] or ""))
+    if overlay is not None:
+        overlay.note_batch("zgrab", f"tls:{mode}", len(targets), overlay_dropped)
 
     raw_dir = Path(run_dir) / "raw" / "zgrab"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +175,9 @@ def run_tls_batches(
     results: list[TlsResult] = []
     for port in sorted(by_port):
         for chunk in _chunks(by_port[port], cfg.measurement.zgrab_batch_size):
+            chunk = policy.drop_overlay(chunk, lambda t: t[0], stage="zgrab", label=f"tls:{mode}:port={port}:chunk")
+            if not chunk:
+                continue
             job_id = stable_id("ZGRABTLS", mode, port, [(t[0], t[2]) for t in chunk])
             out_path = raw_dir / outputs.raw_name(job_id)
             command = [
