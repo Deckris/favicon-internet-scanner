@@ -147,14 +147,23 @@ def test_public_attributes_and_cidr_listings_unchanged():
 
 
 def test_large_slash32_population_checks_are_fast():
+    """The cost of a check must not grow with the population: a scan of 80 000 networks would be thousands of times slower."""
     rng = random.Random(11)
     values = {rng.getrandbits(32) for _ in range(80_000)}
-    cidrs = [f"{ipaddress.IPv4Address(v)}/32" for v in values]
-    policy = TargetPolicy.for_tests(cidrs)
     members = list(values)[:5000]
     probes = [str(ipaddress.IPv4Address(v)) for v in members]
     probes += [str(ipaddress.IPv4Address(rng.getrandbits(32))) for _ in range(5000)]
-    start = time.perf_counter()
-    for ip in probes:
-        policy.check_ip(ip, stage="s")
-    assert time.perf_counter() - start < 0.5
+
+    def best_of(policy, rounds=3):
+        best = float("inf")
+        for _ in range(rounds):
+            start = time.perf_counter()
+            for ip in probes:
+                policy.check_ip(ip, stage="s")
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    small = TargetPolicy.for_tests([f"{ipaddress.IPv4Address(v)}/32" for v in members[:16]])
+    large = TargetPolicy.for_tests([f"{ipaddress.IPv4Address(v)}/32" for v in values])
+    baseline = best_of(small)
+    assert best_of(large) < 10 * baseline + 0.05
