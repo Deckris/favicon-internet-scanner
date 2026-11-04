@@ -1,15 +1,19 @@
-"""Output schema 2: slim hostname rows, zstd raw files, and the readers that hide both.
+"""Output schema 2 and 3: slim hostname rows, zstd raw files, the context times, and the readers that hide them.
 
-``tests/golden_v1/`` holds the files a schema 1 run wrote for each golden scenario. A schema 2 run of the same
-scenario must give back exactly those rows, that CSV, the same endpoint and address tables, and raw tool output
-whose decompressed bytes carry the checksums the schema 1 manifest recorded.
+``tests/golden_v1/`` holds the files a schema 1 run wrote for each golden scenario. A run of the same
+scenario at the current schema must give back, apart from the schema 3 context fields,
+exactly those rows, that CSV, the same endpoint and address tables, and
+raw tool output whose decompressed bytes carry the checksums the schema 1 manifest recorded.
 """
+import csv
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tracemalloc
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,7 +23,7 @@ from scanner.internet.__main__ import main
 from scanner.internet.config import load_config
 from scanner.internet.runner import ManagedExecutor, _pump_to_file, capture_stdout, iter_lines
 from tests.helpers import write_config
-from tests.test_golden_outputs import SCENARIOS
+from tests.test_golden_outputs import SCENARIOS, fixed_observation_time, fixed_page_times  # noqa: F401  (autouse: pin clock-derived fields)
 from tests.test_pipeline import go, tools
 
 GOLDEN_V1 = Path(__file__).parent / "golden_v1"
@@ -37,29 +41,55 @@ def _sha(data: bytes) -> str:
 
 # ------------------------------------------------------------------ equivalence with the schema 1 goldens
 
+CONTEXT = outputs.CONTEXT_FIELDS
+
+
+def _drop_context(row: dict) -> dict:
+    return {k: v for k, v in row.items() if k not in CONTEXT}
+
+
+def _jsonl_rows(raw: bytes) -> list[dict]:
+    return [json.loads(l) for l in _lf(raw).decode("utf-8").splitlines()]
+
+
+def _csv_without_context(raw: bytes) -> tuple[list[str], list[list[str]]]:
+    rows = list(csv.reader(io.StringIO(_lf(raw).decode("utf-8"), newline="")))
+    if not rows:
+        return [], []
+    keep = [i for i, c in enumerate(rows[0]) if c not in CONTEXT]
+    return [rows[0][i] for i in keep], [[r[i] for i in keep] for r in rows[1:]]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="golden files are generated on Linux")
 @pytest.mark.parametrize("name", sorted(SCENARIOS))
-def test_schema_2_run_reproduces_the_schema_1_outputs(name, tmp_path):
+def test_schema_3_run_reproduces_the_schema_1_outputs_apart_from_the_context_fields(name, tmp_path):
     cfg, ft, fetcher = SCENARIOS[name](tmp_path)
     run_dir = pipeline.run(cfg, run_id="t1", executor=ft, fetcher=fetcher, skip_preflight=True, offline_preflight=True)
     old = GOLDEN_V1 / name
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["output_schema"] == 2 and not (run_dir / "normalized" / "hostname_resolution.csv").exists()
+    assert manifest["output_schema"] == outputs.OUTPUT_SCHEMA == 3
+    assert not (run_dir / "normalized" / "hostname_resolution.csv").exists()
 
     # (a) the hostname rows, parsed, in order
     expected = [json.loads(l) for l in (old / "normalized" / "hostname_resolution.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert list(outputs.iter_hostname_rows(run_dir)) == expected
+    assert [_drop_context(r) for r in outputs.iter_hostname_rows(run_dir)] == expected
 
     # (b) the CSV
     csv_path = outputs.export_csv(run_dir, tmp_path / "export.csv")
-    assert _lf(csv_path.read_bytes()) == (old / "normalized" / "hostname_resolution.csv").read_bytes()
+    assert _csv_without_context(csv_path.read_bytes()) == _csv_without_context(
+        (old / "normalized" / "hostname_resolution.csv").read_bytes())
 
-    # (c) the tables that did not change
-    for rel in ("normalized/endpoints.jsonl", "ip_results.csv", "favicons/index.jsonl"):
+    # (c) the tables that did not change in kind
+    for rel in ("normalized/endpoints.jsonl", "favicons/index.jsonl"):
         if (old / rel).exists():
-            assert _lf((run_dir / rel).read_bytes()) == (old / rel).read_bytes(), rel
+            got = _jsonl_rows((run_dir / rel).read_bytes())
+            assert [_drop_context(r) for r in got] == _jsonl_rows((old / rel).read_bytes()), rel
         else:
             assert not (run_dir / rel).exists(), rel
+    if (old / "ip_results.csv").exists():
+        assert _lf((run_dir / "ip_results.csv").read_bytes()) == (old / "ip_results.csv").read_bytes()
+    else:
+        assert not (run_dir / "ip_results.csv").exists()
 
     # (d) raw tool output: the stored files are compressed, the content is what the schema 1 manifest checksummed
     old_sums = json.loads((old / "manifest.json").read_text(encoding="utf-8"))["output_checksums"]
@@ -74,6 +104,37 @@ def test_schema_2_run_reproduces_the_schema_1_outputs(name, tmp_path):
     for job in map(json.loads, (run_dir / "normalized" / "tool_jobs.jsonl").read_text().splitlines()):
         if job["raw_path"].startswith(("raw/zgrab/", "raw/zdns/")):
             assert job["raw_sha256"] == manifest["output_checksums"][job["raw_path"].replace("\\", "/")]
+
+
+@pytest.mark.parametrize("name", sorted(SCENARIOS))
+def test_schema_3_rows_carry_every_context_field_as_a_utc_time_or_null(name, tmp_path):
+    cfg, ft, fetcher = SCENARIOS[name](tmp_path)
+    run_dir = pipeline.run(cfg, run_id="t1", executor=ft, fetcher=fetcher, skip_preflight=True, offline_preflight=True)
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["output_schema"] == 3 and manifest["epoch_id"] == manifest["config_checksum"][:12]
+    endpoint_fields = {"l4_seen_at", "tls_at", "http_at", "direct_favicon_at", "direct_document_captured_at"}
+    hostname_fields = CONTEXT - endpoint_fields
+    endpoints = list(outputs.iter_endpoint_rows(run_dir))
+    hostnames = [json.loads(l) for l in (run_dir / "normalized" / "hostname_resolution.jsonl").read_text().splitlines()]
+    assert all(endpoint_fields <= set(r) for r in endpoints)
+    assert all(hostname_fields <= set(r) for r in hostnames)
+    assert endpoints or name == "zero_responsive"
+    assert not any(hostname_fields & set(r) for r in endpoints)
+    for row in endpoints + hostnames:
+        for key in CONTEXT & set(row):
+            value = row[key]
+            assert value is None or datetime.fromisoformat(value).utcoffset() == timedelta(0), (key, value)
+    for job in map(json.loads, (run_dir / "normalized" / "tool_jobs.jsonl").read_text().splitlines()):
+        assert "stats" in job
+
+
+def test_schema_2_runs_are_read_without_the_context_fields(tmp_path):
+    eps = [{"target_ip": "1.1.1.1", "port": 80, "protocol": "http", "hostnames": ["a"]}]
+    hosts = [{"target_ip": "1.1.1.1", "port": 80, "hostname": "a"}]
+    run = _fake_run(tmp_path, 2, eps, hosts)
+    assert outputs.output_schema(run) == 2
+    row = next(outputs.iter_hostname_rows(run))
+    assert not CONTEXT & set(row)
 
 
 # ------------------------------------------------------------------ the row split

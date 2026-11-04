@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -210,6 +211,23 @@ def fixed_page_times(monkeypatch):
     """A stored page's capture time and age come from the clock; fixing them keeps the files comparable byte for byte."""
     monkeypatch.setattr(fav, "_fetched_at", lambda stamp: 1_800_000_000.0)
     monkeypatch.setattr(fav, "_age_seconds", lambda doc: 0.0)
+
+
+# The recorded TLS fixtures carry a real certificate that lapses on 2026-11-03. `certificate_expired` compares it
+# with the observation time, so the goldens would flip on that date; the observation is pinned to the capture day.
+OBSERVED_AT = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def fixed_observation_time(monkeypatch):
+    from scanner import certificates
+    from scanner.internet import tls
+    real = certificates.parse_der
+
+    def pinned(der, **kw):
+        return real(der, **{**kw, "observed_at": OBSERVED_AT})
+    monkeypatch.setattr(certificates, "parse_der", pinned)
+    monkeypatch.setattr(tls, "parse_der", pinned)
 
 
 def run_scenario_dir(name: str, tmp: Path) -> Path:

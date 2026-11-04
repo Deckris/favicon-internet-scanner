@@ -4,6 +4,7 @@
     "favicon_documents_reused": 1,
     "favicon_images_indexed": 2,
     "favicon_images_stored": 2,
+    "favicon_stage_max_seconds": 7200,
     "l4_endpoints": 9,
     "l4_per_port": {
       "443": 4,
@@ -72,7 +73,7 @@
   },
   "tool_job_counts": {
     "zdns": 5,
-    "zgrab2": 13,
+    "zgrab2": 9,
     "zmap": 3
   },
   "unique_ips": 6,

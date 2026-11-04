@@ -55,6 +55,7 @@
   "output_schema": 3,
   "parameters": {
     "dns_network_timeout": 5.0,
+    "dns_resolver_local": false,
     "dns_resolvers": [
       "9.9.9.9:53",
       "1.1.1.1"
@@ -66,6 +67,13 @@
       "enabled": true,
       "fallback": "always_if_no_image",
       "icon_selection": "first_image",
+      "javascript": {
+        "concurrency": null,
+        "enabled": false,
+        "max_pages_per_shard": 1000,
+        "page_timeout_seconds": 20.0,
+        "wait_ms": 1500
+      },
       "max_active_requests": 512,
       "max_hostnames_per_endpoint": 3,
       "max_icons_per_page": 4,
@@ -151,6 +159,7 @@
     "favicon_documents_reused": 0,
     "favicon_images_indexed": 1,
     "favicon_images_stored": 1,
+    "favicon_stage_max_seconds": 7200,
     "l4_endpoints": 4,
     "l4_per_port": {
       "443": 3,

@@ -4,6 +4,7 @@
     "favicon_documents_reused": 1,
     "favicon_images_indexed": 2,
     "favicon_images_stored": 2,
+    "favicon_stage_max_seconds": 7200,
     "l4_endpoints": 5,
     "l4_per_port": {
       "443": 3,

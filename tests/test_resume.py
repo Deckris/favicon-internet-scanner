@@ -40,7 +40,8 @@ class Dying:
 
 
 def scans(command):
-    return Path(command[0]).name in ("zmap", "zgrab2", "zdns") and "--dryrun" not in command
+    # The preflight probes (`--help`, `--version`) run too when the real binaries are on PATH; they are not scans.
+    return Path(command[0]).name in ("zmap", "zgrab2", "zdns") and not {"--dryrun", "--help", "--version"} & set(command)
 
 
 def real_calls(fake):

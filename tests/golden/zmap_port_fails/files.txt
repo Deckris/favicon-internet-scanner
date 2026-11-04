@@ -30,3 +30,4 @@ raw/zmap/sample-blocklist.txt
 report/summary.json
 report/summary.md
 scanned_ips.txt
+work/facts.sqlite
