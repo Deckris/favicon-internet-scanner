@@ -1,0 +1,4 @@
+# Optional: Certificate Transparency hostname sources (crt.sh PostgreSQL reader, certstream websocket reader).
+# Imported lazily, only when those sources are used. Not needed for a normal scan.
+psycopg[binary]==3.3.6
+websockets==17.3
