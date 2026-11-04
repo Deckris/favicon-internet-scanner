@@ -5,7 +5,7 @@ import pytest
 import yaml
 
 from scanner.internet import population as pop
-from scanner.internet.config import ConfigError, load_config
+from scanner.internet.config import ConfigError, load_config, resolvers_are_local
 from tests.helpers import config_dict, write_approval, write_config, write_exclusions
 
 
@@ -74,10 +74,23 @@ def test_transparency_must_match_the_approval(tmp_path):
         load_config(_rewrite(tmp_path, mutate))
 
 
-def test_private_institutional_resolver_allowed_but_loopback_refused(tmp_path):
+def test_private_institutional_resolver_allowed(tmp_path):
     assert load_config(_rewrite(tmp_path, lambda d: d["dns"].update(resolvers=["10.20.30.40"]))).dns.resolvers == ("10.20.30.40",)
-    with pytest.raises(ConfigError, match="routable unicast"):
-        load_config(_rewrite(tmp_path, lambda d: d["dns"].update(resolvers=["127.0.0.1"])))
+
+
+def test_loopback_resolver_accepted_as_local_recursive_resolver(tmp_path):
+    for r in ("127.0.0.1", "127.0.0.1:5353", "127.1.2.3", "::1", "[::1]:53"):
+        cfg = load_config(_rewrite(tmp_path, lambda d, r=r: d["dns"].update(resolvers=[r])))
+        assert cfg.dns.resolvers == (r,)
+        assert resolvers_are_local(cfg.dns.resolvers)
+    assert not resolvers_are_local(("127.0.0.1", "10.20.30.40"))
+    assert not resolvers_are_local(())
+
+
+def test_other_special_purpose_resolvers_still_refused(tmp_path):
+    for r in ("0.0.0.0", "224.0.0.1", "169.254.1.1", "240.0.0.1", "255.255.255.255", "fe80::1", "2001:db8::1", "::", "ff02::1", "not-an-ip"):
+        with pytest.raises(ConfigError, match="dns resolver"):
+            load_config(_rewrite(tmp_path, lambda d, r=r: d["dns"].update(resolvers=[r])))
 
 
 def test_blocked_or_expired_or_missing_approval_refused(tmp_path):

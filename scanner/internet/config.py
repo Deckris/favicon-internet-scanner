@@ -236,6 +236,22 @@ def _choice(value: Any, name: str, allowed: tuple[str, ...]) -> str:
     return value
 
 
+def _resolver_host(entry: str) -> str:
+    """The address of a resolver entry: ``192.0.2.1``, ``192.0.2.1:53``, ``::1`` or ``[::1]:53``."""
+    entry = entry.strip()
+    if entry.startswith("["):
+        return entry[1:].partition("]")[0]
+    return entry.rsplit(":", 1)[0] if entry.count(":") == 1 else entry
+
+
+def resolvers_are_local(resolvers: Any) -> bool:
+    """True when every configured resolver is a loopback address, i.e. a recursive resolver on the scanner host."""
+    try:
+        return bool(resolvers) and all(ipaddress.ip_address(_resolver_host(str(r))).is_loopback for r in resolvers)
+    except ValueError:
+        return False
+
+
 def load_config(path: Path, *, base_dir: Path | None = None, require_approval: bool = True) -> ScanConfig:
     """Load and validate a config file. ``require_approval=False`` is for offline tooling only."""
     path = Path(path)
@@ -385,14 +401,16 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     if not isinstance(resolvers, list) or not resolvers:
         raise ConfigError("dns.resolvers must be a non-empty list")
     for r in resolvers:
-        host = str(r).rsplit(":", 1)[0] if ":" in str(r) else str(r)
         try:
-            ip = ipaddress.ip_address(host)
+            ip = ipaddress.ip_address(_resolver_host(str(r)))
         except ValueError as exc:
             raise ConfigError(f"dns resolver {r!r} must be an IP[:port]") from exc
-        # Institutional recursive resolvers are often private; loopback/multicast/unspecified/link-local never are.
-        if ip.version != 4 or ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_link_local or ip.is_reserved:
-            raise ConfigError(f"dns resolver {r!r} must be a routable unicast IPv4 address")
+        # A loopback resolver is a deliberate local recursive resolver on the scanner host (127.0.0.0/8 or ::1).
+        if ip.is_loopback:
+            continue
+        # Institutional recursive resolvers are often private; multicast/unspecified/link-local never are.
+        if ip.version != 4 or ip.is_multicast or ip.is_unspecified or ip.is_link_local or ip.is_reserved:
+            raise ConfigError(f"dns resolver {r!r} must be a routable unicast IPv4 address or a loopback address")
     dns = SimpleNamespace(
         resolvers=tuple(str(r) for r in resolvers),
         timeout=_float(d["timeout"], "dns.timeout", 1, 120),

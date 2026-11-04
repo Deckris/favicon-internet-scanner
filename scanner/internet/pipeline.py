@@ -42,7 +42,7 @@ from scanner.internet import population as pop
 from scanner.internet import preflight as pre
 from scanner.internet import resume as resume_mod
 from scanner.internet import tls as tlsmod
-from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, sha256_file, shared_config_checksum
+from scanner.internet.config import ConfigError, ScanConfig, favicon_stage_seconds, read_exclusions, resolvers_are_local, sha256_file, shared_config_checksum
 from scanner.internet.runner import ManagedExecutor
 from scanner.internet.shardstore import EndpointFacts, IpFacts, ShardStore
 from scanner.models import ToolJob, canonical_json, write_jsonl
@@ -1367,7 +1367,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
         "vantage": {"id": cfg.vantage.id, "interface": cfg.vantage.interface, "source_ipv4": cfg.vantage.source_ipv4,
                     "gateway_mac": gateway_mac,
                     "public_egress_ip": cfg.vantage.public_egress_ip},
-        "parameters": {"dns_resolvers": list(cfg.dns.resolvers), "dns_threads": cfg.dns.threads, "dns_timeout": cfg.dns.timeout,
+        "parameters": {"dns_resolvers": list(cfg.dns.resolvers), "dns_resolver_local": resolvers_are_local(cfg.dns.resolvers),
+                       "dns_threads": cfg.dns.threads, "dns_timeout": cfg.dns.timeout,
                        "zmap_version": cfg.measurement.zmap_version, "zmap_cli_rate": mview.zmap_rate,
                        "zmap_sender_threads": 1,
                        "dns_network_timeout": cfg.dns.network_timeout, "dns_retries": cfg.dns.retries,

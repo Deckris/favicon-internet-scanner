@@ -24,7 +24,7 @@ scope:
   # max_connections_per_subnet: 4   # connections open at once to one /24 (IPv6 /48), 1 to 64; backs off on timeouts, 429 and 503
   # retry_after_max_hold_seconds: 30   # longest a network is left alone after a 429/503 with Retry-After, 0 to 900
   # subnet_wait_max_seconds: 120   # longest a request waits for room in its network before it is skipped unsent, 1 to 3600
-  dns_resolver: REPLACE_ME      # resolver for PTR and name checks; it sees every scanned address
+  dns_resolver: REPLACE_ME      # resolver for PTR and name checks; a remote one sees every scanned address, a local recursive one (127.0.0.1) does not, but each authoritative server then sees queries from the scanner's address
   # Concurrency follows the cores, RAM and open-file limit of the host (see `scanner plan`). Set any of these to
   # fix it instead; a value set here always wins over the derived one, and a command-line flag wins over both.
   # zgrab_senders: 500                # connections per ZGrab2 process (1-1000)
