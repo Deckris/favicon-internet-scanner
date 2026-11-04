@@ -266,12 +266,17 @@ class ProcessFetcher(FakeFetcher):
 
 class ProcessFetcherFactory:
     def __init__(self, log: str | None = None, crash_ip: str | None = None, hang_ip: str | None = None, delay: float = 0.0,
-                 broken: bool = False) -> None:
+                 broken: bool = False, env_log: str | None = None) -> None:
         self.log, self.crash_ip, self.hang_ip, self.delay, self.broken = log, crash_ip, hang_ip, delay, broken
+        self.env_log = env_log
 
     def __call__(self, pacer, owned=None, killed=None):
         if self.broken:
             raise RuntimeError("cannot build a fetcher")
+        if self.env_log:        # one line per process: its pid, MALLOC_ARENA_MAX and the addresses it owns
+            import os
+            with open(self.env_log, "a", encoding="ascii") as fh:
+                fh.write(f"{os.getpid()} {os.environ.get('MALLOC_ARENA_MAX')} {','.join(sorted(owned or ()))}\n")
         return ProcessFetcher(pacer, self.log, self.crash_ip, self.hang_ip, self.delay)
 
 

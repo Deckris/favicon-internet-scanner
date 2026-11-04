@@ -197,13 +197,14 @@ def _resource_plan(cfg, args) -> dict:
 def _favicon_overrides(args, cfg):
     """The favicon sizing flags as runtime overrides of this host's config. They are host-derived keys, outside the checksum."""
     values = {"workers": args.favicon_workers, "processes": args.favicon_processes,
-              "max_active_requests": args.favicon_max_active_requests}
+              "max_active_requests": args.favicon_max_active_requests,
+              "worker_max_lookups": getattr(args, "favicon_worker_max_lookups", None)}
     values = {key: value for key, value in values.items() if value is not None}
     if not values:
         return cfg
     merged = {**vars(cfg.favicon), **values}
-    for key, low, high in (("workers", 1, 8192), ("processes", 1, 64), ("max_active_requests", 1, 8192)):
-        if not low <= merged[key] <= high:
+    for key, low, high in (("workers", 1, 8192), ("processes", 1, 64), ("max_active_requests", 1, 8192), ("worker_max_lookups", 0, 10**7)):
+        if key in merged and not low <= merged[key] <= high:
             raise ConfigError(f"favicon.{key} must be between {low} and {high}")
     for key in ("workers", "max_active_requests"):
         if merged["processes"] > merged[key]:
@@ -398,6 +399,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--favicon-workers", type=int, help="init, apply, favicon-stage: favicon worker threads in all (1-8192); campaign --decoupled: favicon stages at once (default 3)")
     ap.add_argument("--favicon-processes", type=int, help="init, apply, favicon-stage: favicon worker processes (1-64)")
     ap.add_argument("--favicon-max-active-requests", type=int, help="init, apply, favicon-stage: favicon requests on the wire at once (1-8192)")
+    ap.add_argument("--favicon-worker-max-lookups", type=int, help="favicon-stage: lookups after which a favicon worker process is replaced by a fresh one (default 50000, 0 never)")
     ap.add_argument("--favicon-stage-max-seconds", type=int, help="init, apply: time limit of the favicon stage (1-86400)")
     ap.add_argument("--overlap-tls-with-zmap", choices=("true", "false", "auto"),
                     help="init, apply: start TLS while ZMap sweeps later ports (auto: on from 4 cores)")

@@ -152,6 +152,10 @@ class TargetPolicy:
     _hostname_suffixes: tuple[str, ...] = ()
     _deny_all: bool = False
     refusals: list[PolicyRefusal] = field(default_factory=list)
+    # A policy that guards a very long stage keeps only the first ``max_refusals`` examples in ``refusals`` and counts
+    # the rest in ``refusals_total``; None keeps every refusal (the policy whose refusals are written out).
+    max_refusals: int | None = field(default=None, compare=False)
+    refusals_total: int = field(default=0, compare=False)
     overlay: Any = field(default=None, repr=False, compare=False)      # live exclusions (scanner.live_exclusions), or None
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _population_index: _NetSet = field(init=False, repr=False, compare=False)
@@ -239,7 +243,9 @@ class TargetPolicy:
             observed_at=datetime.now(UTC).isoformat(),
         )
         with self._lock:
-            self.refusals.append(refusal)
+            self.refusals_total += 1
+            if self.max_refusals is None or len(self.refusals) < self.max_refusals:
+                self.refusals.append(refusal)
         return refusal
 
     def check_ip(self, ip: str, *, stage: str, context: str = "") -> PolicyRefusal | None:
