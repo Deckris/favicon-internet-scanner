@@ -308,11 +308,11 @@ pip install -r requirements-ct.txt
 Every subcommand writes an observation table (`--out`, JSON Lines) and can also write the distinct names (`--names-out`). A short summary goes to stderr; exit code 0 is success, 1 a runtime error, 2 a usage error.
 
 ```bash
-# crt.sh over a time window, one minute at a time; the contact in the User-Agent is required
-python -m scanner.ct crtsh --start 2026-01-01T00:00 --end 2026-01-01T06:00     --user-agent "ct-collector (mailto:ops@example.com)" --terms terms.txt --out obs.jsonl
+# crt.sh over a time window [start, end), one minute at a time (UTC when no zone is given)
+python -m scanner.ct crtsh --start 2026-01-01T00:00 --end 2026-01-01T06:00 --user-agent "ct-collector (mailto:ops@example.com)" --terms terms.txt --out obs.jsonl
 
 # live feeds; there is no default URL, pass the feed you chose to use
-python -m scanner.ct certstream  --url wss://certstream.example.com/ --max-messages 10000 --out obs.jsonl
+python -m scanner.ct certstream  --url wss://certstream.example.com/ --max-messages 10000 --max-seconds 3600 --out obs.jsonl
 python -m scanner.ct zonestream  --url wss://zonestream.example.com/ --max-messages 10000 --out obs.jsonl
 
 # a crt.sh export you already have (no network)
@@ -330,11 +330,13 @@ python -m scanner.ct log-coverage --watched logs.txt --fetch --json
 
 `terms.txt` has one term per line (for example `example`); with no `--terms` every name is kept. `logs.txt` has one log URL per line.
 
-Politeness rules, built in and not switched off by an option:
+`--user-agent` is an identifying string with a contact e-mail address or an http(s) URL, sent as the PostgreSQL `application_name` (63 bytes at most; the contact is kept when the text is shortened). crt.sh is a PostgreSQL database, so no HTTP User-Agent is involved. Window bounds are half-open, and a window close to the present may be incomplete because entries reach the database with a delay. Wildcard names are skipped.
 
-- crt.sh is a shared public database. At least 1 s passes between two statements (`--min-gap` can only raise it), the User-Agent must carry a contact address, and a run is capped at a number of statements (`--statement-cap`, default 5000). A run that reaches the cap, or a statement that still fails after its retries, stops the command with exit code 1, and what was read so far is still written. Statements that fail on the connection are retried with exponential back-off.
-- Live feeds reconnect with a back-off and give up after a fixed number of attempts. Use `--max-messages` to bound a collection.
-- Each live subcommand prints a notice about this when it starts.
+Limits that an option cannot switch off:
+
+- crt.sh is a shared public database. At least 1 s passes between two statements (`--min-gap` can only raise it) and a run sends at most `--statement-cap` statements (default 5000, retries included). These limits are per process, so parallel runs add up: run one at a time. Statements that fail on the connection are retried with exponential back-off. A statement the server cancels for taking too long is not repeated unchanged: the window, or the batch of certificates, is split in half. A window that still times out at one second is skipped. A run that reaches the cap, a statement that fails after its retries or a skipped window ends with exit code 1.
+- Live feeds reconnect with a back-off that resets only after a connection that lasted a minute or delivered 100 messages, and give up after a fixed number of attempts. `--max-messages` and `--max-seconds` bound a collection.
+- A crt.sh or feed run writes its table again every 5000 new rows or 60 s, and on SIGTERM, Ctrl-C or an error, so what was read is kept.
 
 To use the names, add a `ct_names` section to the config (it is ignored when absent or `enabled: false`):
 

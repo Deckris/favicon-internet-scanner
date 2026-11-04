@@ -13,14 +13,22 @@ config section points at the names file.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import math
+import signal
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+FLUSH_EVERY = 5000
+FLUSH_SECONDS = 60.0
+
 POLITENESS_CRTSH = (
-    "crt.sh is a shared public service: at most one statement per {gap:g} s, a contact in the User-Agent "
-    "is required, at most {cap} statements per run, with back-off on connection errors."
+    "crt.sh is a shared public service: at most one statement per {gap:g} s, at most {cap} statements per run, "
+    "back-off on connection errors. The identifying string, with its contact, is sent as the PostgreSQL "
+    "application_name."
 )
 POLITENESS_STREAM = (
     "live feed: you must pass the feed URL yourself; reconnects back off, "
@@ -58,19 +66,28 @@ def _add_outputs(p: argparse.ArgumentParser) -> None:
     p.add_argument("--names-out", type=Path, help="also write the distinct names, one per line")
 
 
-def _finish(table, args, *, extra: str = "") -> int:
+def _write_outputs(table, args) -> int | None:
+    """Write the table and, when asked, the names file; returns the number of names written."""
     from scanner.ct.names import write_names
 
     table.to_jsonl(args.out)
-    written = None
     if args.names_out:
-        written = write_names(args.names_out, table.names())
+        return write_names(args.names_out, table.names())
+    return None
+
+
+def _summary(table, args, extra: str = "") -> str:
     parts = [f"{len(table)} observations -> {args.out}"]
-    if written is not None:
-        parts.append(f"{written} names -> {args.names_out}")
+    if args.names_out:
+        parts.append(f"{len(table.names())} names -> {args.names_out}")
     if extra:
         parts.append(extra)
-    _say("; ".join(parts))
+    return "; ".join(parts)
+
+
+def _finish(table, args, *, extra: str = "") -> int:
+    _write_outputs(table, args)
+    _say(_summary(table, args, extra))
     return 0
 
 
@@ -86,15 +103,71 @@ def _apply_terms(table, args, label_boundary: bool = False):
     return kept
 
 
+@contextlib.contextmanager
+def _graceful_stop():
+    """Turn SIGTERM into ``KeyboardInterrupt`` for the duration, so a terminated run still writes its table."""
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        previous = signal.signal(signal.SIGTERM, handler)
+    except (ValueError, OSError):   # not the main thread
+        yield
+        return
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _collect(args, items, flt, *, handled: dict | None = None, interrupt_is_error: bool):
+    """Read ``items`` into a table. The table and names file are written however the read ends.
+
+    Periodic writes (every ``FLUSH_EVERY`` new rows or ``FLUSH_SECONDS``) keep a long run from losing everything.
+    Returns ``(table, seen, error)``; ``handled`` maps exception classes to a message, any other exception is
+    re-raised after the write.
+    """
+    from scanner.ct.models import ObservationTable
+
+    table = ObservationTable()
+    seen = 0
+    error = None
+    last_rows, last_time = 0, time.monotonic()
+    try:
+        with _graceful_stop():
+            for obs in _flatten(items):
+                seen += 1
+                if flt is None or flt.matches(obs.name):
+                    table.add(obs)
+                if len(table) - last_rows >= FLUSH_EVERY or time.monotonic() - last_time >= FLUSH_SECONDS:
+                    if len(table) != last_rows:
+                        table.to_jsonl(args.out)
+                    last_rows, last_time = len(table), time.monotonic()
+    except KeyboardInterrupt:
+        if interrupt_is_error:
+            error = "interrupted"
+        else:
+            _say("interrupted, writing what was collected")
+    except BaseException as exc:
+        label = next((text for cls, text in (handled or {}).items() if isinstance(exc, cls)), None)
+        if label is None:
+            raise
+        error = f"{label}: {exc}"
+    finally:
+        _write_outputs(table, args)
+    return table, seen, error
+
+
 def _cmd_crtsh(args) -> int:
     from scanner.ct import crtsh
-    from scanner.ct.models import ObservationTable
     from scanner.ct.terms import TermFilter
 
-    if not args.user_agent.strip():
-        raise UsageError("--user-agent must carry a contact")
-    if args.min_gap < 1.0:
-        raise UsageError("--min-gap must be at least 1 second")
+    try:
+        crtsh.validate_identifier(args.user_agent)
+    except ValueError as exc:
+        raise UsageError(f"--user-agent: {exc}") from exc
+    if not math.isfinite(args.min_gap) or args.min_gap < 1.0:
+        raise UsageError("--min-gap must be a finite number of at least 1 second")
     if args.statement_cap < 1:
         raise UsageError("--statement-cap must be at least 1")
     start, end = _utc(args.start), _utc(args.end)
@@ -102,52 +175,52 @@ def _cmd_crtsh(args) -> int:
         raise UsageError("--end must be after --start")
     flt = TermFilter.from_file(args.terms, label_boundary=args.label_boundary) if args.terms else None
     _say(POLITENESS_CRTSH.format(gap=args.min_gap, cap=args.statement_cap))
-    source = crtsh.CrtShWindows(
-        connect=lambda: crtsh.default_connect(args.user_agent), user_agent=args.user_agent, min_gap_s=args.min_gap, statement_cap=args.statement_cap
-    )
-    table = ObservationTable()
-    seen = 0
-    error = None
     try:
-        for obs in _flatten(source.iter_window(start, end)):
-            seen += 1
-            if flt is None or flt.matches(obs.name):
-                table.add(obs)
-    except crtsh.StatementCapReached as exc:
-        error = f"statement cap reached, window incomplete: {exc}"
-    except crtsh.StatementFailed as exc:
-        error = f"statement failed, window incomplete: {exc}"
-    except KeyboardInterrupt:
-        error = "interrupted"
-    status = _finish(table, args, extra=f"{seen} read")
+        source = crtsh.CrtShWindows(
+            connect=lambda: crtsh.default_connect(args.user_agent), user_agent=args.user_agent,
+            min_gap_s=args.min_gap, statement_cap=args.statement_cap,
+        )
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+    try:
+        table, seen, error = _collect(args, source.iter_window(start, end), flt,
+                                      handled={crtsh.StatementCapReached: "statement cap reached",
+                                                       crtsh.StatementFailed: "statement failed"},
+                                      interrupt_is_error=True)
+    finally:
+        close = getattr(source, "close", None)
+        if close:
+            close()
+    problems = list(getattr(source, "errors", []))
+    _say(_summary(table, args, f"{seen} read"))
+    for problem in problems:
+        _say(problem)
     if error:
-        _say(error)
+        _say(f"{error}; the result is incomplete")
         return 1
-    return status
+    if problems:
+        _say("some windows were skipped; the result is incomplete")
+        return 1
+    return 0
 
 
 def _cmd_stream(args, kind: str) -> int:
     from scanner.ct import certstream
-    from scanner.ct.models import ObservationTable
     from scanner.ct.terms import TermFilter
 
     if not args.url.lower().startswith(("ws://", "wss://")):
         raise UsageError("--url must be a ws:// or wss:// address")
     if args.max_messages is not None and args.max_messages < 1:
         raise UsageError("--max-messages must be at least 1")
+    if args.max_seconds is not None and (not math.isfinite(args.max_seconds) or args.max_seconds <= 0):
+        raise UsageError("--max-seconds must be a positive, finite number")
     parse = certstream.parse_certstream if kind == "certstream" else certstream.parse_zonestream
-    flt = TermFilter.from_file(args.terms) if args.terms else None
+    flt = TermFilter.from_file(args.terms, label_boundary=args.label_boundary) if args.terms else None
     _say(POLITENESS_STREAM)
-    table = ObservationTable()
-    seen = 0
-    try:
-        for obs in _flatten(certstream.stream_websocket(args.url, parse=parse, max_messages=args.max_messages)):
-            seen += 1
-            if flt is None or flt.matches(obs.name):
-                table.add(obs)
-    except KeyboardInterrupt:
-        _say("interrupted, writing what was collected")
-    return _finish(table, args, extra=f"{seen} read")
+    feed = certstream.stream_websocket(args.url, parse=parse, max_messages=args.max_messages, max_seconds=args.max_seconds)
+    table, seen, _ = _collect(args, feed, flt, interrupt_is_error=False)
+    _say(_summary(table, args, f"{seen} read"))
+    return 0
 
 
 def _cmd_import(args) -> int:
@@ -210,7 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("crtsh", help="query crt.sh over a time window, one minute at a time")
     c.add_argument("--start", required=True, help="window start, ISO 8601 (UTC if no zone)")
     c.add_argument("--end", required=True, help="window end, ISO 8601 (UTC if no zone)")
-    c.add_argument("--user-agent", required=True, help="identifies you to crt.sh; include a contact address")
+    c.add_argument("--user-agent", required=True, help="identifying string with a contact e-mail or URL, sent as the PostgreSQL application_name")
     c.add_argument("--min-gap", type=float, default=1.0, help="seconds between statements (minimum and default 1)")
     c.add_argument("--statement-cap", type=int, default=5000, help="statements one run may send before it stops")
     c.add_argument("--terms", type=Path, help="keep only names that match a term in this file")
@@ -222,7 +295,9 @@ def build_parser() -> argparse.ArgumentParser:
         s = sub.add_parser(kind, help=f"read names from a {kind} websocket feed")
         s.add_argument("--url", required=True, help="ws:// or wss:// address of the feed (no default)")
         s.add_argument("--max-messages", type=int, help="stop after this many messages")
+        s.add_argument("--max-seconds", type=float, help="stop after this many seconds")
         s.add_argument("--terms", type=Path, help="keep only names that match a term in this file")
+        s.add_argument("--label-boundary", action="store_true", help="match terms only at label or hyphen boundaries")
         _add_outputs(s)
         s.set_defaults(handler=lambda a, k=kind: _cmd_stream(a, k))
 

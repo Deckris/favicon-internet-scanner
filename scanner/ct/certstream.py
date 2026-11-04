@@ -13,6 +13,9 @@ from scanner.ct.names import normalize_name
 CLOSE_ERRORS = {"ConnectionClosed", "ConnectionClosedError", "ConnectionClosedOK", "InvalidMessage",
                 "InvalidStatus", "InvalidHandshake"}
 MAX_BACKOFF_S = 300.0
+RECV_TIMEOUT_S = 30.0
+STABLE_SECONDS = 60.0
+STABLE_MESSAGES = 100
 
 
 def _iso(epoch: Any) -> str | None:
@@ -94,33 +97,51 @@ def _default_connect(url: str):
 
 
 def stream_websocket(url: str, *, parse: Callable[[Any], list[Observation]], connect: Callable | None = None,
-                     max_messages: int | None = None, reconnect_backoff_s: float = 5.0, max_reconnects: int = 10,
-                     sleep: Callable[[float], None] = time.sleep) -> Iterator[Observation]:
+                     max_messages: int | None = None, max_seconds: float | None = None,
+                     reconnect_backoff_s: float = 5.0, max_reconnects: int = 10,
+                     sleep: Callable[[float], None] = time.sleep,
+                     clock: Callable[[], float] = time.monotonic) -> Iterator[Observation]:
     """Yield observations parsed from every message; reconnect with doubling back-off after a connection error.
 
-    ``max_messages`` counts received messages. After ``max_reconnects`` consecutive failed connections the last
-    error is raised. A connection that delivered a message resets the failure count and the delay.
+    ``max_messages`` counts received messages and ``max_seconds`` bounds the whole collection. After
+    ``max_reconnects`` consecutive failed connections the last error is raised. The failure count and the delay
+    are reset only by a connection that lasted at least ``STABLE_SECONDS`` or delivered at least
+    ``STABLE_MESSAGES`` messages, so a server that accepts and drops at once is not hammered. Reads time out
+    after ``RECV_TIMEOUT_S`` so the time limit is checked on a quiet feed.
     """
     connect = connect or _default_connect
+    deadline = None if max_seconds is None else clock() + max_seconds
     received = 0
     failures = 0
     delay = reconnect_backoff_s
-    while max_messages is None or received < max_messages:
+
+    def done() -> bool:
+        return (max_messages is not None and received >= max_messages) or (deadline is not None and clock() >= deadline)
+
+    while not done():
+        opened, delivered = clock(), 0
         try:
             with connect(url) as ws:
-                while max_messages is None or received < max_messages:
-                    raw = ws.recv()
+                while not done():
+                    wait = RECV_TIMEOUT_S if deadline is None else max(0.1, min(RECV_TIMEOUT_S, deadline - clock()))
+                    try:
+                        raw = ws.recv(timeout=wait)
+                    except TimeoutError:
+                        continue
                     received += 1
-                    failures, delay = 0, reconnect_backoff_s
+                    delivered += 1
                     yield from parse(raw)
-            if max_messages is not None and received >= max_messages:
+            if done():
                 return
             raise ConnectionError("connection closed")
         except Exception as exc:
             if not isinstance(exc, OSError) and type(exc).__name__ not in CLOSE_ERRORS:
                 raise
+            if delivered >= STABLE_MESSAGES or clock() - opened >= STABLE_SECONDS:
+                failures, delay = 0, reconnect_backoff_s
             failures += 1
             if failures > max_reconnects:
                 raise
-            sleep(delay)
+            pause = delay if deadline is None else max(0.0, min(delay, deadline - clock()))
+            sleep(pause)
             delay = min(delay * 2, MAX_BACKOFF_S)

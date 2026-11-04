@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -69,11 +70,20 @@ class ObservationTable:
     def to_jsonl(self, path: str | os.PathLike) -> None:
         """Write one JSON object per line (sorted keys, UTF-8, LF); the file appears whole or not at all."""
         target = Path(path)
-        tmp = target.with_name(target.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            for obs in self._rows:
-                handle.write(json.dumps(obs.to_dict(), sort_keys=True, ensure_ascii=False) + "\n")
-        os.replace(tmp, target)
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            with open(tmp, "x", encoding="utf-8", newline="\n") as handle:
+                for obs in list(self._rows):
+                    handle.write(json.dumps(obs.to_dict(), sort_keys=True, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def from_jsonl(cls, path: str | os.PathLike) -> "ObservationTable":

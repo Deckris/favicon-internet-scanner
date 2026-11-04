@@ -1,11 +1,14 @@
 import json
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from scanner.ct import certstream as cs
 
+ROOT = Path(__file__).resolve().parents[2]
 CERT = {
     "message_type": "certificate_update",
     "data": {
@@ -63,11 +66,14 @@ class FakeWS:
     def __exit__(self, *args):
         return False
 
-    def recv(self):
+    def recv(self, timeout=None):
+        self.timeouts.append(timeout)
         item = self.items.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
+
+    timeouts = []
 
 
 def zs(name):
@@ -124,4 +130,100 @@ def test_stream_named_close_error_reconnects_and_other_errors_raise():
 
 def test_import_does_not_load_websockets():
     code = "import sys, scanner.ct.certstream; sys.exit('websockets' in sys.modules)"
-    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    assert subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env).returncode == 0
+
+
+def test_wildcard_names_are_dropped():
+    assert [o.name for o in cs.parse_certstream(CERT)] == ["example.test", "www.example.test"]
+    assert cs.parse_zonestream({"domain": "*.example.test"}) == []
+
+
+class Ticker:
+    """A clock that moves only when told to; ``sleep`` advances it too."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class TimedWS(FakeWS):
+    """Each item is a pair of seconds to advance and the payload."""
+
+    def __init__(self, items, clock):
+        super().__init__(items)
+        self.clock = clock
+
+    def recv(self, timeout=None):
+        advance, item = self.items.pop(0)
+        self.clock.now += advance
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def timed_connect(sessions, clock):
+    queue = list(sessions)
+
+    def connect(url):
+        return TimedWS(queue.pop(0), clock)
+    return connect
+
+
+def test_short_connections_do_not_reset_the_backoff():
+    clock = Ticker()
+    drop = [(0.0, zs("a.test")), (0.0, ConnectionResetError("drop"))]
+    connect = timed_connect([drop, drop, drop, [(0.0, zs("z.test"))]], clock)
+    out = run(connect, max_messages=4, reconnect_backoff_s=1.0, sleep=clock.sleep, clock=clock)
+    assert len(out) == 4
+    assert clock.now == 1.0 + 2.0 + 4.0
+
+
+def test_long_connection_resets_the_backoff():
+    clock = Ticker()
+    short = [(0.0, ConnectionResetError("drop"))]
+    long_lived = [(70.0, zs("a.test")), (0.0, ConnectionResetError("drop"))]
+    connect = timed_connect([short, short, long_lived, short, [(0.0, zs("b.test"))]], clock)
+    out = run(connect, max_messages=2, reconnect_backoff_s=1.0, sleep=clock.sleep, clock=clock)
+    assert len(out) == 2
+    # 1 + 2 after the first two, then reset: 1 after the long connection, 2 after the next short one
+    assert clock.now == 70.0 + 1.0 + 2.0 + 1.0 + 2.0
+
+
+def test_many_messages_reset_the_backoff():
+    clock = Ticker()
+    busy = [(0.0, zs(f"h{i}.test")) for i in range(100)] + [(0.0, ConnectionResetError("drop"))]
+    short = [(0.0, ConnectionResetError("drop"))]
+    connect = timed_connect([short, busy, short, [(0.0, zs("end.test"))]], clock)
+    out = run(connect, max_messages=101, reconnect_backoff_s=1.0, sleep=clock.sleep, clock=clock)
+    assert len(out) == 101
+    assert clock.now == 1.0 + 1.0 + 2.0
+
+
+def test_max_seconds_stops_the_stream():
+    clock = Ticker()
+    session = [(10.0, zs(f"h{i}.test")) for i in range(100)]
+    out = run(timed_connect([session], clock), max_seconds=35, clock=clock, sleep=clock.sleep)
+    assert len(out) == 4
+
+
+def test_max_seconds_applies_across_reconnects_and_caps_the_pause():
+    clock = Ticker()
+    connect = timed_connect([[(0.0, ConnectionResetError("drop"))]] * 3, clock)
+    assert run(connect, max_seconds=8, reconnect_backoff_s=5.0, clock=clock, sleep=clock.sleep) == []
+    assert clock.now == 8.0
+
+
+def test_recv_gets_a_timeout_and_timeouts_are_tolerated():
+    clock = Ticker()
+    FakeWS.timeouts = []
+    session = [TimeoutError("quiet"), zs("a.test")]
+    connect = make_connect([session])
+    out = run(connect, max_messages=1, clock=clock)
+    assert [o.name for o in out] == ["a.test"]
+    assert FakeWS.timeouts == [cs.RECV_TIMEOUT_S] * 2

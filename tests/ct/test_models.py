@@ -1,3 +1,7 @@
+import os
+
+import pytest
+
 from scanner.ct.models import Observation, ObservationTable
 
 
@@ -39,3 +43,33 @@ def test_jsonl_roundtrip(tmp_path):
     assert first.index('"cert_id"') < first.index('"name"') < first.index('"source"')
     again = ObservationTable.from_jsonl(path)
     assert list(again) == list(table)
+
+
+def test_jsonl_write_is_synced_unique_and_leaves_no_temp_file(tmp_path, monkeypatch):
+    table = ObservationTable()
+    table.add(obs("a.example.com"))
+    target = tmp_path / "obs.jsonl"
+    synced, replaced = [], []
+    real_replace = os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd))
+    monkeypatch.setattr(os, "replace", lambda a, b: (replaced.append(str(a)), real_replace(a, b)))
+    table.to_jsonl(target)
+    table.to_jsonl(target)
+    assert len(synced) == 2 and len(set(replaced)) == 2
+    assert [p.name for p in tmp_path.iterdir()] == ["obs.jsonl"]
+
+
+def test_jsonl_failure_keeps_the_old_file_and_removes_the_temp_file(tmp_path, monkeypatch):
+    target = tmp_path / "obs.jsonl"
+    target.write_text("old\n", encoding="utf-8")
+    table = ObservationTable()
+    table.add(obs("a.example.com"))
+
+    def fail(src, dst):
+        raise OSError("disk")
+
+    monkeypatch.setattr(os, "replace", fail)
+    with pytest.raises(OSError):
+        table.to_jsonl(target)
+    assert target.read_text(encoding="utf-8") == "old\n"
+    assert [p.name for p in tmp_path.iterdir()] == ["obs.jsonl"]
