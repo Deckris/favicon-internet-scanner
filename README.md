@@ -139,6 +139,26 @@ A worker can bound its own growth with `scanner.internet.recycle.Recycler(max_sh
 
 Certificates with a zero or negative serial number no longer flood the log with `CryptographyDeprecationWarning`; only that message is filtered, other warnings still appear, and `scanner.certificates.nonpositive_serial_count()` returns how many were parsed.
 
+### Host bootstrap
+
+One command turns a fresh Ubuntu 24.04+ or Debian 13 x86-64 host into a scanner host. Run it from a checkout of this repository, as root, naming the unprivileged user that will run the scan:
+
+    sudo bash run/bootstrap-host.sh <user>
+
+[`run/bootstrap-host.sh`](run/bootstrap-host.sh) is idempotent and can be repeated. `--dry-run` prints what it would change and changes nothing. `--no-upgrade`, `--no-toolchain`, `--no-sysctl`, `--no-unbound` and `--no-systemd` skip the matching parts. It never reboots the host and never enables or starts the campaign.
+
+| Step | What it changes | How to undo |
+| --- | --- | --- |
+| Upgrade | `apt-get update` and `full-upgrade` keeping existing config files, then installs packages that only phased updates were holding back. Prints whether a reboot is required. | Not reversible; use `--no-upgrade` to skip. |
+| Unattended reboots | `/etc/apt/apt.conf.d/52scanner-no-reboot` sets `Unattended-Upgrade::Automatic-Reboot "false"`. | Delete the file. |
+| Toolchain | Runs `run/setup-wsl.sh`: pinned ZMap, ZGrab2, ZDNS and Go under `/opt`, `/usr/local/bin`, and the venv and `BUILD_INFO` in the user's home. | Remove `/opt/scanner`, `/opt/src`, `/usr/local/bin/zgrab2`, `/usr/local/bin/zdns` and the user's `scanner-venv` and `.scanner`. |
+| Network sysctl | `/etc/sysctl.d/90-scanner.conf`: `ip_local_port_range = 10000 59999`, `tcp_tw_reuse = 1`, `tcp_fin_timeout = 15`. Ports 60000-65535 are left to the local resolver. | Delete the file and run `sysctl --system` or reboot. |
+| Open files | `/etc/security/limits.d/90-scanner.conf` sets the user's soft and hard `nofile` to 65536; every unit also has `LimitNOFILE=65536`. | Delete the file. |
+| Resolver | Installs `unbound` and writes [`run/unbound/scanner.conf`](run/unbound/scanner.conf) to `/etc/unbound/unbound.conf.d/scanner.conf`, with threads and slabs set to the largest power of two that is at most 8 and at most half the cores. Listens on 127.0.0.1:53 only, uses source ports 60000-65535 and runs `unbound-checkconf` before the restart. It stops with a message if another process holds 127.0.0.1:53; the systemd-resolved stub on 127.0.0.53 does not conflict. `/etc/resolv.conf` is not changed. | Delete the file, `systemctl restart unbound`, or `systemctl disable --now unbound`. |
+| systemd | Copies the units and `scanner.target` to `/etc/systemd/system` with `User=` set to the operator, writes `/etc/scanner/scanner.env` from `scanner.env.example` (an existing env file is never overwritten), `/etc/tmpfiles.d/scanner.conf` for `/run/scanner`, and creates `/var/lib/scanner/work` and `/var/log/scanner`. Runs `daemon-reload`. | Delete the unit files, `/etc/scanner` and `/etc/tmpfiles.d/scanner.conf`, then `systemctl daemon-reload`. |
+
+The summary at the end lists the toolchain versions, the sysctl values, the resolver status and whether a reboot is needed. Still to do by hand: write `settings.yaml` and `config.yaml`, record the approval, run a small pilot, put the confirmation token from `plan` into `/etc/scanner/scanner.env`, and only then `sudo systemctl enable --now scanner.target`.
+
 ## Choosing how much of the Internet to scan
 
 The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:
