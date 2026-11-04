@@ -92,7 +92,14 @@ class RedirectResolver:
     def __init__(self, nameservers: tuple[str, ...], timeout: float) -> None:
         self._servers = []
         for ns in nameservers:
-            host, _, port = ns.partition(":")
+            ns = ns.strip()
+            if ns.startswith("["):
+                host, _, rest = ns[1:].partition("]")
+                port = rest[1:]
+            elif ns.count(":") > 1:
+                host, port = ns, ""
+            else:
+                host, _, port = ns.partition(":")
             self._servers.append((host, int(port) if port else 53))
         self._timeout = timeout
         self._local = threading.local()
