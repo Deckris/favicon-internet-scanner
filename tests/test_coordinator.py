@@ -696,3 +696,115 @@ def test_zmap_lock_path_is_shared_by_all_campaigns(tmp_path, monkeypatch):
     monkeypatch.setenv(coordinator.LOCK_ENV, str(tmp_path / "env.lock"))
     assert coordinator.zmap_lock_path(cfg) == tmp_path / "env.lock"
     assert coordinator.zmap_lock_path(cfg, tmp_path / "flag.lock") == tmp_path / "flag.lock"
+
+
+def _sweep_units(cfg, shard):
+    from dataclasses import replace
+    from scanner.internet import resume
+    m = cfg.measurement
+    book = resume.UnitBook(None, resume.run_identity(replace(cfg, shard=shard)))
+    return {port: book.unit_id("zmap", port, m.zmap_rate, m.zmap_probes) for port in m.ports}
+
+
+def _write_store(cfg, shard, run_dir, ports):
+    import sqlite3
+    from scanner.internet import shardstore
+    work = Path(run_dir) / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(work / "facts.sqlite"))
+    try:
+        db.executescript(shardstore.SCHEMA if hasattr(shardstore, "SCHEMA") else "CREATE TABLE IF NOT EXISTS units (unit TEXT NOT NULL PRIMARY KEY, stage TEXT NOT NULL, port INTEGER, size INTEGER NOT NULL, jobs TEXT NOT NULL)")
+        units = _sweep_units(cfg, shard)
+        for port in ports:
+            db.execute("INSERT OR REPLACE INTO units (unit, stage, port, size, jobs) VALUES (?, 'zmap', ?, 0, '[]')", (units[port], port))
+        db.commit()
+    finally:
+        db.close()
+
+
+class SweepCluster(Cluster):
+    """A zmap stage sweeps only the ports that have no unit in the store yet and commits them; a network stage refuses
+    with the lost-sweep exit code when a unit is missing, like the real one."""
+
+    def __init__(self, cfg, **kw):
+        super().__init__(cfg, **kw)
+        self.swept = []
+
+    def outcome(self, proc):
+        from dataclasses import replace
+        from scanner.internet import resume
+        if proc.stage == "zmap":
+            gone = resume.missing_zmap_ports(proc.run_dir, replace(self.cfg, shard=proc.shard))
+            self.swept.append((proc.shard, gone))
+            _write_store(self.cfg, proc.shard, proc.run_dir, self.cfg.measurement.ports)
+        elif proc.stage == "network" and resume.missing_zmap_ports(proc.run_dir, replace(self.cfg, shard=proc.shard)):
+            self.events.append(("lost", proc.stage, proc.shard))
+            return coordinator.EXIT_ZMAP_MISSING
+        return super().outcome(proc)
+
+
+def _zmap_done_entry(cfg, shard):
+    entry = coordinator._entry_for(cfg, shard, None)
+    entry["stages"]["zmap"] = coordinator._done_stage()
+    entry["status"] = "zmap_done"
+    run_dir = Path(entry["run_dir"])
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "manifest.json").write_text(json.dumps({"zmap_done": True, "status": "zmap_done"}))
+    return entry
+
+
+def test_lost_sweep_units_send_the_shard_back_to_a_zmap_re_sweep_of_only_those_units(tmp_path):
+    cfg = make_cfg(tmp_path, shards=2)
+    entry = _zmap_done_entry(cfg, 0)
+    ports = list(cfg.measurement.ports)
+    _write_store(cfg, 0, entry["run_dir"], ports[:1])            # zmap is marked done, but two sweep units are gone
+    seed_state(cfg, {0: entry})
+    cluster = SweepCluster(cfg)
+    result = run(cfg, cluster, tmp_path)
+    assert result["complete"]
+    assert cluster.events.index(("start", "zmap", 0)) < cluster.events.index(("start", "network", 0))
+    assert (0, ports[1:]) in cluster.swept                         # only the missing units are swept again
+    assert ("lost", "network", 0) not in cluster.events           # found before the network worker was started
+    st = state_of(cfg)["shard_states"]["0"]["stages"]
+    assert st["zmap"]["resweeps"] == 1 and st["zmap"]["status"] == "done" and st["network"]["status"] == "done"
+
+
+def test_network_worker_reporting_missing_sweeps_returns_the_shard_to_zmap(tmp_path):
+    cfg = make_cfg(tmp_path, shards=2)
+    entry = _zmap_done_entry(cfg, 0)                               # no fact store at all
+    seed_state(cfg, {0: entry})
+    cluster = SweepCluster(cfg)
+    result = run(cfg, cluster, tmp_path)
+    assert result["complete"] and result["stopped"] is None
+    assert ("lost", "network", 0) in cluster.events
+    assert cluster.events.count(("start", "zmap", 0)) == 1 and cluster.events.count(("start", "network", 0)) == 2
+    assert (0, list(cfg.measurement.ports)) in cluster.swept
+    st = state_of(cfg)["shard_states"]["0"]["stages"]
+    assert st["network"]["attempts"] == 0 and st["zmap"]["resweeps"] == 1
+
+
+def test_sweeps_that_keep_getting_lost_stop_the_campaign(tmp_path):
+    cfg = make_cfg(tmp_path, shards=1)
+    seed_state(cfg, {0: _zmap_done_entry(cfg, 0)})
+
+    class Forgetful(SweepCluster):
+        def outcome(self, proc):
+            if proc.stage == "zmap":
+                self.swept.append((proc.shard, []))
+                return super(SweepCluster, self).outcome(proc)          # reports done but commits nothing
+            return super().outcome(proc)
+    cluster = Forgetful(cfg)
+    result = run(cfg, cluster, tmp_path)
+    assert result["stopped"]["reason"] == "crashed" and not result["complete"]
+    assert len(cluster.swept) == coordinator.MAX_ATTEMPTS
+
+
+def test_worker_maps_missing_sweeps_to_its_own_exit_code(tmp_path, monkeypatch):
+    path = _cfg(tmp_path, sample={"fraction": 0.0001, "seed": 4, "shards": 3})
+    cfg = load_config(path)
+    argv, _ = _worker_args(path, cfg, "network")
+
+    def gone(c, **kw):
+        raise pipeline.ZmapResultsMissing("zmap results missing for port 80")
+    monkeypatch.setattr(pipeline, "run", gone)
+    assert cli.main(argv) == coordinator.EXIT_ZMAP_MISSING

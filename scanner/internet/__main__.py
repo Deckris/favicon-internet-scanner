@@ -324,6 +324,9 @@ def _stage_worker(args, cfg) -> int:
             pipeline.run(shard_cfg, run_id=run_dir.name, from_zmap=True)
         else:
             pipeline.run_favicon_only(shard_cfg, run_dir)
+    except pipeline.ZmapResultsMissing as exc:
+        print(f"ZMAP RESULTS MISSING: {exc}", file=sys.stderr)
+        return coordinator.EXIT_ZMAP_MISSING
     except (ConfigError, pre.PreflightFailed) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return coordinator.EXIT_REFUSED

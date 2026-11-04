@@ -183,6 +183,10 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+class ZmapResultsMissing(ConfigError):
+    """A ``from_zmap`` run found ZMap sweep units of its fact store missing; the sweeps have to be repeated, not this stage."""
+
+
 class _Stages:
     """Stage runner: failure isolation plus the stop conditions (kill switch, interrupt, approval expiry)."""
 
@@ -538,7 +542,7 @@ def run(
     if from_zmap:
         gone = resume_mod.missing_zmap_ports(run_dir, cfg) if run_dir.is_dir() else list(cfg.measurement.ports)
         if gone:
-            raise ConfigError(f"zmap results missing for port(s) {', '.join(map(str, gone))} in {run_dir}; ZMap is not sent in this mode")
+            raise ZmapResultsMissing(f"zmap results missing for port(s) {', '.join(map(str, gone))} in {run_dir}; ZMap is not sent in this mode")
     for sub in ("raw", "normalized", "report"):
         (run_dir / sub).mkdir(parents=True, exist_ok=True)
     (run_dir / "config.snapshot.json").write_text(json.dumps(cfg.raw, indent=2, sort_keys=True, default=str), encoding="utf-8")
@@ -972,7 +976,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 after_sweep(port, [ip for ip, _ in store.iter_endpoints(port)])
                 continue
             if st.from_zmap:
-                raise ConfigError(f"zmap results missing for port {port}; ZMap is not sent in this mode")
+                raise ZmapResultsMissing(f"zmap results missing for port {port}; ZMap is not sent in this mode")
             # Every port probes the same seeded sample, so a pause between port runs keeps one address's SYNs apart.
             if not gap.wait():
                 st.skipped.append(f"zmap:{port}")

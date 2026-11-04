@@ -23,10 +23,15 @@ attempted ``MAX_ATTEMPTS`` times. ``EXIT_RECYCLE`` asks for a fresh process with
 worker is gone without a record of its end (the coordinator died, or was stopped) returns to pending with the same attempt
 and continues in place from the units already committed to the shard's fact store. A stage that failed stays failed across
 restarts of the coordinator, with its attempt count; only ``retry_failed`` (``--retry-failed``) gives it fresh attempts.
+
+A ZMap sweep unit that is lost after the zmap stage was marked done (missing from the fact store, or reported by the network
+worker with ``EXIT_ZMAP_MISSING``) sends the shard back to a pending zmap stage. The sweep then repeats only the missing
+units, because the finished ones are kept in the store. Such a return is counted in ``resweeps`` and capped at ``max_attempts``.
 """
 from __future__ import annotations
 
 import contextlib
+from dataclasses import replace
 import json
 import os
 import signal
@@ -40,6 +45,7 @@ from typing import Any, Callable
 
 from scanner.internet import campaign
 from scanner.internet import preflight as pre
+from scanner.internet import resume as resume_mod
 
 try:
     import fcntl
@@ -51,6 +57,7 @@ MAX_ATTEMPTS = 3
 DEFAULT_NETWORK_WORKERS = 2
 DEFAULT_FAVICON_WORKERS = 3
 EXIT_REFUSED = 2                # stage-worker: configuration, approval or preflight refusal; never retried
+EXIT_ZMAP_MISSING = 76          # stage-worker (network): sweep units of the fact store are missing; the shard goes back to the zmap stage
 EXIT_RECYCLE = 75               # stage-worker: "start me again in a fresh process" (e.g. memory ceiling); restarted without counting an attempt
 LOCK_NAME = "zmap.lock"
 LOCK_ENV = "SCANNER_ZMAP_LOCK"
@@ -419,6 +426,9 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
                     entry["status"] = derive_status(entry["stages"])
                     campaign.prune_finished(cfg, entry, i, log)
             return
+        if rc == EXIT_ZMAP_MISSING and name == "network" and stopping is None:
+            reopen_zmap(i, "the network worker found its sweep results missing")
+            return
         if rc == EXIT_RECYCLE or (stopping is not None and rc != 0):
             st.update(status="pending")
             entry["status"] = derive_status(entry["stages"])
@@ -441,6 +451,31 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
             st["status"] = "pending"
             log(f"[coordinator] shard {i + 1}/{cfg.shards} {name} attempt {st['attempts']} failed ({how}); will retry")
         entry["status"] = derive_status(entry["stages"])
+
+    def reopen_zmap(i: int, why: str) -> None:
+        """Send shard ``i`` back to a pending zmap stage; the sweep repeats the missing units only."""
+        nonlocal dirty
+        entry = shards[i]
+        zst, nst = entry["stages"]["zmap"], entry["stages"]["network"]
+        dirty = True
+        zst["resweeps"] = zst.get("resweeps", 0) + 1
+        if zst["resweeps"] > max_attempts:
+            zst.update(status="failed", stop_reason="crashed", error=f"sweep results lost again after {max_attempts} repeated sweeps: {why}"[:500])
+            entry["status"] = derive_status(entry["stages"])
+            log(f"[coordinator] shard {i + 1}/{cfg.shards} zmap: {zst['error']}")
+            _stop_for(i, "zmap", "crashed", f"zmap of shard {i} {zst['error']}")
+            return
+        zst.update(status="pending", attempts=0, owner_pid=None, finished_at=None, error=why[:500])
+        nst.update(status="pending", owner_pid=None)
+        entry["status"] = derive_status(entry["stages"])
+        log(f"[coordinator] shard {i + 1}/{cfg.shards} zmap: {why}; sweeping the missing units again ({zst['resweeps']}/{max_attempts})")
+
+    def sweeps_lost(i: int) -> bool:
+        """True when the fact store of shard ``i`` exists but lacks finished sweep units of the configured ports."""
+        run_dir = Path(shards[i]["run_dir"])
+        if not (run_dir / "work" / "facts.sqlite").is_file():
+            return False                       # no store at all: the network worker reports it with EXIT_ZMAP_MISSING
+        return bool(resume_mod.missing_zmap_ports(run_dir, replace(cfg, shard=i)))
 
     def _stop_for(i: int, name: str, reason: str, detail: str) -> None:
         nonlocal halted
@@ -480,6 +515,9 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
                     for i in pending(name, needs):
                         if count(name) >= limit:
                             break
+                        if name == "network" and sweeps_lost(i):
+                            reopen_zmap(i, "sweep units are missing from the fact store")
+                            continue
                         start(i, name)
                 nxt = pending("zmap", None)
                 if nxt and count("zmap") == 0:
