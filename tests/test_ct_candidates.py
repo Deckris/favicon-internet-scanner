@@ -50,9 +50,9 @@ def _ct_modules():
 
 
 def test_matching_domain_attaches_with_ct_provenance(tmp_path):
-    idx = _index(tmp_path, ["api.example.com", "shop.example.com", "other.example.net"])
+    idx = _index(tmp_path, ["api.example.com", "cdn.example.com", "other.example.net"])
     ep = cand.build_endpoint_names(["host.example.com."], None, POLICY, max_candidates=20, ct_names=idx)
-    assert ep.names["api.example.com"] == {"ct"} and ep.names["shop.example.com"] == {"ct"}
+    assert ep.names["api.example.com"] == {"ct"} and ep.names["cdn.example.com"] == {"ct"}
     assert ep.names["host.example.com"] == {"ptr"}
     assert "other.example.net" not in ep.names
 
@@ -144,7 +144,7 @@ def _go(cfg, ft):
 def test_pipeline_labels_ct_names_and_records_manifest(tmp_path):
     names = _names_file(tmp_path, ["api.good.test", "mail.good.test", "unrelated.example"])
     cfg = load_config(write_config(tmp_path, ct_names={"enabled": True, "names_file": str(names)}))
-    ft = tools(a={"good.test": [IP_OK], "edge.shop.example": ["1.1.1.2"], "api.good.test": [], "mail.good.test": [IP_OK]},
+    ft = tools(a={"good.test": [IP_OK], "edge.cdn.example": ["1.1.1.2"], "api.good.test": [], "mail.good.test": [IP_OK]},
                nxdomain={"www.good.test"})
     run_dir = _go(cfg, ft)
     by = {r["hostname"]: r for r in outputs.iter_hostname_rows(run_dir) if r["target_ip"] == IP_OK and r["port"] == 443}
@@ -280,7 +280,8 @@ def test_refusals_are_bounded_by_the_free_room(tmp_path):
 
 def test_public_suffix_names_link_nothing(tmp_path):
     from scanner.ct import names as ctnames
-    idx = cand.CtIndex({"co.uk": ["evil.co.uk"], "example.com": ["api.example.com"]}, ctnames.registrable_domain)
+    idx = cand.CtIndex({"co.uk": ["evil.co.uk"], "example.com": ["api.example.com"]},
+                       ctnames.registrable_domain, ctnames.wildcard_base)
     ep = cand.build_endpoint_names(["co.uk"], _cert(["*.co.uk"]), POLICY, max_candidates=20, ct_names=idx)
     assert set(ep.names) == {"co.uk"} and ep.ct_names_skipped == 0
     assert _index(tmp_path, ["co.uk", "a.example.com"]).names_without_domain == 1

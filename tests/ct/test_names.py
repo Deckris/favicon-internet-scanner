@@ -128,3 +128,16 @@ def test_public_suffix(name, expected):
 ])
 def test_wildcard_base(raw, expected):
     assert wildcard_base(raw) == expected
+
+
+def test_write_names_leaves_no_temporary_file(tmp_path, monkeypatch):
+    from scanner.ct import names as ctnames
+
+    target = tmp_path / "out.txt"
+    assert ctnames.write_names(target, ["b.example.org", "a.example.org"]) == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.txt"]
+    monkeypatch.setattr(ctnames.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("denied")))
+    with pytest.raises(OSError):
+        ctnames.write_names(target, ["c.example.org"])
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out.txt"]
+    assert target.read_text(encoding="utf-8") == "a.example.org\nb.example.org\n"

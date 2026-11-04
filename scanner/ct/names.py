@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from functools import cache
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -44,11 +45,20 @@ def write_names(path: str | os.PathLike, names: Iterable[str]) -> int:
     """Write the normalised, unique, sorted names one per line (UTF-8, LF); returns how many."""
     unique = sorted({name for name in map(normalize_name, names) if name is not None})
     target = Path(path)
-    tmp = target.with_name(target.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-        for name in unique:
-            handle.write(name + "\n")
-    os.replace(tmp, target)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, "x", encoding="utf-8", newline="\n") as handle:
+            for name in unique:
+                handle.write(name + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return len(unique)
 
 

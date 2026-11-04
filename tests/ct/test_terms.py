@@ -22,7 +22,7 @@ def test_no_builtin_terms():
 def test_label_boundary():
     flt = TermFilter.from_terms(["widget", "gadget"], label_boundary=True)
     assert flt.matches("widget.example.com") == ["widget"]
-    assert flt.matches("my-widget-portal.example.com") == ["widget"]
+    assert flt.matches("my-widget-console.example.com") == ["widget"]
     assert flt.matches("gadget-widget.example.com") == ["widget", "gadget"]
     assert flt.matches("widgets.example.com") == []
     assert flt.matches("topwidget.example.com") == []

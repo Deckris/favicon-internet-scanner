@@ -62,15 +62,12 @@ def _add(ep: EndpointNames, raw: str, source: str, policy: Any) -> None:
     ep.names.setdefault(norm, set()).add(source)
 
 
-def _strip_wildcard(raw: str) -> str | None:
-    return raw[2:] if raw.startswith("*.") else None
-
-
 @dataclass
 class CtIndex:
     """Names of a Certificate Transparency list grouped by registrable domain, at most ``max_per_domain`` each."""
     by_domain: dict[str, list[str]]
     registrable_domain: Callable[[str], str | None]
+    wildcard_base: Callable[[str], str | None]
     names_loaded: int = 0           # valid name lines read from the file, repeats included
     names_dropped_by_cap: int = 0   # names left out because their domain already had max_per_domain
     max_per_domain: int = 50
@@ -78,7 +75,6 @@ class CtIndex:
     size_bytes: int = 0
     names_duplicate: int = 0        # repeats of a name already held for its domain
     names_without_domain: int = 0   # names with no registrable domain (public suffixes); they link nothing
-    wildcard_base: Callable[[str], str | None] = _strip_wildcard
 
     @property
     def domains_indexed(self) -> int:
@@ -139,13 +135,10 @@ def load_ct_index(path: Path, *, max_per_domain: int, expected_sha256: str | Non
         raise ConfigError(f"ct_names.names_file does not match ct_names.names_sha256 (the file hashes to {sha})")
     if not by_domain:
         raise ConfigError("ct_names.names_file holds no usable name with a registrable domain")
-    extra: dict[str, Any] = {}
-    base = getattr(ctnames, "wildcard_base", None)
-    if base is not None:
-        extra["wildcard_base"] = base
     return CtIndex(by_domain, ctnames.registrable_domain, names_loaded=loaded, names_dropped_by_cap=dropped,
                    max_per_domain=max_per_domain, sha256=sha, size_bytes=size,
-                   names_duplicate=duplicate, names_without_domain=no_domain, **extra)
+                   names_duplicate=duplicate, names_without_domain=no_domain,
+                   wildcard_base=ctnames.wildcard_base)
 
 
 def _core(sources: set[str]) -> set[str]:
