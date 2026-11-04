@@ -13,7 +13,7 @@ def test_json_export():
     assert all(o.source == "import" for o in rows)
     assert set(table.names()) == {"www.alpha.example", "alpha.example", "beta.test", "xn--bcher-kva.example"}
     alpha = [o for o in rows if o.cert_id == "1000001"]
-    assert sorted(o.name for o in alpha) == ["alpha.example", "www.alpha.example"]  # the wildcard reduces to alpha.example, which the table keeps once
+    assert sorted(o.name for o in alpha) == ["alpha.example", "www.alpha.example"]  # the wildcard line is skipped
     assert {o.seen_at for o in alpha} == {"2025-03-01T10:15:30Z"}
     assert alpha[0].issuer == "C=XX, O=Example Test CA, CN=Example Test CA R1"
 
@@ -36,10 +36,19 @@ def test_csv_export():
     rows = list(table)
     assert set(table.names()) == {"www.gamma.example", "gamma.example", "delta.invalid"}
     gamma = [o for o in rows if o.cert_id == "2000001"]
-    assert {o.seen_at for o in gamma} == {"2025-04-01T08:00:00Z"}
+    assert {o.seen_at for o in gamma} == {"2025-04-01T08:00:00Z"}  # Logged At, not Not Before
+    assert {o.issuer for o in gamma} == {"C=XX, O=Example Test CA"}
+    assert not [o for o in rows if "*" in o.name]
     delta = [o for o in rows if o.cert_id == "2000002"]
     assert [o.seen_at for o in delta] == ["2025-04-02T00:00:00Z"]
     assert not [o for o in rows if o.cert_id == "2000003"]
+
+
+def test_header_keys_are_case_and_space_insensitive(tmp_path):
+    path = tmp_path / "h.csv"
+    path.write_text("CRT.SH  ID,logged  AT,matching identities\n7,2025-05-01T00:00:00,a.example.test\n", encoding="utf-8")
+    rows = list(load_crtsh_export(path))
+    assert [(o.name, o.cert_id, o.seen_at) for o in rows] == [("a.example.test", "7", "2025-05-01T00:00:00Z")]
 
 
 def test_empty_and_invalid_files(tmp_path):

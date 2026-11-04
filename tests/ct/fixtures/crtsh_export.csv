@@ -1,8 +1,8 @@
-id,issuer_name,name_value,entry_timestamp,not_before
-2000001,"C=XX, O=Example Test CA, CN=Example Test CA R1","www.gamma.example
+crt.sh ID,Logged At,Not Before,Not After,Common Name,Matching Identities,Issuer Name
+2000001,2025-04-01T08:00:00,2025-04-01T07:00:00,2025-06-30T07:00:00,www.gamma.example,"www.gamma.example
 gamma.example
-*.gamma.example",2025-04-01T08:00:00.5,2025-04-01T07:00:00
-2000002,"C=XX, O=Example Test CA, CN=Example Test CA R2","delta.invalid
+*.gamma.example","C=XX, O=Example Test CA"
+2000002,,2025-04-02T00:00:00,2025-07-01T00:00:00,delta.invalid,"delta.invalid
 203.0.113.9
-bad name",,2025-04-02T00:00:00
-2000003,,,2025-04-03T00:00:00,
+bad name","C=XX, O=Example Test CA"
+2000003,2025-04-03T00:00:00,2025-04-03T00:00:00,2025-07-02T00:00:00,,,"C=XX, O=Example Test CA"

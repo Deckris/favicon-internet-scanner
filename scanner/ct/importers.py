@@ -10,14 +10,18 @@ from pathlib import Path
 from scanner.ct.models import Observation, ObservationTable
 from scanner.ct.names import normalize_name
 
-_NAME_KEYS = ("name_value", "matching identities", "matching_identities")
-_TIME_KEYS = ("entry_timestamp", "logged_at", "not_before", "not before")
-_ID_KEYS = ("id", "min_cert_id", "crt.sh id")
+_NAME_KEYS = ("name_value", "matching_identities")
+_TIME_KEYS = ("entry_timestamp", "logged_at", "not_before")
+_ID_KEYS = ("id", "min_cert_id", "crt.sh_id")
 _ISSUER_KEYS = ("issuer_name", "issuer")
 
 
-def _pick(row: dict, keys: tuple[str, ...]):
-    folded = {str(k).strip().lower(): v for k, v in row.items()}
+def _fold(row: dict) -> dict:
+    """Row keyed by lower-cased names with runs of whitespace as ``_`` (``Logged At`` becomes ``logged_at``)."""
+    return {"_".join(str(k).lower().split()): v for k, v in row.items()}
+
+
+def _pick(folded: dict, keys: tuple[str, ...]):
     for key in keys:
         value = folded.get(key)
         if value not in (None, ""):
@@ -55,13 +59,14 @@ def load_crtsh_export(path) -> ObservationTable:
     for row in _records(text):
         if not isinstance(row, dict):
             continue
-        raw_names = _pick(row, _NAME_KEYS)
+        folded = _fold(row)
+        raw_names = _pick(folded, _NAME_KEYS)
         if not isinstance(raw_names, str):
             continue
-        seen_at = _stamp(_pick(row, _TIME_KEYS))
-        ident = _pick(row, _ID_KEYS)
+        seen_at = _stamp(_pick(folded, _TIME_KEYS))
+        ident = _pick(folded, _ID_KEYS)
         cert_id = None if ident is None else str(ident)
-        issuer = _pick(row, _ISSUER_KEYS)
+        issuer = _pick(folded, _ISSUER_KEYS)
         issuer = None if issuer is None else str(issuer)
         for part in raw_names.splitlines():
             name = normalize_name(part)
