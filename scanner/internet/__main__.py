@@ -43,8 +43,9 @@ def _prior_runs(cfg) -> list[str]:
 PILOT_MAX_TARGETS_PER_PORT = 5000
 
 # Exit codes of an incomplete campaign, by the reason it stopped. Every reason that is not listed (crashed,
-# stage_errors, kill_switch, stalled, egress_changed, ...) is a stop that needs a look: exit 5, the same as an
+# stage_errors, kill_switch, stalled, egress_changed, interrupt, ...) is a stop that needs a look: exit 5, the same as an
 # incomplete `run`. `stalled` is listed on purpose: a shard made no progress for operations.stall_minutes.
+# run/systemd/scanner-coordinator.service must not restart on 2, 4, 5 and 6 (RestartPreventExitStatus).
 EXIT_STOPPED = 5
 # `disk` is a stop between shards for lack of free space (operations.min_free_gb_between_shards): free space, run again.
 EXIT_DISK = 6
@@ -315,6 +316,7 @@ def _stage_worker(args, cfg) -> int:
         return coordinator.EXIT_RECYCLE
     shard_cfg = replace(cfg, shard=args.shard)
     try:
+        shard_cfg = _favicon_overrides(args, shard_cfg)       # --favicon-processes and --favicon-max-active-requests of the coordinator
         if args.stage == "zmap":
             pipeline.run(shard_cfg, run_id=run_dir.name, stop_after_zmap=True, continue_in_place=True, zmap_lock_fd=args.zmap_lock_fd)
         elif args.stage == "network":
@@ -448,6 +450,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--stage-run-dir", "--run-dir", dest="stage_run_dir", type=Path, help="stage-worker: the shard's run directory")
     ap.add_argument("--zmap-lock-fd", type=int, help="stage-worker: inherited descriptor of zmap.lock, held by ZMap while it sweeps")
     ap.add_argument("--parent-pid", type=int, help="stage-worker: pid of the coordinator; the worker ends with it")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="campaign --decoupled: give stages that failed in an earlier run fresh attempts (without it they stay failed "
+                         "and the campaign ends at once)")
+    ap.add_argument("--allow-per-process-limits", action="store_true",
+                    help="campaign --decoupled: start several target-facing workers without a limiter socket, so that each applies "
+                         "the per-network cap and the per-address pause on its own")
+    ap.add_argument("--zmap-lock-file", type=Path, metavar="FILE",
+                    help="campaign --decoupled: the machine-wide ZMap lock shared by all campaigns (default: $SCANNER_ZMAP_LOCK, "
+                         "else /run/scanner/zmap.lock if writable, else zmap.lock in the output directory)")
 
     # network-only shards and the favicon stage on a second machine
     ap.add_argument("--stop-after-network", action="store_true",
@@ -670,8 +681,21 @@ def main(argv: list[str] | None = None) -> int:
                 span["archive"] = ArchivePolicy(args.archive_to, args.archive_remove_source, args.archive_when_free_gb_below)
             if args.decoupled:
                 from scanner.internet import coordinator
+                worker_args: list[str] = []                   # runtime overrides that change what the workers do; the coordinator's own
+                for flag, value in (("--favicon-processes", args.favicon_processes),     # --favicon-workers counts stages, not threads
+                                    ("--favicon-max-active-requests", args.favicon_max_active_requests)):
+                    if value is not None:
+                        worker_args += [flag, str(value)]
+                try:
+                    _favicon_overrides(argparse.Namespace(favicon_workers=None, favicon_processes=args.favicon_processes,
+                                                          favicon_max_active_requests=args.favicon_max_active_requests), cfg)
+                except ConfigError as exc:
+                    print(f"REFUSED: {exc}", file=sys.stderr)
+                    return 2
                 result = coordinator.run_decoupled(cfg, config_path=args.config, confirm=args.confirm, network_workers=args.network_workers,
-                                                   favicon_workers=args.favicon_workers or coordinator.DEFAULT_FAVICON_WORKERS, **span)
+                                                   favicon_workers=args.favicon_workers or coordinator.DEFAULT_FAVICON_WORKERS,
+                                                   retry_failed=args.retry_failed, zmap_lock=args.zmap_lock_file,
+                                                   worker_args=tuple(worker_args), allow_per_process_limits=args.allow_per_process_limits, **span)
             else:
                 result = (run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config, **span) if args.pipeline > 1
                           else run_campaign(cfg, **span))
