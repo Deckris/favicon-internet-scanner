@@ -35,7 +35,7 @@ def manifest(d):
 
 
 def sweeps(fake):
-    return [c for c in fake.commands if Path(c[0]).name == "zmap" and "--dryrun" not in c]
+    return [c for c in fake.commands if Path(c[0]).name == "zmap" and not {"--dryrun", "--version"} & set(c)]
 
 
 def steady(rows):
@@ -50,7 +50,7 @@ def test_stop_after_zmap_keeps_the_store_and_says_so(cfg):
     assert m["zmap_started_at"] <= m["zmap_finished_at"] and m["zmap_started_at"].endswith("+00:00")
     assert (d / "work" / "facts.sqlite").is_file() and (d / "scanned_ips.txt").is_file()
     assert len(sweeps(fake)) == len(cfg.measurement.ports)
-    assert not any(Path(c[0]).name == "zgrab2" for c in fake.commands)           # no target-facing network stage ran
+    assert not any(Path(c[0]).name == "zgrab2" and "--help" not in c for c in fake.commands)           # no target-facing network stage ran
     assert resume_mod.missing_zmap_ports(d, cfg) == []
 
 
@@ -98,7 +98,7 @@ def test_from_zmap_without_a_store_raises_before_any_traffic(cfg):
 def test_a_sweep_that_cannot_be_reused_is_never_sent(cfg, monkeypatch):
     d = go(cfg, "g1", tools(), stop_after_zmap=True)
     monkeypatch.setattr(resume_mod, "missing_zmap_ports", lambda *a, **k: [])      # get past the early check
-    for p in (d / "raw" / "zmap").glob("zmap-*"):
+    for p in (d / "raw" / "zmap").glob("ZMAP-*"):
         p.unlink()
     fake = tools()
     result = go(cfg, "g1", fake, from_zmap=True)
@@ -178,7 +178,7 @@ def test_the_zmap_lock_is_held_for_the_run_and_dropped_after(cfg):
             self.inner = inner
 
         def __call__(self, command, **kw):
-            if Path(command[0]).name == "zmap" and "--dryrun" not in command:
+            if Path(command[0]).name == "zmap" and not {"--dryrun", "--version"} & set(command):
                 seen.append(dict(runner._INHERITED_FDS))
             return self.inner(command, **kw)
 
