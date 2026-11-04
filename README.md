@@ -118,6 +118,15 @@ A stopped campaign is marked partial. To resume, delete the kill-switch file and
 
 To record CPU per core, per-process and per-thread CPU, memory (including the scope's cgroup counters), network and disk figures for tuning, run [`run/measure.sh`](run/measure.sh) next to the campaign, for example `bash run/measure.sh -o measure -m 'scanner.internet campaign' -u <scope name> -l campaign.log -i 10`. It writes CSV files that are sampled every `-i` seconds until the process exits or `measure/stop` appears, and logs the stage transitions found in the log. With `py-spy` installed, `--pyspy 30` also records a flame graph and a stack dump in the background at the start of each stage.
 
+**One limit for several processes.** The cap on simultaneous connections per /24 (`max_connections_per_subnet`) and the pause between two requests to one address (`min_seconds_between_probes_per_ip`) are enforced inside each process. When the stages run as separate processes on one host, start a limiter daemon and point every process at it, so that both limits hold for the host as a whole:
+
+```
+python -m scanner.internet limiterd --config config.yaml --socket /run/scanner/limiter.sock
+python -m scanner.internet run --config config.yaml --limiter-socket /run/scanner/limiter.sock ...
+```
+
+`--limiter-socket` (or `measurement.limiter_socket`, which is host-local and not part of the config checksum; the variable `SCANNER_LIMITER_SOCKET` also works) makes the process ask the daemon for its connection slots and for the pause of each address, and report timeouts, 429 and 503 to it, so back-off applies to every process at once. The daemon takes the cap, the pause and the Retry-After hold from `--config` or from `--max-connections-per-subnet`, `--min-seconds-between-probes` and `--retry-after-max-hold-seconds`; it refuses a client whose own limits are stricter than the daemon's. The socket is created with mode 0660 and only one daemon can listen on a path. Slots belong to the client's connection and are freed when it closes, or after `--lease-ttl-seconds` (300) of silence; the daemon remembers contacts only for the length of the pause, in `--bucket-seconds` buckets (1 s; a pause can run up to one bucket longer, never shorter). If the daemon cannot be reached, requests wait and are skipped like any request held by a full network (`skipped_network_busy`); nothing is sent without a slot. Without the option each process limits on its own, as before. The daemon needs Unix domain sockets.
+
 ## Choosing how much of the Internet to scan
 
 The share of the Internet is not a command-line argument. It is one line in the work folder's `settings.yaml`:

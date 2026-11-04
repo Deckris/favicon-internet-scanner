@@ -931,8 +931,12 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
             conn.send(message)
     try:
         stopped = stop.is_set
-        limiter = (SubnetLimiter(settings["subnet_cap"], max_hold=settings["retry_after_max_hold"])
-                   if settings.get("subnet_cap") else None)
+        if settings.get("limiter_socket") and settings.get("subnet_cap"):
+            from scanner.internet.limiterclient import LimiterClient
+            limiter = LimiterClient(settings["limiter_socket"], settings["subnet_cap"], settings["pace"])
+        else:
+            limiter = (SubnetLimiter(settings["subnet_cap"], max_hold=settings["retry_after_max_hold"])
+                       if settings.get("subnet_cap") else None)
         pacer = IpPacer(settings["pace"], stopped, stop_event=stop, poll=2.0, limiter=limiter,
                         max_wait=settings["subnet_wait_max"])
         store = IconStore(store_root) if store_root is not None else None
@@ -960,7 +964,8 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
                                 grace: float = STOP_GRACE_SECONDS, record_sink: Any = None,
                                 on_failure: Any = None, subnet_cap: int = 0, offhost_service: Any = None,
                                 retry_after_max_hold: float = DEFAULT_RETRY_AFTER_MAX_HOLD,
-                                subnet_wait_max: float = DEFAULT_SUBNET_WAIT_MAX) -> list[dict[str, Any]]:
+                                subnet_wait_max: float = DEFAULT_SUBNET_WAIT_MAX,
+                                limiter_socket: str | None = None) -> list[dict[str, Any]]:
     """Like ``run_favicon_stage`` but over ``processes`` worker processes; one record per job, original order.
 
     ``factory(pacer, owned, killed)`` returns the fetcher (``owned``: the addresses of the process) and must be
@@ -1019,7 +1024,8 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     stop = SharedFlag(ctx)
     settings = {"pace": pace, "workers": split_cap(workers, len(parts)), "max_icons": max_icons, "selection": selection,
                 "fallback": fallback, "max_document_bytes": max_document_bytes, "grace": grace,
-                "subnet_cap": subnet_cap or 0, "retry_after_max_hold": retry_after_max_hold, "subnet_wait_max": subnet_wait_max}      # a network lives in one process, which may use the whole cap
+                "subnet_cap": subnet_cap or 0, "retry_after_max_hold": retry_after_max_hold, "subnet_wait_max": subnet_wait_max,
+                "limiter_socket": limiter_socket}      # without a limiter daemon a network lives in one process, which may use the whole cap
     procs, conns, sends = [], [], []
     for i, indexes in enumerate(parts):
         recv_end, send_end = ctx.Pipe(duplex=False)

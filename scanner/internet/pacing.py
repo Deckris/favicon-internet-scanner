@@ -12,6 +12,11 @@ Lock order: a ``ContactLedger`` or ``IpPacer`` lock may be held while taking the
 way round. The limiter lock is a leaf: nothing is called while it is held, and a waiter never sleeps holding a
 lock. The limiter is only ever asked without blocking (``try_acquire``) from inside the ledger or pacer lock,
 so a caller that waits for a slot holds no address and no slot while it waits.
+
+When the stages run as several processes, ``limiter_for`` can return a ``LimiterClient`` instead (see
+``limiterd.py``): the same interface, with the counts, the tickets and the pause between two contacts of an address
+held machine-wide by a daemon. The callers then pass the addresses along (``ips=``) and the client talks to the
+daemon while the ledger or pacer lock is held; the daemon never calls back, so the lock order is unchanged.
 """
 from __future__ import annotations
 
@@ -158,7 +163,7 @@ class IpPacer:
                 earliest = max(slot, last + self.min_interval) if self.min_interval > 0 else slot
                 if now < earliest - 1e-9:
                     delay = earliest - now
-                elif counts is not None and not self.limiter.try_acquire(counts):
+                elif counts is not None and not self.limiter.try_acquire(counts, ips=[ip]):
                     if blocked_since is None:
                         blocked_since = now
                     if self.max_wait is not None and now - blocked_since >= self.max_wait:
@@ -354,8 +359,11 @@ class SubnetLimiter:
         with self._lock:
             return len(self._active), len(self._states)
 
-    def try_acquire(self, counts: Mapping[str, int], ticket: int | None = None) -> bool:
-        """Take the slots without waiting; False (nothing taken) if any network is full, held or has earlier waiters."""
+    def try_acquire(self, counts: Mapping[str, int], ticket: int | None = None, ips: list[str] | None = None,
+                    exclusive: bool = False) -> bool:
+        """Take the slots without waiting; False (nothing taken) if any network is full, held or has earlier waiters.
+
+        ``ips`` and ``exclusive`` say which addresses the slots are for; only a machine-wide limiter uses them."""
         with self._lock:
             now = self._now()
             fits = not self._behind_locked(ticket, counts)
@@ -378,7 +386,7 @@ class SubnetLimiter:
                     _violation(f"network {key} has {total} connections in flight, above the cap of {self.cap}")
             return True
 
-    def try_acquire_some(self, ips: list[str], ticket: int | None = None) -> list[str]:
+    def try_acquire_some(self, ips: list[str], ticket: int | None = None, exclusive: bool = False) -> list[str]:
         """Take a slot for each address that fits under its network's current limit and return those addresses,
         in order; the others are left to the caller. Empty (nothing taken) if no address fits."""
         with self._lock:
@@ -418,7 +426,7 @@ class SubnetLimiter:
         finally:
             self.withdraw(ticket)
 
-    def release(self, counts: Mapping[str, int]) -> None:
+    def release(self, counts: Mapping[str, int], ips: Iterable[str] | None = None) -> None:
         with self._lock:
             for key, n in counts.items():
                 left = self._active.get(key, 0) - n
@@ -472,8 +480,13 @@ class SubnetLimiter:
             self.observe(ip, timeout=status in ("connection-timeout", "io-timeout"), http_status=getattr(r, "http_status", None))
 
 
-def limiter_for(measurement: Any) -> SubnetLimiter:
-    """The per-network limiter that the ``measurement`` section of a configuration asks for."""
+def limiter_for(measurement: Any) -> Any:
+    """The per-network limiter that the ``measurement`` section of a configuration asks for: the in-process
+    ``SubnetLimiter``, or a client of the machine-wide daemon when ``limiter_socket`` (or ``SCANNER_LIMITER_SOCKET``) is set."""
+    path = getattr(measurement, "limiter_socket", None) or os.environ.get("SCANNER_LIMITER_SOCKET")
+    if path:
+        from scanner.internet.limiterclient import LimiterClient
+        return LimiterClient(path, measurement.max_connections_per_subnet, measurement.min_seconds_between_probes_per_ip)
     return SubnetLimiter(measurement.max_connections_per_subnet, max_hold=measurement.retry_after_max_hold_seconds)
 
 
@@ -582,8 +595,8 @@ class ContactLedger:
                         if self.limiter is None:
                             got = list(ips)
                         elif partial:
-                            got = self.limiter.try_acquire_some(ips, ticket)
-                        elif self.limiter.try_acquire(self.limiter.counts(ips), ticket):
+                            got = self.limiter.try_acquire_some(ips, ticket, exclusive=True)
+                        elif self.limiter.try_acquire(self.limiter.counts(ips), ticket, ips=ips, exclusive=True):
                             got = list(ips)
                     elif self.limiter is not None:
                         self.limiter.withdraw(ticket)
@@ -618,7 +631,7 @@ class ContactLedger:
             if self._releases % _PRUNE_EVERY == 0:
                 self._prune(end)
         if self.limiter is not None:
-            self.limiter.release(self.limiter.counts(ips))
+            self.limiter.release(self.limiter.counts(ips), ips=ips)
 
     def _prune(self, now: float) -> None:
         """Forget addresses whose pause has passed: an absent address is due at once."""
