@@ -5,7 +5,8 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"   # resolve before any cd
 
-GO_VERSION=1.25.8   # ZDNS v2.1.1 needs Go 1.25; pinned so no other toolchain is downloaded silently
+GO_VERSION=1.26.10   # ZDNS v2.1.1 needs Go 1.25 or newer (its generator fails on Go 1.27), ZGrab2 v1.0.0 Go 1.24 or newer; pinned so no other toolchain is downloaded silently
+GO_SHA256=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5   # go1.26.10.linux-amd64.tar.gz, from go.dev/dl
 ZMAP_COMMIT=651ed713759a12e283c449259b2f6fa027ccf9b5   # v4.4.0
 ZMAP_PREFIX=/opt/scanner/zmap-4.4.0
 ZGRAB2_COMMIT=ea734bcf60ef2921684cb522dfb87a07a322afa6   # v1.0.0
@@ -43,6 +44,7 @@ if ! "$GO_ROOT/go/bin/go" version 2>/dev/null | grep -q "go${GO_VERSION} "; then
   mkdir -p "$GO_ROOT"
   GO_ARCHIVE=$(mktemp /tmp/scanner-go.XXXXXX.tar.gz)
   curl --fail -sSL -o "$GO_ARCHIVE" "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+  echo "${GO_SHA256}  ${GO_ARCHIVE}" | sha256sum -c --quiet - || { echo "Go archive checksum mismatch" >&2; rm -f "$GO_ARCHIVE"; exit 4; }
   tar -C "$GO_ROOT" -xzf "$GO_ARCHIVE"
   rm -f "$GO_ARCHIVE"
 fi
@@ -59,7 +61,7 @@ setcap cap_net_raw,cap_net_admin+ep "$ZMAP_BIN"
 
 VENV="$TARGET_HOME/scanner-venv"
 sudo -u "$TARGET_USER" python3 -m venv "$VENV"
-sudo -u "$TARGET_USER" "$VENV/bin/pip" -q install -r "$REPO_ROOT/scanner/requirements.lock" "pytest==9.1.1"
+sudo -u "$TARGET_USER" "$VENV/bin/pip" -q install -r "$REPO_ROOT/scanner/requirements.lock" "pytest==9.2.0"
 
 mkdir -p "$TARGET_HOME/.scanner"
 {

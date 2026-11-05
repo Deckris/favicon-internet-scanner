@@ -87,7 +87,7 @@ def test_a_missing_work_folder_is_created(tmp_path, monkeypatch):
 
 def test_container_recipe_pins_everything_and_ships_with_the_package():
     docker = (ROOT / "run" / "Dockerfile").read_text(encoding="utf-8")
-    for pinned in ("651ed713759a12e283c449259b2f6fa027ccf9b5", "ea734bcf60ef2921684cb522dfb87a07a322afa6", "v2.1.1", "golang:1.25.8", "ubuntu:24.04"):
+    for pinned in ("651ed713759a12e283c449259b2f6fa027ccf9b5", "ea734bcf60ef2921684cb522dfb87a07a322afa6", "v2.1.1", "golang:1.26.10", "ubuntu:24.04"):
         assert pinned in docker
     assert "requirements.lock" in docker and "setcap cap_net_raw+ep" in docker
     assert (ROOT / "scanner" / "requirements.lock").is_file()

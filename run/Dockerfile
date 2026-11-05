@@ -3,8 +3,10 @@
 # Every tool is pinned; nothing is fetched when the container runs.
 # Run it with host networking (see run/scanner): ZMap sends raw packets and must see the host's NIC.
 
-# ZDNS v2.1.1 needs Go 1.25. The toolchain is pinned here and never downloaded at build time.
-ARG GO_IMAGE=golang:1.25.8-bookworm
+# ZDNS v2.1.1 needs Go 1.25 or newer and ZGrab2 v1.0.0 Go 1.24 or newer. Go 1.27 is too new: the code
+# generator of ZDNS v2.1.1 (golang.org/x/tools v0.43.0) fails to load packages with it. The toolchain is
+# pinned here and never downloaded at build time.
+ARG GO_IMAGE=golang:1.26.10-bookworm
 ARG BASE_IMAGE=ubuntu:24.04
 
 # ---- ZGrab2 and ZDNS ----------------------------------------------------------------------
