@@ -1,16 +1,16 @@
 # Pipeline + ground-truth tooling. Scanning itself is done by ZMap/ZGrab2 (system
 # binaries), not pip packages.
-mmh3>=4.1
-Pillow>=10.0
-ImageHash>=4.3
+mmh3>=5.3.1
+Pillow>=13.0.0
+ImageHash>=4.3.2
 httpx>=0.28.1,<0.29  # ground-truth collection and the internet scan's fetcher
 httpcore==1.0.9      # the fetcher replaces httpcore internals (network backend, SyncStream): keep this exact
-PyYAML>=6.0
-defusedxml>=0.7      # SVG parsing hardened against entity expansion
-resvg-py>=0.1        # deterministic SVG rasterisation in a bounded subprocess
-dnspython>=2.6       # DNS / rDNS enrichment
-pyasn>=1.6          # optional: offline IP-to-ASN lookup from a RouteViews snapshot (asn.ipasn)
-cryptography>=42.0   # TLS certificate (SAN) parsing
-brotli>=1.2.0         # bounded output_buffer_limit API used by the streaming decoder
-pytest>=8.0           # the offline test suite (`scanner verify`)
-zstandard>=0.22     # raw tool output is stored zstd-compressed (falls back to plain files if missing)
+PyYAML>=6.0.3
+defusedxml>=0.7.1     # SVG parsing hardened against entity expansion
+resvg-py>=0.5.0       # deterministic SVG rasterisation in a bounded subprocess
+dnspython>=2.9.2      # DNS / rDNS enrichment
+pyasn>=1.6.2         # optional: offline IP-to-ASN lookup from a RouteViews snapshot (asn.ipasn)
+cryptography>=50.0.2  # TLS certificate (SAN) parsing
+brotli>=1.2.1         # bounded output_buffer_limit API used by the streaming decoder
+pytest>=9.2.0           # the offline test suite (`scanner verify`)
+zstandard>=0.25.0    # raw tool output is stored zstd-compressed (falls back to plain files if missing)

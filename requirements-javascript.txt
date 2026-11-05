@@ -1,3 +1,4 @@
 # Optional: headless-browser icons (favicon.javascript.enabled). Not needed for a normal scan.
 # After installing, fetch the browser once with: python -m playwright install chromium
-playwright>=1.45
+# Pinned exactly: rendered icons can differ between browser builds.
+playwright==1.64.1
