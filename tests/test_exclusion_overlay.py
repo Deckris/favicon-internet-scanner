@@ -195,3 +195,26 @@ def test_favicon_and_offhost_policies_refuse_overlay_addresses(tmp_path):
     fp.overlay.refresh(force=True)
     assert fp.check_ip("8.8.8.8", stage="favicon").reason == "excluded_overlay"
     assert op.check_ip("9.9.9.9", stage="favicon").reason == "excluded_overlay"
+
+
+@pytest.mark.parametrize("stamps", [
+    ["2026-01-01T00:00:00+00:00"] * 8,
+    [f"2026-01-01T00:00:{59 - i:02d}+00:00" for i in range(8)],
+])
+def test_records_keep_write_order_when_timestamps_tie_or_step_back(tmp_path, monkeypatch, stamps):
+    from scanner import live_exclusions as live
+
+    ticks = iter(stamps)
+    monkeypatch.setattr(live, "_now", lambda: next(ticks))
+    path = tmp_path / "optouts.txt"
+    put(path, "192.0.2.0/24\n")
+    overlay = LiveExclusions(path, min_interval=0)
+    overlay.begin_run()
+    overlay.note_batch("zmap", "first", 3, 1)
+    put(path, "192.0.2.0/24\n198.51.100.0/24\n")
+    assert overlay.refresh(force=True)
+    overlay.note_batch("zgrab", "second", 2, 0)
+    rows = overlay.records()
+    assert [(r["record"], r.get("label", r.get("event"))) for r in rows] == [
+        ("event", "loaded"), ("batch", "first"), ("event", "loaded"), ("batch", "second")]
+    assert rows[0]["reason"] == "in force at start of run" and rows[2]["entries"] == 2

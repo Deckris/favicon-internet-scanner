@@ -76,6 +76,7 @@ class LiveExclusions:
         self.events: list[dict[str, Any]] = []          # reloads and rejections, in order
         self.batches: list[dict[str, Any]] = []         # per batch or sweep: stage, size, dropped, overlay sha256
         self.dropped: Counter[str] = Counter()          # addresses refused by the overlay, by stage
+        self._written: list[tuple[str, dict[str, Any]]] = []   # events and batches in the order they were recorded
         self.refresh(force=True, initial=True)
 
     # ------------------------------------------------------------------ reading
@@ -121,6 +122,7 @@ class LiveExclusions:
     def _event(self, kind: str, **fields: Any) -> None:
         rec = {"event": kind, "at": _now(), "path": str(self.path), **fields}
         self.events.append(rec)
+        self._written.append(("event", rec))
         if kind == "loaded":
             log.info("exclusions overlay loaded: %s entries, sha256 %s", fields.get("entries"), fields.get("sha256"))
         else:
@@ -147,6 +149,7 @@ class LiveExclusions:
         with self._lock:
             self.events.clear()
             self.batches.clear()
+            self._written.clear()
             self.dropped.clear()
             if self._sha256:
                 self._event("loaded", sha256=self._sha256, entries=len(self._cidrs), reason="in force at start of run")
@@ -157,14 +160,17 @@ class LiveExclusions:
 
     def note_batch(self, stage: str, label: str, size: int, dropped: int) -> None:
         with self._lock:
-            self.batches.append({"at": _now(), "stage": stage, "label": label, "size": size, "dropped": dropped,
-                                 "overlay_sha256": self._sha256, "overlay_entries": len(self._cidrs)})
+            batch = {"at": _now(), "stage": stage, "label": label, "size": size, "dropped": dropped,
+                     "overlay_sha256": self._sha256, "overlay_entries": len(self._cidrs)}
+            self.batches.append(batch)
+            self._written.append(("batch", batch))
 
     def records(self) -> list[dict[str, Any]]:
-        """Reloads, rejections and batches in time order, one JSON object each."""
+        """Reloads, rejections and batches in the order they were recorded, one JSON object each.
+
+        The order is the write order, not a sort by ``at``: the wall clock can repeat or step back between two records."""
         with self._lock:
-            rows = [{"record": "event", **e} for e in self.events] + [{"record": "batch", **b} for b in self.batches]
-        return sorted(rows, key=lambda r: r["at"])
+            return [{"record": kind, **rec} for kind, rec in self._written]
 
     def summary(self) -> dict[str, Any]:
         with self._lock:
