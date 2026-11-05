@@ -477,6 +477,27 @@ def _request_client(guard: _SocketGuard):
             pool.close()
 
 
+_CLIP_MARGIN = 0.1
+
+
+def _clipped_timeout(limits: FetchLimits, deadline: float) -> httpx.Timeout:
+    """Per-phase timeouts, none longer than what is left of the request's wall-clock budget. They end a little after
+    the deadline so that the watchdog, which acts at the deadline, stays the one that ends a request."""
+    left = max(deadline - time.monotonic(), 0.0) + _CLIP_MARGIN
+    connect, read = min(limits.connect_timeout, left), min(limits.read_timeout, left)
+    return httpx.Timeout(connect=connect, read=read, write=read, pool=connect)
+
+
+def _caused_by(exc: BaseException | None, kind: type) -> bool:
+    """Whether ``kind`` appears anywhere in the chain of causes: httpx wraps the httpcore error, which wraps the socket one."""
+    seen = 0
+    while exc is not None and seen < 8:
+        if isinstance(exc, kind):
+            return True
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return False
+
+
 def _guarded_client(guard: _SocketGuard) -> httpx.Client:
     transport = httpx.HTTPTransport(verify=False, http2=False, trust_env=False)
     transport._pool._network_backend = _GuardedBackend(guard)
@@ -717,7 +738,7 @@ class WebFetcher:
         try:
             with _request_client(guard) as client:
                 request = client.build_request("GET", request_url, headers=headers, extensions=extensions)
-                with client.stream("GET", request_url, headers=headers, extensions=extensions, timeout=httpx.Timeout(connect=limits.connect_timeout, read=limits.read_timeout, write=limits.read_timeout, pool=limits.connect_timeout)) as response:
+                with client.stream("GET", request_url, headers=headers, extensions=extensions, timeout=_clipped_timeout(limits, deadline)) as response:
                     cert_info = self._extract_certificate(response, connect_ip, port, sni)
                     content_encoding = response.headers.get("content-encoding")
                     try:
@@ -789,9 +810,7 @@ class WebFetcher:
         except ConnectionResetError:
             return _RequestOutcome(kind="transport", outcome="reset", http_status=None, content_type=None, content_encoding=None, location=None, body=None, body_bytes=raw_total, certificate=None, retry_after_seconds=None, connect_ip=connect_ip, host_header=headers["Host"], sni=sni, final_url=final_url)
         except (httpx.ConnectError,) as exc:
-            cause = exc.__cause__
-            import ssl as _ssl
-            if isinstance(cause, _ssl.SSLError):
+            if _caused_by(exc, ssl.SSLError):
                 return _RequestOutcome(kind="transport", outcome="tls_error", http_status=None, content_type=None, content_encoding=None, location=None, body=None, body_bytes=0, certificate=None, retry_after_seconds=None, connect_ip=connect_ip, host_header=headers["Host"], sni=sni, final_url=final_url)
             return _RequestOutcome(kind="transport", outcome="connect_error", http_status=None, content_type=None, content_encoding=None, location=None, body=None, body_bytes=0, certificate=None, retry_after_seconds=None, connect_ip=connect_ip, host_header=headers["Host"], sni=sni, final_url=final_url)
         except httpx.TimeoutException:
