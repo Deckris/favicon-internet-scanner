@@ -32,6 +32,7 @@ PACE = float(os.environ.get("E2E_PACE", "1.0"))       # the approval and the con
 CAP = 4
 SHARDS = scenario.SHARDS
 STOP_GRACE = 120.0
+PATIENCE = 300.0      # waits are for events that must happen; only a hung process may reach the deadline, a busy machine must not
 TIME_FIELDS = ("time", "_at", "stamp", "elapsed", "seconds", "duration", "started", "finished", "run_id", "path", "dir", "pid", "host_ts")
 
 
@@ -90,7 +91,7 @@ class Host:
     def start_limiter(self) -> None:
         self.limiter = subprocess.Popen([sys.executable, "-m", "scanner.internet", "limiterd", "--config", str(self.config), "--startup-hold-seconds", "1"],
                                         cwd=ROOT, env=self.env, stdout=subprocess.DEVNULL, stderr=(self.root / "limiter.err").open("ab"))
-        wait_for(lambda: self.socket.exists(), 20, "the limiter socket")
+        wait_for(lambda: self.socket.exists() and self.limiter.poll() is None, PATIENCE, "the limiter socket")
         time.sleep(1.5)
 
     def start_campaign(self) -> subprocess.Popen:
@@ -327,7 +328,7 @@ def test_clean_run_keeps_the_subnet_cap_and_the_pause(clean):
 
 
 def wait_for_zmap_start(host: Host, n: int) -> None:
-    wait_for(lambda: len([e for e in host.events() if e[0] == "ZMAP_START"]) >= n, 120, f"sweep number {n}")
+    wait_for(lambda: len([e for e in host.events() if e[0] == "ZMAP_START"]) >= n, PATIENCE, f"sweep number {n}")
 
 
 def alive_workers(host: Host, stage: str) -> list[int]:
@@ -342,14 +343,14 @@ def test_crash_of_coordinator_and_worker_resumes_to_the_same_outputs(request, cl
              len([e for e in host.events() if e[0] == "ZMAP_START"]) >= 3, 180, "a network contact and the third sweep")
     host.coordinator.send_signal(signal.SIGKILL)
     host.coordinator.wait()
-    wait_for(lambda: not host.members(), 60, "the stage workers to follow the coordinator")
+    wait_for(lambda: not host.members(), PATIENCE, "the stage workers to follow the coordinator")
     before = host.state()
     assert any(s["status"] == "running" for e in before["shard_states"].values() for s in e["stages"].values()), "nothing was running at the kill"
     # restart; kill -9 one stage worker once it has contacted something
     host.start_campaign()
     mark = len(host.events())
-    victim = wait_for(lambda: (alive_workers(host, "network") or [None])[0], 120, "a network worker")
-    wait_for(lambda: any(e[0] == "CONNECT_START" and e[5] == "network" for e in host.events()[mark:]), 120, "its first contact")
+    victim = wait_for(lambda: (alive_workers(host, "network") or [None])[0], PATIENCE, "a network worker")
+    wait_for(lambda: any(e[0] == "CONNECT_START" and e[5] == "network" for e in host.events()[mark:]), PATIENCE, "its first contact")
     os.kill(victim, signal.SIGKILL)
     rc = host.finish()
     assert_complete(host, rc)
@@ -366,7 +367,7 @@ def test_crash_of_coordinator_and_worker_resumes_to_the_same_outputs(request, cl
 def test_kill_switch_stops_everything_and_a_restart_resumes(request, clean):
     host = make_host("kill", request)
     host.start_campaign()
-    wait_for(lambda: any(c["stage"] == "network" for c in contacts(host.events())), 180, "a network contact")
+    wait_for(lambda: any(c["stage"] == "network" for c in contacts(host.events())), PATIENCE, "a network contact")
     t0 = time.monotonic()
     host.kill_file.write_text("stop\n", encoding="utf-8")
     rc = host.coordinator.wait(STOP_GRACE + 30)
@@ -396,7 +397,7 @@ def test_opt_out_added_mid_run_is_never_contacted_afterwards(request):
     swept_early = scenario.shard_ips(2)[1]       # its sweep is done (or running) when the opt-out arrives
     not_yet = scenario.shard_ips(SHARDS - 1)[1]   # its shard has not started
     host.start_campaign()
-    wait_for(lambda: len([e for e in host.events() if e[0] == "ZMAP_END"]) >= 5, 180, "the third shard's sweep")
+    wait_for(lambda: len([e for e in host.events() if e[0] == "ZMAP_END"]) >= 5, PATIENCE, "the third shard's sweep")
     stamp = time.monotonic()
     st = host.overlay.stat().st_mtime_ns
     host.overlay.write_text(f"# opt-outs\n{swept_early}\n{not_yet}\n", encoding="utf-8")

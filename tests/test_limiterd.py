@@ -20,6 +20,18 @@ unix_only = pytest.mark.skipif(not hasattr(__import__("socket"), "AF_UNIX") or s
                                reason="needs Unix domain sockets")
 NET = "192.0.2"
 ROOT = Path(__file__).resolve().parent.parent
+SLOW = 120.0       # a start-up or a reply that is only late because the machine is busy must not fail a test
+
+
+def until(cond, what, timeout=SLOW, poll=0.05):
+    """Poll ``cond`` until it holds; a deadline that only a hung process can reach, not a count of fixed sleeps."""
+    end = time.monotonic() + timeout
+    while True:
+        if cond():
+            return
+        if time.monotonic() > end:
+            raise AssertionError(f"timed out waiting for {what}")
+        time.sleep(poll)
 
 
 class Clock:
@@ -242,13 +254,11 @@ def start_daemon(tmp_path, cap=4, gap=0.4, ttl=300.0, grace=0.2, hold=0.0):
                              "--bucket-seconds", "0.05", "--lease-ttl-seconds", str(ttl),
                              "--grace-seconds", str(grace), "--startup-hold-seconds", str(hold)], cwd=ROOT)
     probe = LimiterClient(str(path), cap, gap, retry_after=0.05)
-    for _ in range(100):
-        if path.exists() and probe.ping():
-            break
-        time.sleep(0.1)
-    else:
+    try:
+        until(lambda: proc.poll() is None and path.exists() and probe.ping(), "the daemon to come up")
+    except AssertionError:
         proc.kill()
-        raise AssertionError("daemon did not come up")
+        raise
     return proc, str(path), probe
 
 
@@ -258,14 +268,23 @@ def daemon(tmp_path):
     yield path, probe
     probe.close()
     proc.terminate()
-    proc.wait(10)
+    proc.wait(SLOW)
 
 
-def _hammer(path, log, threads, rounds, cap, gap):
-    """Take and give back slots of one /24, logging the time after each grant and before each release."""
+def _hammer(path, log, threads, rounds, cap, gap, gate=None):
+    """Take and give back slots of one /24, logging the time after each grant and before each release.
+
+    With a ``gate`` the process reports ready and starts only once every process has, so how long a spawn takes cannot
+    decide whether the processes overlap.
+    """
     client = LimiterClient(path, cap, gap)
+    start = threading.Barrier(threads)
+    if gate:
+        Path(f"{gate}.ready.{os.getpid()}").write_text("")
+        until(lambda: Path(f"{gate}.go").exists(), "the start signal")
 
     def one():
+        start.wait(SLOW)
         for _ in range(rounds):
             assert client.acquire({NET: 1})
             with open(log, "a") as f:
@@ -311,9 +330,12 @@ def _spawn(target, *args):
 def test_processes_never_exceed_the_cap_per_network(daemon, tmp_path):
     path, _ = daemon
     log = tmp_path / "events.log"
-    procs = [_spawn(_hammer, path, str(log), 4, 5, 4, 0.4) for _ in range(3)]
+    gate = str(tmp_path / "gate")
+    procs = [_spawn(_hammer, path, str(log), 4, 5, 4, 0.4, gate) for _ in range(3)]
+    until(lambda: len(list(tmp_path.glob("gate.ready.*"))) == len(procs), "every process to be ready")
+    Path(f"{gate}.go").write_text("")
     for p in procs:
-        p.join(60)
+        p.join(SLOW)
         assert p.exitcode == 0
     events = sorted(line.split() for line in log.read_text().splitlines())
     assert len(events) == 3 * 4 * 5 * 2
@@ -330,7 +352,7 @@ def test_the_pause_between_requests_to_one_address_holds_across_processes(daemon
     log = tmp_path / "contacts.log"
     procs = [_spawn(_contact, path, str(log), 5, 4, 0.4) for _ in range(2)]
     for p in procs:
-        p.join(60)
+        p.join(SLOW)
         assert p.exitcode == 0
     times = sorted(float(x) for x in log.read_text().split())
     assert len(times) == 10
@@ -342,20 +364,11 @@ def test_leases_are_freed_when_a_client_process_is_killed(daemon, tmp_path):
     path, probe = daemon
     ready = tmp_path / "ready"
     holder = _spawn(_hold, path, str(ready), 4)
-    for _ in range(200):
-        if ready.exists():
-            break
-        time.sleep(0.05)
-    assert ready.exists()
+    until(ready.exists, "the holder to take its slots")
     assert not probe.try_acquire({NET: 1}, ips=["192.0.2.200"])               # the cap is used up
     holder.kill()
-    holder.join(10)
-    for _ in range(100):
-        if probe.try_acquire({NET: 1}, ips=["192.0.2.201"]):
-            break
-        time.sleep(0.05)
-    else:
-        raise AssertionError("slots of the killed process were not freed")
+    holder.join(SLOW)
+    until(lambda: probe.try_acquire({NET: 1}, ips=["192.0.2.201"]), "the slots of the killed process to be freed")
     assert probe.stats()["connections"] == 1 and probe.stats()["lingering"] == 0
 
 
@@ -367,16 +380,11 @@ def test_a_hung_client_loses_its_leases_after_the_ttl(tmp_path):
         assert hung.try_acquire({NET: 1})
         hung._closed.set()                                                    # no keep-alive, the socket stays open
         assert not probe.try_acquire({NET: 1})
-        for _ in range(60):
-            if probe.try_acquire({NET: 1}):
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("leases of the hung client did not expire")
+        until(lambda: probe.try_acquire({NET: 1}), "the leases of the hung client to expire", poll=0.1)
     finally:
         probe.close()
         proc.terminate()
-        proc.wait(10)
+        proc.wait(SLOW)
 
 
 @unix_only
@@ -384,7 +392,7 @@ def test_the_socket_is_private_and_a_second_daemon_is_refused(daemon):
     path, _ = daemon
     assert oct(os.stat(path).st_mode & 0o777) == "0o660"
     again = subprocess.run([sys.executable, "-m", "scanner.internet", "limiterd", "--socket", path],
-                           cwd=ROOT, capture_output=True, text=True, timeout=30)
+                           cwd=ROOT, capture_output=True, text=True, timeout=SLOW)
     assert again.returncode == 2 and "already listening" in again.stderr
 
 
@@ -646,7 +654,7 @@ def _daemon_command(path):
 def test_a_regular_file_at_the_socket_path_is_never_removed(tmp_path):
     path = tmp_path / "limiter.sock"
     path.write_text("precious")
-    out = subprocess.run(_daemon_command(path), cwd=ROOT, capture_output=True, text=True, timeout=30)
+    out = subprocess.run(_daemon_command(path), cwd=ROOT, capture_output=True, text=True, timeout=SLOW)
     assert out.returncode == 2 and "not a socket" in out.stderr
     assert path.read_text() == "precious"
 
@@ -661,16 +669,11 @@ def test_a_stale_socket_is_replaced_and_removed_again_at_exit(tmp_path):
     proc = subprocess.Popen(_daemon_command(path), cwd=ROOT)
     try:
         probe = LimiterClient(str(path), 4, 0.4, retry_after=0.05)
-        for _ in range(100):
-            if probe.ping():
-                break
-            time.sleep(0.1)
-        else:
-            raise AssertionError("daemon did not replace the stale socket")
+        until(probe.ping, "the daemon to replace the stale socket")
         probe.close()
     finally:
         proc.send_signal(signal.SIGTERM)
-        proc.wait(10)
+        proc.wait(SLOW)
     assert not path.exists()
 
 
@@ -683,7 +686,7 @@ def test_a_replaced_socket_is_not_unlinked_by_the_old_daemon_at_shutdown(tmp_pat
     other.bind(path)                                                               # somebody else's socket now
     try:
         proc.send_signal(signal.SIGTERM)
-        proc.wait(10)
+        proc.wait(SLOW)
         assert os.path.exists(path)
     finally:
         other.close()
@@ -692,7 +695,7 @@ def test_a_replaced_socket_is_not_unlinked_by_the_old_daemon_at_shutdown(tmp_pat
 @unix_only
 def test_a_live_daemon_at_the_path_is_left_alone(daemon):
     path, probe = daemon
-    again = subprocess.run(_daemon_command(path), cwd=ROOT, capture_output=True, text=True, timeout=30)
+    again = subprocess.run(_daemon_command(path), cwd=ROOT, capture_output=True, text=True, timeout=SLOW)
     assert again.returncode == 2 and "already listening" in again.stderr
     assert probe.ping()
 
@@ -702,21 +705,18 @@ def test_a_daemon_killed_hard_is_replaced_and_the_client_reports_its_leases(tmp_
     proc, path, probe = start_daemon(tmp_path, cap=2, gap=0.4, hold=1.0)
     client = LimiterClient(path, 2, 0.4, retry_after=0.05)
     probe.close()
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + SLOW
     while not client.try_acquire({NET: 2}, ips=["192.0.2.1", "192.0.2.2"], exclusive=True):
         assert time.monotonic() < deadline
         time.sleep(0.05)
     proc.kill()
-    proc.wait(10)
+    proc.wait(SLOW)
     proc2, _, probe2 = start_daemon(tmp_path, cap=2, gap=0.4, hold=1.0)             # same path: the stale socket is replaced
     other = LimiterClient(path, 2, 0.4, retry_after=0.05)
     try:
-        for _ in range(100):                                                        # the first call finds the old
-            if client.ping():                                                       # connection broken; then it reconnects
-                break                                                               # and reports what it holds
-            time.sleep(0.05)
-        else:
-            raise AssertionError("client did not reconnect")
+        until(client.ping, "the client to reconnect")                               # the first call finds the old connection
+                                                                                    # broken; then it reconnects and reports
+                                                                                    # what it holds
         end = time.monotonic() + 3
         while time.monotonic() < end:
             assert not other.try_acquire({NET: 1}, ips=["192.0.2.9"])               # the client still holds the whole cap
@@ -730,4 +730,4 @@ def test_a_daemon_killed_hard_is_replaced_and_the_client_reports_its_leases(tmp_
         client.close()
         probe2.close()
         proc2.terminate()
-        proc2.wait(10)
+        proc2.wait(SLOW)

@@ -73,6 +73,11 @@ try:
             ev("end")
             sys.exit(0)
         time.sleep(b_sleep)
+        until = os.environ.get("FAKE_AWAIT_NEXT_A_UNTIL")      # stay in phase B until the next shard's sweep has begun
+        if until is not None and shard < int(until):
+            deadline = time.monotonic() + 120
+            while f"a-start {shard + 1} " not in Path(log).read_text() and time.monotonic() < deadline:
+                time.sleep(0.02)
         ev("b-end")
     finish(True)
 except KeyboardInterrupt:
@@ -140,7 +145,8 @@ def _lock_is_free(cfg, name):
 
 
 @posix
-def test_phase_a_is_exclusive_two_in_flight_and_phase_b_overlaps_the_next_phase_a(tmp_path, fake):
+def test_phase_a_is_exclusive_two_in_flight_and_phase_b_overlaps_the_next_phase_a(tmp_path, fake, monkeypatch):
+    monkeypatch.setenv("FAKE_AWAIT_NEXT_A_UNTIL", "4")        # the overlap must not depend on how long a child takes to start
     cfg = load_config(_cfg(tmp_path, sample={"fraction": 0.0001, "seed": 4, "shards": 5}))
     result = _go(cfg, fake)
     assert result["complete"] and result["shards_complete"] == 5

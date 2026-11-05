@@ -106,8 +106,11 @@ def test_failed_touch_is_logged_and_retried_instead_of_exiting(tmp_path):
     p = subprocess.Popen([BASH, str(SCRIPT), "-k", str(kill), "-i", "1", "-l", str(log)], env=e,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        time.sleep(3.5)
-        assert p.poll() is None                           # still running, not exited as if it had stopped the campaign
+        deadline = time.monotonic() + 60                  # script start-up time varies; wait for two failed attempts
+        while time.monotonic() < deadline and (not log.exists() or log.read_text().count("could not touch") < 2):
+            assert p.poll() is None                       # still running, not exited as if it had stopped the campaign
+            time.sleep(0.1)
+        assert p.poll() is None
         (tmp_path / "nodir").mkdir()
         p.wait(timeout=10)
     finally:
