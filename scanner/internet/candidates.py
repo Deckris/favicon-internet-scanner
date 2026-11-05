@@ -16,6 +16,7 @@ Rules (scanner scope):
 from __future__ import annotations
 
 import bisect
+import codecs
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -83,8 +84,13 @@ class CtIndex:
 
 def _name_lines(handle: Any, jsonl: bool, digest: Any):
     """Raw names from an open binary file; every byte read is fed to ``digest``."""
+    first = True
     for chunk in handle:
         digest.update(chunk)
+        if first:
+            first = False
+            if chunk.startswith(codecs.BOM_UTF8):    # a UTF-8 byte order mark is not part of the first name
+                chunk = chunk[3:]
         line = chunk.decode("utf-8", errors="replace").strip()
         if not line:
             continue

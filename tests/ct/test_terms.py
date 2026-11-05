@@ -40,8 +40,8 @@ def test_label_boundary_hyphenated_term():
 def test_non_ascii_term_matches_punycode_name():
     for boundary in (False, True):
         flt = TermFilter.from_terms(["münchen", "alpha"], label_boundary=boundary)
-        assert flt.matches("xn--mnchen-3ya.example.com") == ["münchen"]
-        assert flt.matches("www.xn--mnchen-3ya.de") == ["münchen"]
+        assert flt.matches("xn--mnchen-3ya.example") == ["münchen"]
+        assert flt.matches("www.xn--mnchen-3ya.example") == ["münchen"]
         assert flt.matches("alpha.example.com") == ["alpha"]
     assert TermFilter.from_terms(["München"]).matches("münchen.example.com") == ["münchen"]
 
@@ -71,3 +71,11 @@ def test_filter_observations():
     flt = TermFilter.from_terms(["beta"])
     rows = [obs("beta.example.com"), obs("gamma.example.com"), obs("x-beta.example.org")]
     assert [o.name for o in flt.filter(rows)] == ["beta.example.com", "x-beta.example.org"]
+
+
+def test_empty_terms_file_is_a_usage_error(tmp_path):
+    from scanner.ct.__main__ import main
+    (tmp_path / "in.jsonl").write_text("", encoding="utf-8")
+    empty = tmp_path / "terms.txt"
+    empty.write_text("# none\n", encoding="utf-8")
+    assert main(["filter", "--in", str(tmp_path / "in.jsonl"), "--terms", str(empty), "--out", str(tmp_path / "o.jsonl")]) == 2

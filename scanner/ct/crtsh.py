@@ -98,11 +98,11 @@ def application_name(identifier: str) -> str:
 
 
 def default_connect(user_agent: str, dsn: str = DEFAULT_DSN):
-    """Open an autocommit UTC-session connection; psycopg is imported here so the module loads without it."""
+    """Open an autocommit connection; psycopg is imported here so the module loads without it."""
     import psycopg
     # the shared pooler drops server-side prepared statements, so they stay off
     return psycopg.connect(dsn, autocommit=True, prepare_threshold=None, connect_timeout=60,
-                           application_name=application_name(user_agent), options="-c timezone=UTC")
+                           application_name=application_name(user_agent))
 
 
 def _class_names(exc: BaseException) -> set[str]:

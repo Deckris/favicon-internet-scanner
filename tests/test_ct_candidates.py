@@ -280,7 +280,7 @@ def test_refusals_are_bounded_by_the_free_room(tmp_path):
 
 def test_public_suffix_names_link_nothing(tmp_path):
     from scanner.ct import names as ctnames
-    idx = cand.CtIndex({"co.uk": ["evil.co.uk"], "example.com": ["api.example.com"]},
+    idx = cand.CtIndex({"co.uk": ["other.example.co.uk"], "example.com": ["api.example.com"]},
                        ctnames.registrable_domain, ctnames.wildcard_base)
     ep = cand.build_endpoint_names(["co.uk"], _cert(["*.co.uk"]), POLICY, max_candidates=20, ct_names=idx)
     assert set(ep.names) == {"co.uk"} and ep.ct_names_skipped == 0
@@ -295,6 +295,38 @@ def test_load_refuses_empty_list_and_list_without_domains(tmp_path):
     suffixes = _names_file(tmp_path, ["co.uk", "not a name"])
     with pytest.raises(ConfigError, match="no usable name"):
         cand.load_ct_index(suffixes, max_per_domain=5)
+
+
+def test_load_ignores_a_utf8_byte_order_mark(tmp_path):
+    plain = tmp_path / "bom.txt"
+    plain.write_bytes(b"\xef\xbb\xbfapi.example.com\nmail.example.com\n")
+    assert cand.load_ct_index(plain, max_per_domain=5).by_domain == {"example.com": ["api.example.com", "mail.example.com"]}
+    rows = tmp_path / "bom.jsonl"
+    rows.write_bytes(b'\xef\xbb\xbf{"name": "api.example.com"}\n')
+    assert cand.load_ct_index(rows, max_per_domain=5).by_domain == {"example.com": ["api.example.com"]}
+
+
+@pytest.mark.parametrize("content", [b"# nothing\n", b"co.uk\nnot a name\n"])
+def test_run_refuses_a_bad_list_before_any_tool_job(tmp_path, content):
+    names = tmp_path / "bad.txt"
+    names.write_bytes(content)
+    cfg = load_config(write_config(tmp_path, ct_names={"enabled": True, "names_file": str(names)}))
+    ft = tools()
+    with pytest.raises(ConfigError, match="nothing was sent"):
+        _go(cfg, ft)
+    assert ft.commands == [] and not (Path(cfg.output_dir) / "t1").exists()
+
+
+def test_run_refuses_a_list_that_does_not_match_its_pin_or_vanished(tmp_path):
+    names = _names_file(tmp_path, ["api.good.test"])
+    cfg = load_config(write_config(tmp_path, ct_names={"enabled": True, "names_file": str(names), "names_sha256": "0" * 64}))
+    ft = tools()
+    with pytest.raises(ConfigError, match="nothing was sent"):
+        _go(cfg, ft)
+    names.unlink()
+    with pytest.raises(ConfigError, match="cannot be read"):
+        _go(cfg, ft)
+    assert ft.commands == []
 
 
 def test_load_hashes_the_parsed_bytes_and_checks_a_pinned_digest(tmp_path):

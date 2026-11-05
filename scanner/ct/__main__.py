@@ -91,13 +91,21 @@ def _finish(table, args, *, extra: str = "") -> int:
     return 0
 
 
+def _term_filter(path, label_boundary: bool):
+    from scanner.ct.terms import TermFilter
+
+    try:
+        return TermFilter.from_file(path, label_boundary=label_boundary)
+    except ValueError as exc:
+        raise UsageError(f"--terms: {exc}") from exc
+
+
 def _apply_terms(table, args, label_boundary: bool = False):
     from scanner.ct.models import ObservationTable
-    from scanner.ct.terms import TermFilter
 
     if not getattr(args, "terms", None):
         return table
-    flt = TermFilter.from_file(args.terms, label_boundary=label_boundary)
+    flt = _term_filter(args.terms, label_boundary)
     kept = ObservationTable()
     kept.extend(flt.filter(table))
     return kept
@@ -160,7 +168,6 @@ def _collect(args, items, flt, *, handled: dict | None = None, interrupt_is_erro
 
 def _cmd_crtsh(args) -> int:
     from scanner.ct import crtsh
-    from scanner.ct.terms import TermFilter
 
     try:
         crtsh.validate_identifier(args.user_agent)
@@ -173,7 +180,7 @@ def _cmd_crtsh(args) -> int:
     start, end = _utc(args.start), _utc(args.end)
     if end <= start:
         raise UsageError("--end must be after --start")
-    flt = TermFilter.from_file(args.terms, label_boundary=args.label_boundary) if args.terms else None
+    flt = _term_filter(args.terms, args.label_boundary) if args.terms else None
     _say(POLITENESS_CRTSH.format(gap=args.min_gap, cap=args.statement_cap))
     try:
         source = crtsh.CrtShWindows(
@@ -206,7 +213,6 @@ def _cmd_crtsh(args) -> int:
 
 def _cmd_stream(args, kind: str) -> int:
     from scanner.ct import certstream
-    from scanner.ct.terms import TermFilter
 
     if not args.url.lower().startswith(("ws://", "wss://")):
         raise UsageError("--url must be a ws:// or wss:// address")
@@ -215,7 +221,7 @@ def _cmd_stream(args, kind: str) -> int:
     if args.max_seconds is not None and (not math.isfinite(args.max_seconds) or args.max_seconds <= 0):
         raise UsageError("--max-seconds must be a positive, finite number")
     parse = certstream.parse_certstream if kind == "certstream" else certstream.parse_zonestream
-    flt = TermFilter.from_file(args.terms, label_boundary=args.label_boundary) if args.terms else None
+    flt = _term_filter(args.terms, args.label_boundary) if args.terms else None
     _say(POLITENESS_STREAM)
     feed = certstream.stream_websocket(args.url, parse=parse, max_messages=args.max_messages, max_seconds=args.max_seconds)
     table, seen, _ = _collect(args, feed, flt, interrupt_is_error=False)

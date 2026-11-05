@@ -518,8 +518,15 @@ def run(
     if continue_in_place and not resume:
         raise ConfigError("continue_in_place needs resume")
     network_only = network_only or from_zmap
-    if cfg.ct_names.enabled and cfg.ct_names.names_sha256 and sha256_file(cfg.ct_names.names_file) != cfg.ct_names.names_sha256:
-        raise ConfigError("ct_names.names_file does not match ct_names.names_sha256; nothing was sent")
+    ct_index = None
+    if cfg.ct_names.enabled:                        # optional CT name list: read and checked once, before any traffic
+        try:
+            ct_index = cand.load_ct_index(cfg.ct_names.names_file, max_per_domain=cfg.ct_names.max_names_per_domain,
+                                          expected_sha256=cfg.ct_names.names_sha256)
+        except OSError as exc:
+            raise ConfigError(f"ct_names.names_file cannot be read: {exc}; nothing was sent") from exc
+        except ConfigError as exc:
+            raise ConfigError(f"{exc}; nothing was sent") from exc
     started = datetime.now(UTC)
     wall = time.monotonic()
     policy, splan, exclusions = build_policy(cfg)
@@ -575,7 +582,7 @@ def run(
         if not report["ok"] and not skip_preflight:
             raise pre.PreflightFailed(report)
         finished = _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                               started, wall, run_id, resume_from, fetcher_factory, resume)
+                               started, wall, run_id, resume_from, fetcher_factory, resume, ct_index=ct_index)
     finally:
         if zmap_lock_fd is not None:
             runner_mod.drop_fd(zmap_lock_fd)
@@ -681,7 +688,7 @@ def run_favicon_only(
 
 
 def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
-                resume_from=None, fetcher_factory=None, resume=True) -> Path:
+                resume_from=None, fetcher_factory=None, resume=True, ct_index=None) -> Path:
     # What the stages learn about each endpoint goes to disk, not into dictionaries: memory then stays flat in the shard size.
     identity = resume_mod.run_identity(cfg)
     taken, refused = False, None
@@ -702,7 +709,7 @@ def _run_stages(cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, 
     book = resume_mod.UnitBook(store, identity, enabled=resume and st.replay is None, source=resume_from if taken else None, run_dir=run_dir)
     try:
         return _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report,
-                                started, wall, run_id, resume_from, fetcher_factory, book=book, continued=taken or in_place, not_reused=refused)
+                                started, wall, run_id, resume_from, fetcher_factory, book=book, continued=taken or in_place, not_reused=refused, ct_index=ct_index)
     except Exception as exc:               # whatever escaped the stages: the run still ends with a manifest
         st.errors["run"] = f"{type(exc).__name__}: {exc}"[:500]
         return _bare_manifest(cfg, st, run_dir, counts, started, wall, run_id)
@@ -770,7 +777,7 @@ def _zmap_done(store, cfg, st, splan, run_dir, jobs, counts, ptr_early, ptr_pool
            if done else {}),
         "config_checksum": cfg.checksum, "epoch_id": epoch_id(cfg), "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
         "shard": {"index": cfg.shard, "of": cfg.shards, "total_targets": splan.total_targets},
-        "stage_counts": counts, "output_schema": outputs.OUTPUT_SCHEMA, "limitations": LIMITATIONS,
+        "stage_counts": counts, "output_schema": outputs.OUTPUT_SCHEMA, "limitations": limitations("ct_names" in counts),
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=_jsonable), encoding="utf-8")
     return run_dir
@@ -786,7 +793,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
         "status": "finished", "complete": False, "config_checksum": cfg.checksum, "epoch_id": epoch_id(cfg),
         "approval_reference": cfg.approval.approval_reference if cfg.approval else None,
         "shard": {"index": cfg.shard, "of": cfg.shards}, "stage_counts": counts,
-        "output_schema": outputs.OUTPUT_SCHEMA, "limitations": LIMITATIONS,
+        "output_schema": outputs.OUTPUT_SCHEMA, "limitations": limitations("ct_names" in counts),
         **({"network_done": True} if st.replay is not None else {}),     # the favicon stage can be repeated
         **st.zmap_meta,
     }
@@ -795,7 +802,7 @@ def _bare_manifest(cfg, st, run_dir: Path, counts, started, wall, run_id) -> Pat
 
 
 def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executor, fetcher, jobs, counts, report, started, wall, run_id,
-                     resume_from=None, fetcher_factory=None, *, book, continued=False, not_reused=None) -> Path:
+                     resume_from=None, fetcher_factory=None, *, book, continued=False, not_reused=None, ct_index=None) -> Path:
     from scanner.internet.zmap_compat import output_args, packet_rate_args, response_fields
     killed = st.killed
     pace = cfg.measurement.min_seconds_between_probes_per_ip
@@ -1208,11 +1215,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     # ---- Stage 5: hostname candidates = PTR U cert SAN/CN ----------------------------------
     def cand_stage() -> None:
-        store.clear_names()                         # rebuilt in full from what the stages above stored
-        ct_index = None
-        if cfg.ct_names.enabled:                    # optional CT name list: read once for the whole shard
-            ct_index = cand.load_ct_index(cfg.ct_names.names_file, max_per_domain=cfg.ct_names.max_names_per_domain,
-                                          expected_sha256=cfg.ct_names.names_sha256)
+        if ct_index is not None:
             counts["ct_names"] = {
                 "enabled": True, "names_file": cfg.ct_names.names_file.name, "sha256": ct_index.sha256,
                 "size_bytes": ct_index.size_bytes, "names_sha256_pinned": cfg.ct_names.names_sha256 is not None,
@@ -1220,6 +1223,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 "max_names_per_domain": ct_index.max_per_domain, "names_dropped_by_domain_cap": ct_index.names_dropped_by_cap,
                 "names_duplicate": ct_index.names_duplicate, "names_without_registrable_domain": ct_index.names_without_domain,
                 "max_domains_per_endpoint": cfg.ct_names.max_domains_per_endpoint, "names_skipped_endpoint_cap": 0}
+        store.clear_names()                         # rebuilt in full from what the stages above stored
         for g in store.iter_ips():
             for e in g.endpoints:
                 names = cand.build_endpoint_names(

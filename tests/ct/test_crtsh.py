@@ -125,7 +125,7 @@ def test_default_connect_options(monkeypatch):
     assert seen["autocommit"] is True
     assert seen["prepare_threshold"] is None
     assert seen["application_name"] == "Scan Tool/2.0 (+mailto:a@example.test)"
-    assert seen["options"] == "-c timezone=UTC"
+    assert "options" not in seen
 
 
 @pytest.mark.parametrize("text, expected", [
