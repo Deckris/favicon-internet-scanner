@@ -186,6 +186,7 @@ def _collect(run_dir: Path, tmp: Path) -> dict[str, bytes]:
         doc = json.loads((run_dir / rel).read_text(encoding="utf-8"))
         if rel == "manifest.json":
             doc["output_checksums"] = {k: v for k, v in doc["output_checksums"].items() if k not in VOLATILE}
+            doc["tools"] = {k: "<host>" for k in doc.get("tools", {})}   # the installed binaries' paths, hashes and build record belong to the host
         out[rel] = _dump(_scrub(doc, tmp))
     for rel in SCRUBBED_JSONL:
         lines = [_scrub(json.loads(l), tmp) for l in (run_dir / rel).read_text(encoding="utf-8").splitlines()]
