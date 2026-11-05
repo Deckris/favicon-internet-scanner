@@ -204,10 +204,10 @@
     "ZGRABTLS-45731e5c70771bbf"
   ],
   "tools": {
-    "build_info": "zmap: zmap v4.4.0 (651ed713759a12e283c449259b2f6fa027ccf9b5)\nzmap_sha256: 44a51b73b8c188771c119348377758ff6e6bdc0e8bacb36a51c3fcfde12d6a19\nzgrab2_commit: ea734bcf60ef2921684cb522dfb87a07a322afa6\nzdns: zdns version 2.1.1 (97bdbc3a4c70d8e2dedc94355d7a1150507aad8d)\ngo: go version go1.25.8 linux/amd64\npython: Python 3.12.3\ninstalled_at: 2026-10-06T21:31:41Z",
-    "zdns": "",
-    "zgrab2": "/usr/local/bin/zgrab2 (sha256 9f4236fae3801419)",
-    "zmap": "ValueError: '-p' is not in list"
+    "build_info": "<host>",
+    "zdns": "<host>",
+    "zgrab2": "<host>",
+    "zmap": "<host>"
   },
   "vantage": {
     "gateway_mac": null,
