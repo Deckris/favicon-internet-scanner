@@ -140,6 +140,9 @@ HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
                     "zmap_source_ports"),
     "dns": ("threads", "query_resolver_version"),
     "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds", "worker_max_lookups"),
+    # How long a stage may go without a sign of progress before it is aborted. It decides when a run is stopped, not
+    # what it measures, and a host with slower disks needs a longer limit than a fast one.
+    "operations": ("stall_minutes",),
     # The live exclusions overlay: an opt-out must take effect without starting a new campaign.
     "target_policy": ("exclusions_overlay_file",),
     # The CT name list sits at a different path on each host; the manifest records the file's SHA-256.
