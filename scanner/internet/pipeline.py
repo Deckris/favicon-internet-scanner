@@ -60,6 +60,8 @@ SCHEMA_VERSION = 1
 INSTRUMENT_VERSION = "scanner.3"
 DNS_BATCH = 50_000          # names per forward-lookup batch (what ZDNS was already given at a time)
 MONITOR_TICK = 0.5          # how often the run monitor evaluates the stop conditions
+WORK_TICK = 30.0            # longest wait between two looks of ``_Stages.working`` for signs of life in the step it covers
+LOOP_TICK = 1000            # a loop over the fact store reports progress once per this many addresses
 WEB_PROTOCOLS = ("https", "http")
 # TLS outcomes after which a plain-HTTP probe is still worth sending: the port did not prove it speaks TLS.
 HTTP_FALLBACK = frozenset({tlsmod.NOT_TLS, tlsmod.CLOSED, tlsmod.RESET, tlsmod.TIMEOUT, tlsmod.OTHER})
@@ -187,6 +189,32 @@ class ZmapResultsMissing(ConfigError):
     """A ``from_zmap`` run found ZMap sweep units of its fact store missing; the sweeps have to be repeated, not this stage."""
 
 
+def _thread_activity(tid: int) -> tuple[int, int]:
+    """CPU time (clock ticks) and bytes read or written so far by one thread of this process.
+
+    The CPU time of the thread comes from /proc/self/task/<tid>/stat whenever that file is readable; if only the io file
+    cannot be read (permissions, containers, a non-dumpable process) the byte count is 0 and the CPU time still tells
+    this thread apart from the others. Only where /proc does not exist (Windows, macOS) the CPU time of the whole
+    process stands in. That reading also changes while any other thread computes, so on such a platform a step that
+    is blocked can look busy and the stall limit is weaker."""
+    try:
+        with open(f"/proc/self/task/{tid}/stat", "rb") as fh:
+            fields = fh.read().rsplit(b")", 1)[1].split()
+        cpu = int(fields[11]) + int(fields[12])         # utime and stime
+    except (OSError, ValueError, IndexError):
+        return int(time.process_time() * 1000), 0
+    moved = 0
+    try:
+        with open(f"/proc/self/task/{tid}/io", "rb") as fh:
+            for line in fh:
+                key, _, value = line.partition(b":")
+                if key in (b"rchar", b"wchar"):
+                    moved += int(value)
+    except (OSError, ValueError):
+        moved = 0
+    return cpu, moved
+
+
 class _Stages:
     """Stage runner: failure isolation plus the stop conditions (kill switch, interrupt, approval expiry)."""
 
@@ -212,6 +240,8 @@ class _Stages:
         self._progress = 0
         self._last_progress = (0, now)
         self._queued = 0                         # phases this run is waiting to enter; a deliberate wait is not a stall
+        self._tail = contextlib.ExitStack()      # holds the ``working`` block of the write-out until the monitor stops
+        self._tail_open = False
         self._monitor: threading.Thread | None = None
         self._guard_thread: threading.Thread | None = None
         self._monitor_done = threading.Event()
@@ -227,6 +257,51 @@ class _Stages:
     def progress(self) -> None:
         """Called whenever a stage gets a result; a run that stops calling it for ``stall_minutes`` is aborted."""
         self._progress += 1
+
+    @contextlib.contextmanager
+    def working(self, interval: float | None = None) -> Iterator[None]:
+        """Cover a step that computes or moves data in this thread but reports no progress of its own.
+
+        While the block runs, a helper thread looks at the CPU time and I/O of the calling thread every ``interval``
+        seconds and reports progress when either has moved. A step that is busy is therefore not mistaken for a hung
+        one; a thread that waits on a lock or a dead peer uses neither and still runs into the stall limit."""
+        tid = threading.get_native_id()
+        if interval is None:
+            interval = max(0.05, min(WORK_TICK, self.stall_seconds / 4)) if self.stall_seconds > 0 else WORK_TICK
+        done = threading.Event()
+
+        def beat() -> None:
+            seen: tuple[int, int] | None = None
+            while True:
+                try:
+                    now = _thread_activity(tid)
+                except Exception:           # a failing probe must not end the step it watches
+                    now = None
+                if now is not None:
+                    if seen is not None and now != seen:
+                        self.progress()
+                    seen = now
+                if done.wait(interval):
+                    return
+
+        helper: threading.Thread | None = threading.Thread(target=beat, name="work-heartbeat", daemon=True)
+        try:
+            helper.start()
+        except RuntimeError:                # no thread to be had: the step relies on the stall limit alone
+            helper = None
+        try:
+            yield
+        finally:
+            done.set()
+            if helper is not None:
+                helper.join(timeout=5)
+            self.progress()
+
+    def begin_tail(self) -> None:
+        """Cover everything from here to the end of the run (record counts, write-out, hashing, store close)."""
+        if not self._tail_open:
+            self._tail_open = True
+            self._tail.enter_context(self.working())
 
     @contextlib.contextmanager
     def queued(self) -> Iterator[None]:
@@ -310,13 +385,17 @@ class _Stages:
         self._guard_thread.start()
 
     def stop_monitor(self) -> None:
-        thread, self._monitor = self._monitor, None
-        guard, self._guard_thread = self._guard_thread, None
-        self._monitor_done.set()
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=10)
-        if guard is not None and guard is not threading.current_thread():
-            guard.join(timeout=10)
+        try:
+            self._tail.close()
+        finally:
+            self._tail_open = False
+            thread, self._monitor = self._monitor, None
+            guard, self._guard_thread = self._guard_thread, None
+            self._monitor_done.set()
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=10)
+            if guard is not None and guard is not threading.current_thread():
+                guard.join(timeout=10)
 
     def _watch_guards(self) -> None:
         while not self._monitor_done.wait(MONITOR_TICK):
@@ -760,6 +839,7 @@ def _zmap_done(store, cfg, st, splan, run_dir, jobs, counts, ptr_early, ptr_pool
                 counts["ptr_early_failed"] = f"{type(exc).__name__}: {exc}"[:300]
     finally:
         ptr_pool.shutdown(wait=True, cancel_futures=True)
+    st.begin_tail()         # the store flush and close below report nothing on their own
     st.check_now()
     problem = store_problem()
     if problem:
@@ -1203,10 +1283,12 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 jobs.extend(future.result())
             except Exception as exc:
                 counts["ptr_early_failed"] = f"{type(exc).__name__}: {exc}"[:300]     # its addresses are asked again below
-        missing = list(store.iter_unsent_ptr_ips())
+        with st.working():
+            missing = list(store.iter_unsent_ptr_ips())
         if missing:
             jobs.extend(ptr_lookup(missing, "ptr_rest"))
-        store.fill_missing_ptr()
+        with st.working():
+            store.fill_missing_ptr()
 
     try:
         st.run("ptr", ptr_stage, None)
@@ -1223,8 +1305,11 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 "max_names_per_domain": ct_index.max_per_domain, "names_dropped_by_domain_cap": ct_index.names_dropped_by_cap,
                 "names_duplicate": ct_index.names_duplicate, "names_without_registrable_domain": ct_index.names_without_domain,
                 "max_domains_per_endpoint": cfg.ct_names.max_domains_per_endpoint, "names_skipped_endpoint_cap": 0}
-        store.clear_names()                         # rebuilt in full from what the stages above stored
-        for g in store.iter_ips():
+        with st.working():
+            store.clear_names()                     # rebuilt in full from what the stages above stored
+        for n, g in enumerate(store.iter_ips()):
+            if n % LOOP_TICK == 0:
+                st.progress()                       # no tool runs here, so the loop reports progress itself
             for e in g.endpoints:
                 names = cand.build_endpoint_names(
                     g.ptr_names, e.tls.certificate if e.tls else None, policy, max_candidates=cfg.max_candidates_per_ip,
@@ -1238,8 +1323,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     # ---- Stage 6: forward verification via ZDNS (A + AAAA, CNAME chains) -------------------
     def dns_stage() -> None:
-        store.prune_resolutions()                   # answers for names that are no longer candidates are not carried along
-        names = list(store.iter_candidate_names())
+        with st.working():
+            store.prune_resolutions()               # answers for names that are no longer candidates are not carried along
+            names = list(store.iter_candidate_names())
         if not names:
             return
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="dns") as pool:     # resolver traffic only
@@ -1271,7 +1357,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     def sni_stage() -> None:
         targets: list[tuple[str, int, str | None]] = []
-        for g in store.iter_ips():
+        for n, g in enumerate(store.iter_ips()):
+            if n % LOOP_TICK == 0:
+                st.progress()                       # building the target list runs no tool
             skipped: list[tuple[str, int, str, str]] = []
             for e in g.endpoints:
                 t = e.tls
@@ -1324,7 +1412,8 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     def favicon_stage() -> None:
         if not cfg.favicon.enabled:
             return
-        fjobs, job_ips, job_endpoints = favicon_jobs(store, cfg, counts)
+        with st.working():
+            fjobs, job_ips, job_endpoints = favicon_jobs(store, cfg, counts)
         if not fjobs or not ledger.wait(job_ips):
             return
         fp = fav.fetch_policy(cfg, sorted(job_ips))
@@ -1412,6 +1501,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                 counts.update(js.counts())
             if getattr(getattr(cfg.favicon, "javascript", None), "enabled", False) and not stop():
                 st.guard("favicon_js_icons", js_stage)
+            st.begin_tail()         # the counts, the icon index and the write-out below report nothing on their own
             # every job leaves exactly one record, whatever happened to it; fewer in the store means some were lost
             expected = len({(j["ip"], j["port"], j.get("hostname")) for j in fjobs})
             stored = store.count_favicons()
@@ -1453,6 +1543,7 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
 
     if not st.network_only:
         tarpits_known("favicon", favicon_stage)
+    st.begin_tail()         # also when the favicon stage was off or ended early: the write-out below still takes time
     st.check_now()          # a stop that arrived after the last check still belongs in the manifest
 
     if resume_from is not None and st.replay is None:
