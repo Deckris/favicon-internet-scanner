@@ -458,6 +458,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--retry-failed", action="store_true",
                     help="campaign --decoupled: give stages that failed in an earlier run fresh attempts (without it they stay failed "
                          "and the campaign ends at once)")
+    ap.add_argument("--skip-failed", action="store_true",
+                    help="campaign --decoupled: when a stage fails for good, go on with the other shards instead of stopping; the failed "
+                         "stages are listed at the end and need --retry-failed")
     ap.add_argument("--allow-per-process-limits", action="store_true",
                     help="campaign --decoupled: start several target-facing workers without a limiter socket, so that each applies "
                          "the per-network cap and the per-address pause on its own")
@@ -699,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
                     return 2
                 result = coordinator.run_decoupled(cfg, config_path=args.config, confirm=args.confirm, network_workers=args.network_workers,
                                                    favicon_workers=args.favicon_workers or coordinator.DEFAULT_FAVICON_WORKERS,
-                                                   retry_failed=args.retry_failed, zmap_lock=args.zmap_lock_file,
+                                                   retry_failed=args.retry_failed, skip_failed=args.skip_failed, zmap_lock=args.zmap_lock_file,
                                                    worker_args=tuple(worker_args), allow_per_process_limits=args.allow_per_process_limits, **span)
             else:
                 result = (run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config, **span) if args.pipeline > 1

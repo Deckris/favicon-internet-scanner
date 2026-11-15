@@ -54,6 +54,8 @@ except ImportError:             # Windows: no machine-wide lock; the coordinator
 
 STAGES = ("zmap", "network", "favicon")
 MAX_ATTEMPTS = 3
+MAX_STALLS = 10                 # stalled stages continued in place per stage before they count as failed (a stall is not an attempt; a long stage may stall several times)
+EXIT_STOPPED = 5                # stage-worker: the stage ended without finishing (stalled, killed, interrupted)
 DEFAULT_NETWORK_WORKERS = 2
 DEFAULT_FAVICON_WORKERS = 3
 EXIT_REFUSED = 2                # stage-worker: configuration, approval or preflight refusal; never retried
@@ -98,6 +100,12 @@ def derive_status(stages: dict[str, dict[str, Any]]) -> str:
     if any(s["status"] == "running" for s in stages.values()):
         return "running"
     return "pending"
+
+
+def _stalls_of(st: dict[str, Any]) -> int:
+    """How many stalls of this stage were continued so far; anything but a whole number of at least 0 reads as none."""
+    n = st.get("stalls", 0)
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0
 
 
 def stage_done_in(stage: str, manifest: dict[str, Any]) -> bool:
@@ -296,11 +304,12 @@ def run_decoupled(cfg: Any, *, config_path: Path, confirm: str | None = None, lo
                   sleep: Callable[[float], None] = time.sleep, alive: Callable[[int | None], bool] = pid_alive,
                   egress: Callable[[Any], str | None] | None = None, max_attempts: int = MAX_ATTEMPTS,
                   retry_failed: bool = False, zmap_lock: Path | str | None = None, worker_args: tuple[str, ...] = (),
-                  allow_per_process_limits: bool = False) -> dict[str, Any]:
+                  allow_per_process_limits: bool = False, skip_failed: bool = False) -> dict[str, Any]:
     """Run the campaign with decoupled stages; returns the same result record as the other campaign modes.
 
     ``retry_failed`` gives stages that failed in an earlier run fresh attempts; without it they stay failed and the campaign
-    ends at once. ``worker_args`` are command-line options handed to every stage worker."""
+    ends at once. ``skip_failed`` lets the other shards go on when a stage fails for good: the failure is listed, the campaign
+    ends when nothing else can run and reports the failed stages. ``worker_args`` are command-line options handed to every stage worker."""
     if network_workers < 1 or favicon_workers < 1:
         raise ValueError("--network-workers and --favicon-workers must be at least 1")
     refusal = limiter_refusal(cfg, network_workers, favicon_workers, allow_per_process_limits)
@@ -311,7 +320,7 @@ def run_decoupled(cfg: Any, *, config_path: Path, confirm: str | None = None, lo
     try:
         return _coordinate(cfg, span, Path(config_path), confirm, log, network_workers, favicon_workers, archive,
                            spawn or _spawn_process, tick, sleep, alive, egress or (lambda c: pre.current_egress(c)), max_attempts,
-                           retry_failed, zmap_lock_path(cfg, zmap_lock), tuple(worker_args))
+                           retry_failed, zmap_lock_path(cfg, zmap_lock), tuple(worker_args), skip_failed)
     finally:
         lock.unlink(missing_ok=True)
 
@@ -319,7 +328,7 @@ def run_decoupled(cfg: Any, *, config_path: Path, confirm: str | None = None, lo
 def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, log: Callable[[str], None], n_workers: int, f_workers: int,
                 archive: Any, spawn: Callable[[list[str], tuple[int, ...]], Any], tick: float, sleep: Callable[[float], None],
                 alive: Callable[[int | None], bool], egress: Callable[[Any], str | None], max_attempts: int,
-                retry_failed: bool, lock_path: Path, worker_args: tuple[str, ...]) -> dict[str, Any]:
+                retry_failed: bool, lock_path: Path, worker_args: tuple[str, ...], skip_failed: bool = False) -> dict[str, Any]:
     cdir = campaign.campaign_dir(cfg)
     cdir.mkdir(parents=True, exist_ok=True)
     path = cdir / "campaign.json"
@@ -331,12 +340,16 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
         shards[i] = entry
     # resume: a stage left running by a coordinator that is gone returns to pending, same attempt
     halted: dict[str, Any] | None = None          # a stage failed for good: running children finish, nothing starts
+    skipped_failed: list[dict[str, Any]] = []     # with skip_failed: the stages that failed for good while the others went on
     for i, entry in shards.items():
         for name, st in entry["stages"].items():
             if st["status"] == "failed":
                 if retry_failed:
                     log(f"[coordinator] shard {i + 1}/{cfg.shards} {name}: failed earlier ({st.get('error')}); trying again with fresh attempts")
-                    st.update(status="pending", attempts=0, owner_pid=None, stop_reason=None)
+                    st.update(status="pending", attempts=0, stalls=0, owner_pid=None, stop_reason=None)
+                elif skip_failed and st.get("stop_reason") in (None, "crashed"):
+                    skipped_failed.append({"shard": i, "stage": name, "detail": str(st.get("error"))})
+                    log(f"[coordinator] shard {i + 1}/{cfg.shards} {name}: failed earlier ({st.get('error')}); skipped, the other shards go on")
                 elif halted is None:
                     halted = {"shard": i, "reason": st.get("stop_reason") or "crashed", "stage": name,
                               "detail": f"{name} of shard {i} failed earlier ({st.get('error')}); pass --retry-failed to try it again"}
@@ -442,9 +455,17 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
             entry["status"] = derive_status(entry["stages"])
             _stop_for(i, name, "preflight_failed", "the stage worker was refused (configuration, approval or preflight)")
             return
+        if rc == EXIT_STOPPED and stopping is None and manifest.get("abort_reason") == "stalled" and _stalls_of(st) < MAX_STALLS:
+            st["stalls"] = _stalls_of(st) + 1       # the stage's own stall limit fired: continue in place, this is not a crash
+            st["status"] = "pending"
+            entry["status"] = derive_status(entry["stages"])
+            log(f"[coordinator] shard {i + 1}/{cfg.shards} {name} stalled ({st['stalls']}/{MAX_STALLS}); continuing in place, the attempt is not counted")
+            return
         st["attempts"] += 1
         if st["attempts"] >= max_attempts:
-            st.update(status="failed", stop_reason="crashed")
+            if _stalls_of(st) > 0:
+                how = f"{how}; after {_stalls_of(st)} stalls continued in place"
+            st.update(status="failed", stop_reason="crashed", error=how[:500])
             log(f"[coordinator] shard {i + 1}/{cfg.shards} {name} failed after {st['attempts']} attempts: {how}")
             _stop_for(i, name, "crashed", f"{name} of shard {i} {how}")
         else:
@@ -479,6 +500,10 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
 
     def _stop_for(i: int, name: str, reason: str, detail: str) -> None:
         nonlocal halted
+        if skip_failed and reason == "crashed":
+            skipped_failed.append({"shard": i, "stage": name, "detail": detail})
+            log(f"[coordinator] shard {i + 1}/{cfg.shards} {name}: {reason}; skipped, the other shards go on")
+            return
         if halted is None:
             halted = {"shard": i, "reason": reason, "detail": detail, "stage": name}
             log(f"[coordinator] shard {i + 1}/{cfg.shards} {name}: {reason}; nothing further starts, running stages finish")
@@ -489,6 +514,10 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
     def pending(name: str, needs: str | None) -> list[int]:
         return [i for i, e in shards.items() if e["stages"][name]["status"] == "pending"
                 and (needs is None or e["stages"][needs]["status"] == "done")]
+
+    def more_to_do() -> bool:
+        """Is any stage still waiting for its turn? A stage behind a skipped failure never gets one."""
+        return bool(pending("zmap", None) or pending("network", "zmap") or pending("favicon", "network"))
 
     try:
         while True:
@@ -565,6 +594,12 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
                     else:
                         halted = {"shard": None, "reason": "disk", "detail": disk_detail}
                     break
+                if skipped_failed and not more_to_do():
+                    first = skipped_failed[0]
+                    halted = {"shard": first["shard"], "reason": "crashed", "stage": first["stage"],
+                              "detail": f"{len(skipped_failed)} stage(s) failed and were skipped: "
+                                        + "; ".join(f"{f['stage']} of shard {f['shard']}" for f in skipped_failed)[:300]}
+                    break
             sleep(tick)
     finally:
         for sig, handler in previous.items():
@@ -580,6 +615,11 @@ def _coordinate(cfg: Any, span: range, config_path: Path, confirm: str | None, l
             if entry["status"] != "zero_responsive":
                 entry["status"] = derive_status(entry["stages"])
         campaign._write_json(path, state)
+    if skipped_failed:
+        names = "; ".join(f"{f['stage']} of shard {f['shard']}" for f in skipped_failed)
+        log(f"[coordinator] {len(skipped_failed)} stage(s) failed and were skipped: {names}; --retry-failed gives them fresh attempts")
+        if halted is not None and halted.get("reason") != "crashed":
+            halted["detail"] = f"{halted.get('detail')} (skipped failures: {names})"[:500]
     stopped = stopping or halted
     run_dirs = {i: Path(e["run_dir"]) for i, e in shards.items() if e["stages"]["favicon"]["status"] == "done"}
     return campaign.end_campaign(cfg, state, run_dirs, stopped, span)
