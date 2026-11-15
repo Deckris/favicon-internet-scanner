@@ -8,3 +8,11 @@ approval.yaml
 exclusions.txt
 STOP
 *.results.tar.gz
+
+# Local block lists are never part of the repository
+blocklist.*
+blocklist-*
+blocklist_*
+*-blocklist.*
+*_blocklist.*
+*.blocklist
