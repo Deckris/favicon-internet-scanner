@@ -1693,7 +1693,7 @@ def test_slow_store_calls_run_inside_a_working_block(method):
 
 
 def test_favicon_jobs_runs_inside_a_working_block():
-    calls = [c for c in plain_calls("favicon_jobs") if enclosing_function(c) == "favicon_stage"]
+    calls = [c for c in plain_calls("build_jobs") if enclosing_function(c) == "favicon_stage"]
     assert len(calls) == 1 and inside_working(calls[0])
 
 

@@ -31,6 +31,7 @@ from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.internet import outputs
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from scanner.internet.icon_store import IconStore
+from scanner.internet.joborder import order_groups
 from scanner.internet.offhost_service import OffhostClient, OffhostService
 from scanner.internet.pacing import DEFAULT_RETRY_AFTER_MAX_HOLD, DEFAULT_SUBNET_WAIT_MAX, IpPacer, SubnetLimiter, network_key
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
@@ -165,12 +166,14 @@ class GuardedFetcher(WebFetcher):
     port the approval does not cover. Decode errors from hostile bodies become a recorded outcome.
     """
 
+    _active: threading.BoundedSemaphore | None = None
+
     def __init__(self, *args: Any, allowed_endpoints: set[tuple[str, int]], pacer: Any = None,
                  max_active_requests: int | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.allowed_endpoints = frozenset(allowed_endpoints)
         self.pacer = pacer
-        # Workers that wait out the pause hold no socket; this bounds the requests actually on the wire.
+        # Bounds the requests in flight; taken before the pacer so a queued request holds no network slot.
         self._active = threading.BoundedSemaphore(max_active_requests) if max_active_requests else None
 
     @staticmethod
@@ -184,18 +187,22 @@ class GuardedFetcher(WebFetcher):
     def _one_request(self, parts, hostname, port, connect_ip, limits, timeout, deadline):   # type: ignore[override]
         if (connect_ip, port) not in self.allowed_endpoints:
             return self._outcome("policy_refused", connect_ip, hostname, port, parts.scheme)
+        # Lock order: the active-request semaphore first, then the pacer. A request never holds a pacer
+        # (network) slot while it waits for the semaphore, and the pacer never waits on the semaphore.
+        if self._active is None:
+            return self._paced_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+        with self._active:
+            return self._paced_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+
+    def _paced_request(self, parts, hostname, port, connect_ip, limits, timeout, deadline):
         if self.pacer is not None:
             verdict = _admit(self.pacer, connect_ip)
             if verdict != "ok":
                 return self._outcome(_SKIPS[verdict], connect_ip, hostname, port, parts.scheme)
         result = None
         try:
-            if self._active is None:
-                result = super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
-                return result
-            with self._active:
-                result = super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
-                return result
+            result = super()._one_request(parts, hostname, port, connect_ip, limits, timeout, deadline)
+            return result
         except Exception as exc:       # zlib.error / brotli.error / anything a hostile body provokes
             return self._outcome("decode_error" if "error" in type(exc).__name__.lower() else "fetch_error",
                                  connect_ip, hostname, port, parts.scheme)
@@ -669,9 +676,19 @@ class RecordLog:
             return RecordIndex()
         if outputs.is_compressed(path):
             return RecordIndex(held=self.load())
-        offsets: dict[tuple[str, int, str | None], int] = {}
-        at = 0
+        offsets, covered = self._read_sidecar(path)
+        if offsets is None:
+            offsets, covered = {}, 0
+        self._scan(path, covered, offsets)
+        return RecordIndex(path, offsets)
+
+    @staticmethod
+    def _scan(path: Path, start: int, offsets: dict) -> tuple[dict, int]:
+        """Add the records of the lines from ``start`` on; returns the offsets and the end of the last whole line."""
+        at = start
+        covered = start
         with path.open("rb") as fh:
+            fh.seek(start)
             for line in fh:
                 try:
                     rec = json.loads(line)
@@ -679,7 +696,58 @@ class RecordLog:
                 except (ValueError, KeyError, TypeError):
                     pass            # a line cut short by the kill
                 at += len(line)
-        return RecordIndex(path, offsets)
+                if line.endswith(b"\n"):
+                    covered = at
+        return offsets, covered
+
+    @property
+    def _sidecar(self) -> Path:
+        # In a run's raw/ folder the index lives in the run's work/ folder (never checksummed or archived).
+        if self.path.parent.name == "raw":
+            return self.path.parent.parent / "work" / (self.path.stem + ".idx")
+        return self.path.with_name(self.path.name + ".idx")
+
+    def _read_sidecar(self, path: Path) -> tuple[dict | None, int]:
+        """The offsets saved at the last clean close and the log size they cover, or (None, 0) if unusable."""
+        try:
+            size = path.stat().st_size
+            with self._sidecar.open("rb") as fh:
+                doc = json.loads(fh.read())
+            covered = doc["covered"]
+            if doc["version"] != 1 or not isinstance(covered, int) or covered < 0 or covered > size:
+                return None, 0
+            if covered:
+                with path.open("rb") as fh:
+                    fh.seek(covered - 1)
+                    if fh.read(1) != b"\n":
+                        return None, 0
+            offsets = {(ip, port, host): off for ip, port, host, off in doc["entries"]}
+            return offsets, covered
+        except (OSError, ValueError, KeyError, TypeError):
+            return None, 0
+
+    def _write_sidecar(self) -> None:
+        path = self.path
+        if not path.exists() or outputs.is_compressed(path):
+            return
+        offsets, covered = self._read_sidecar(path)
+        if offsets is None:
+            offsets, covered = {}, 0
+        offsets, covered = self._scan(path, covered, offsets)
+        doc = {"version": 1, "covered": covered,
+               "entries": [[ip, port, host, off] for (ip, port, host), off in offsets.items()]}
+        sidecar = self._sidecar
+        tmp = sidecar.with_name(sidecar.name + ".tmp")
+        try:
+            sidecar.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8", newline="\n") as fh:
+                json.dump(doc, fh, separators=(",", ":"))
+            os.replace(tmp, sidecar)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def append(self, rec: dict[str, Any]) -> None:
         line = json.dumps(rec, default=str) + "\n"
@@ -696,9 +764,12 @@ class RecordLog:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            had_writes = self._fh is not None
             if self._fh is not None:
                 self._fh.close()
                 self._fh = None
+            if had_writes:
+                self._write_sidecar()
 
 
 _WORKER_STACK_BYTES = 256 * 1024
@@ -836,7 +907,7 @@ def run_favicon_stage(fetcher: WebFetcher, jobs: list[dict[str, Any]], *, worker
     pool = _DaemonPool(workers)
     cap = 2 * max(1, workers)
     # Longest chains first, so the few addresses with many names do not set the tail of the stage.
-    pending = iter(sorted(groups.values(), key=len, reverse=True))
+    pending = iter(order_groups(list(groups.values()), jobs))
     inflight: dict[Future, list[int]] = {}
     finished: queue.SimpleQueue = queue.SimpleQueue()     # futures in completion order, filled by the workers' done callbacks
     failure: BaseException | None = None

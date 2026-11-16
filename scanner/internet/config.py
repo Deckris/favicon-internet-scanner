@@ -139,7 +139,8 @@ HOST_DERIVED_KEYS: dict[str, tuple[str, ...]] = {
     "measurement": ("zgrab_senders", "zgrab_parallel_batches", "zgrab_batch_size", "limiter_socket",
                     "zmap_source_ports"),
     "dns": ("threads", "query_resolver_version"),
-    "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds", "worker_max_lookups"),
+    "favicon": ("workers", "processes", "max_active_requests", "stage_max_seconds", "worker_max_lookups",
+                "prefetch", "fast_jobs"),
     # How long a stage may go without a sign of progress before it is aborted. It decides when a run is stopped, not
     # what it measures, and a host with slower disks needs a longer limit than a fast one.
     "operations": ("stall_minutes",),
@@ -492,7 +493,7 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
     fv = _section(raw, "favicon", {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page",
                                    "max_unverified_names_per_endpoint", "offhost_icons", "stage_max_seconds", "store_images",
                                    "icon_selection", "fallback", "max_active_requests", "reuse_http_document", "processes", "javascript",
-                                   "worker_max_lookups"},
+                                   "worker_max_lookups", "prefetch", "fast_jobs"},
                   {"enabled", "max_hostnames_per_endpoint", "workers", "max_icons_per_page"})
     oh = _section({"offhost_icons": fv.get("offhost_icons") or {"enabled": False}}, "offhost_icons",
                   {"enabled", "max_total_fetches", "max_per_host", "min_interval_seconds", "max_bytes"}, {"enabled"})
@@ -560,6 +561,8 @@ def load_config(path: Path, *, base_dir: Path | None = None, require_approval: b
             fallback=_choice(fv.get("fallback", "always_if_no_image"), "favicon.fallback", FALLBACK_MODES),
             max_active_requests=_int(fv.get("max_active_requests", 512), "favicon.max_active_requests", 1, 8192),
             reuse_http_document=_bool(fv.get("reuse_http_document", True), "favicon.reuse_http_document"),
+            prefetch=_bool(fv.get("prefetch", True), "favicon.prefetch"),
+            fast_jobs=_bool(fv.get("fast_jobs", True), "favicon.fast_jobs"),
             javascript=SimpleNamespace(
                 enabled=js["enabled"],
                 max_pages_per_shard=_int(js.get("max_pages_per_shard", 1000), "favicon.javascript.max_pages_per_shard", 1, 10**7),

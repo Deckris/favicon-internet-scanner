@@ -265,6 +265,7 @@ GOOD_VALUES = {
     ("dns", "query_resolver_version"): (False, True),
     ("favicon", "workers"): (3, 9), ("favicon", "processes"): (1, 2), ("favicon", "max_active_requests"): (100, 300),
     ("favicon", "stage_max_seconds"): (8000, 9000), ("favicon", "worker_max_lookups"): (10, 20000),
+    ("favicon", "prefetch"): (False, True), ("favicon", "fast_jobs"): (False, True),
     ("operations", "stall_minutes"): (2, 600), ("target_policy", "exclusions_overlay_file"): ("a.txt", "b.txt"),
 }
 

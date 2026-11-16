@@ -308,3 +308,45 @@ def test_batched_buffer_is_flushed_before_a_read_and_on_close(tmp_path):
     s = ShardStore(p)
     assert s.count_endpoints() == 2
     s.close()
+
+
+def _big_store(tmp_path, size=3 * 1024 * 1024):
+    s = ShardStore(tmp_path / "pf" / "facts.sqlite")
+    s.put_endpoints((f"10.0.{i // 250}.{i % 250}", 443) for i in range(20000))
+    s.flush()
+    return s
+
+
+def test_prefetch_reads_whole_file(tmp_path):
+    import os
+    s = _big_store(tmp_path)
+    try:
+        want = sum(os.path.getsize(str(s.path) + suffix) for suffix in ("", "-wal") if os.path.exists(str(s.path) + suffix))
+        read, seconds = s.prefetch(meminfo=lambda: 1 << 40)
+        assert read == want > 0
+        assert seconds >= 0
+    finally:
+        s.close()
+
+
+def test_prefetch_skips_when_file_exceeds_memory_share(tmp_path):
+    s = _big_store(tmp_path)
+    try:
+        assert s.prefetch(max_fraction=0.6, meminfo=lambda: 1000)[0] == 0
+    finally:
+        s.close()
+
+
+def test_prefetch_reads_when_meminfo_unreadable(tmp_path):
+    s = _big_store(tmp_path)
+    try:
+        assert s.prefetch(meminfo=lambda: None)[0] > 0
+    finally:
+        s.close()
+
+
+def test_prefetch_missing_file_is_not_an_error(tmp_path):
+    s = ShardStore(tmp_path / "pf2" / "facts.sqlite")
+    s.close()
+    s.delete()
+    assert s.prefetch(meminfo=lambda: 1 << 40)[0] == 0

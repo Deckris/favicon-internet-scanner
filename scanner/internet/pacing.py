@@ -25,6 +25,7 @@ import ipaddress
 import logging
 import math
 import os
+import random
 import threading
 import time
 from collections import deque
@@ -33,7 +34,23 @@ from typing import Any, Callable, Iterable, Mapping, TypeVar
 T = TypeVar("T")
 _SLICE = 0.5
 _CHECK = 1.0               # longest sleep of a pacer waiter between looks at the kill switch
-_LIMIT_POLL = 0.25          # how often a caller blocked only by the network cap looks again
+_LIMIT_POLL = 0.25          # how often a caller blocked only by the network cap looks again (the floor)
+_LIMIT_POLL_CAP = 1.0       # a repeatedly refused caller backs off to this, unless the limiter asks for longer
+_LIMIT_HINT_MAX = 10.0      # longest wait hint of the limiter that is honoured in one go
+_LIMIT_GROWTH = 1.5
+_LIMIT_JITTER = 0.1         # extra, never less: waits only get longer by up to this fraction
+
+
+def refusal_delay(hint: float | None, refusals: int, rand: Callable[[], float] = random.random) -> float:
+    """How long a caller refused ``refusals`` times in a row waits before it asks again.
+
+    Never shorter than the limiter's hint nor than ``_LIMIT_POLL``; it grows with repeated refusals up to
+    ``_LIMIT_POLL_CAP`` (a longer hint is honoured as given, up to ``_LIMIT_HINT_MAX``) and carries a little jitter.
+    """
+    hint = 0.0 if hint is None or hint != hint else min(max(float(hint), 0.0), _LIMIT_HINT_MAX)
+    base = max(hint, _LIMIT_POLL)
+    grown = min(_LIMIT_POLL * _LIMIT_GROWTH ** max(refusals - 1, 0), _LIMIT_POLL_CAP)
+    return max(base, grown) * (1.0 + _LIMIT_JITTER * rand())
 DEFAULT_RETRY_AFTER_MAX_HOLD = 30.0     # longest a network is left alone after one Retry-After
 DEFAULT_SUBNET_WAIT_MAX = 120.0         # longest a request waits for a network slot before it is skipped
 WAIT_OK, WAIT_STOPPED, WAIT_BUSY = "ok", "stopped", "network_busy"
@@ -163,6 +180,8 @@ class IpPacer:
         counts = {self.limiter.key_of(ip): 1} if self.limiter is not None else None
         slot: float | None = None
         blocked_since: float | None = None      # when the network first refused this caller with its own pause over
+        retry_at = float("-inf")                # the limiter is not asked again before this
+        refusals = 0
         while True:
             if self._killed() or (self._stop is not None and self._stop.is_set()):
                 return WAIT_STOPPED
@@ -177,6 +196,8 @@ class IpPacer:
                 earliest = max(slot, last + self.min_interval) if self.min_interval > 0 else slot
                 if now < earliest - 1e-9:
                     delay = earliest - now
+                elif now < retry_at:
+                    delay = retry_at - now
                 elif ip in self._claiming:
                     delay = 0.01            # another thread is asking the limiter for this address
                 elif counts is None:
@@ -201,9 +222,11 @@ class IpPacer:
                     blocked_since = now
                 if self.max_wait is not None and now - blocked_since >= self.max_wait:
                     return WAIT_BUSY
-                delay = _LIMIT_POLL
+                refusals += 1
+                delay = refusal_delay(getattr(self.limiter, "wait_hint", lambda: None)(), refusals)
                 if self.max_wait is not None:
                     delay = min(delay, max(blocked_since + self.max_wait - now, 0.01))
+                retry_at = now + delay
             _nap(min(self._poll, delay), self._sleep, self._stop)
 
     def done(self, ip: str, result: Any = None) -> None:

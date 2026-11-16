@@ -283,3 +283,20 @@ def test_shared_checksum_ignores_host_local_parts(tmp_path):
              "favicon": {**raw["favicon"], "workers": 500}}
     assert shared_checksum(raw) == shared_checksum(moved) == shared_config_checksum(raw)
     assert shared_checksum(raw) != shared_checksum({**raw, "sample": {**raw["sample"], "seed": 99}})
+
+
+def test_prefetch_setting_does_not_change_checksums(tmp_path):
+    from scanner.internet.config import config_checksum, shared_config_checksum
+    raw = load_config(write_config(tmp_path)).raw
+    off = {**raw, "favicon": {**raw["favicon"], "prefetch": False}}
+    on = {**raw, "favicon": {**raw["favicon"], "prefetch": True}}
+    assert config_checksum(raw) == config_checksum(off) == config_checksum(on)
+    assert shared_config_checksum(raw) == shared_config_checksum(off) == shared_config_checksum(on)
+
+
+def test_fast_jobs_setting_does_not_change_checksums(tmp_path):
+    from scanner.internet.config import config_checksum, shared_config_checksum
+    raw = load_config(write_config(tmp_path)).raw
+    off = {**raw, "favicon": {**raw["favicon"], "fast_jobs": False}}
+    assert config_checksum(raw) == config_checksum(off)
+    assert shared_config_checksum(raw) == shared_config_checksum(off)

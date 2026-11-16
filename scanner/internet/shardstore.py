@@ -24,6 +24,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
@@ -208,6 +209,21 @@ _SQL = {
 }
 
 
+_PREFETCH_BLOCK = 8 * 1024 * 1024
+
+
+def _mem_available() -> int | None:
+    """MemAvailable from /proc/meminfo in bytes, or None where it cannot be read."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 class ShardStore:
     """Facts of one shard run on disk. Safe to call from any number of threads."""
 
@@ -234,6 +250,48 @@ class ShardStore:
             self._db.execute("ALTER TABLE synack ADD COLUMN seen_at TEXT")      # a store written before the column existed
 
     # -------------------------------------------------------------- lifecycle
+
+    def prefetch(self, max_fraction: float = 0.6, *, meminfo: Any = None) -> tuple[int, float]:
+        """Read the database and its write-ahead log once, front to back, so the page cache holds them before the
+        random reads start. Returns the bytes read and the seconds taken; (0, 0.0) when the files are larger than
+        ``max_fraction`` of the available memory, since they would only push each other out of the cache."""
+        start = time.monotonic()
+        paths = [str(self.path), str(self.path) + "-wal"]
+        sizes = []
+        for p in paths:
+            try:
+                sizes.append(os.path.getsize(p))
+            except OSError:
+                sizes.append(0)
+        total = sum(sizes)
+        if total <= 0:
+            return 0, 0.0
+        try:
+            available = (meminfo or _mem_available)()
+        except Exception:
+            available = None
+        if available is not None and total > available * max_fraction:
+            return 0, 0.0
+        done = 0
+        for p, size in zip(paths, sizes):
+            if size <= 0:
+                continue
+            try:
+                with open(p, "rb", buffering=0) as fh:
+                    advise = getattr(os, "posix_fadvise", None)
+                    if advise is not None:
+                        try:
+                            advise(fh.fileno(), 0, 0, os.POSIX_FADV_WILLNEED)
+                        except OSError:
+                            pass
+                    while True:
+                        block = fh.read(_PREFETCH_BLOCK)
+                        if not block:
+                            break
+                        done += len(block)
+            except OSError:
+                continue
+        return done, time.monotonic() - start
 
     def _remove_files(self) -> None:
         for suffix in ("", "-wal", "-shm", "-journal"):

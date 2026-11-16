@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from scanner.internet import __main__ as cli
-from scanner.internet import coordinator, pipeline, supervisor
+from scanner.internet import coordinator, fastjobs, pipeline, supervisor
 from scanner.internet.config import load_config
 from scanner.internet.shardstore import ShardStore
 from tests.helpers import FakeFetcher
@@ -149,10 +149,10 @@ def around(monkeypatch, owner, name, before, *, once=False):
     return count
 
 
-STEPS = [(ShardStore, "fill_missing_ptr"), (ShardStore, "clear_names"), (ShardStore, "prune_resolutions"), (pipeline, "favicon_jobs")]
-STEP_IDS = [name for _, name in STEPS]
+STEPS = [(ShardStore, "fill_missing_ptr"), (ShardStore, "clear_names"), (ShardStore, "prune_resolutions"), (fastjobs, "favicon_jobs_fast")]
+STEP_IDS = ["fill_missing_ptr", "clear_names", "prune_resolutions", "favicon_jobs"]
 SOME_STEPS = [STEPS[1], STEPS[3]]
-SOME_IDS = [name for _, name in SOME_STEPS]
+SOME_IDS = [STEP_IDS[1], STEP_IDS[3]]
 
 
 # ------------------------------------------------------------------ the limit comes from the configuration
@@ -413,7 +413,7 @@ def test_the_stage_worker_does_not_call_a_kill_switch_stop_a_stall(tmp_path, mon
     assert cli.main(zmap) == 0
     network, _ = _worker_args(path, cfg, "network")
     around(monkeypatch, ShardStore, "clear_names", lambda: Path(cfg.kill_switch_file).write_text("stop"), once=True)
-    around(monkeypatch, pipeline, "favicon_jobs", lambda: instances.seen[-1].stop.wait(30))
+    around(monkeypatch, fastjobs, "favicon_jobs_fast", lambda: instances.seen[-1].stop.wait(30))
     assert cli.main(network) == EXIT_STOPPED
     assert manifest_of(run_dir)["abort_reason"] == "kill_switch"
 

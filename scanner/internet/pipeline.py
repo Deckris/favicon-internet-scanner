@@ -32,6 +32,7 @@ from typing import Any, Callable, Iterator
 from scanner import asn_context
 from scanner.internet import candidates as cand
 from scanner.internet import enrich
+from scanner.internet import fastjobs
 from scanner.internet import favicon as fav
 from scanner.internet import icon_store
 from scanner.internet import js_icons
@@ -1412,8 +1413,15 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
     def favicon_stage() -> None:
         if not cfg.favicon.enabled:
             return
+        if cfg.favicon.prefetch:
+            with st.working():
+                warmed, warm_seconds = store.prefetch()
+            if warmed:
+                print(f"[scanner] favicon: read {warmed / 1e9:.1f} GB of the shard store into the page cache in {warm_seconds:.0f} s",
+                      file=sys.stderr, flush=True)
         with st.working():
-            fjobs, job_ips, job_endpoints = favicon_jobs(store, cfg, counts)
+            build_jobs = fastjobs.favicon_jobs_fast if cfg.favicon.fast_jobs else favicon_jobs
+            fjobs, job_ips, job_endpoints = build_jobs(store, cfg, counts)
         if not fjobs or not ledger.wait(job_ips):
             return
         fp = fav.fetch_policy(cfg, sorted(job_ips))

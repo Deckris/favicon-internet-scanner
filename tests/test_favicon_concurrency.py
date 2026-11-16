@@ -174,3 +174,80 @@ def test_fingerprint_cache_returns_the_same_result_and_decodes_each_icon_once(mo
     assert (cache.hits, cache.misses) == (1, 1)
     cache(b"not an image"), cache(b"other bytes"), cache(png)       # capacity 2: the oldest entry was evicted
     assert len(calls) == 4
+
+
+class _SlotPacer:
+    """Fake pacer: counts the network slots held and records the peak."""
+
+    def __init__(self):
+        self.held = self.peak = 0
+        self.lock = threading.Lock()
+
+    def admit(self, ip):
+        with self.lock:
+            self.held += 1
+            self.peak = max(self.peak, self.held)
+        return "ok"
+
+    def done(self, ip, result=None):
+        with self.lock:
+            self.held -= 1
+
+
+def _guarded(pacer, active):
+    guarded = object.__new__(fav.GuardedFetcher)
+    guarded.allowed_endpoints = frozenset([("198.51.100.7", 80)])
+    guarded.pacer = pacer
+    guarded._active = threading.BoundedSemaphore(active)
+    return guarded
+
+
+class _Parts:
+    scheme = "http"
+
+
+def test_queued_requests_hold_no_network_slot(monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocked(self, parts, hostname, port, connect_ip, limits, timeout, deadline):
+        entered.set()
+        release.wait(5)
+        return fav.GuardedFetcher._outcome("ok", connect_ip, hostname, port, parts.scheme)
+
+    monkeypatch.setattr(WebFetcher, "_one_request", blocked)
+    pacer = _SlotPacer()
+    guarded = _guarded(pacer, 1)
+    threads = [threading.Thread(target=lambda: guarded._one_request(_Parts, "h", 80, "198.51.100.7", None, None, None)) for _ in range(3)]
+    [t.start() for t in threads]
+    assert entered.wait(5)
+    time.sleep(0.1)
+    assert pacer.held == 1                      # one active request, two queued holding nothing
+    release.set()
+    [t.join() for t in threads]
+    assert pacer.held == 0 and pacer.peak == 1
+
+
+def test_slot_and_semaphore_released_when_the_request_raises(monkeypatch):
+    def boom(self, *a):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(WebFetcher, "_one_request", boom)
+    pacer = _SlotPacer()
+    guarded = _guarded(pacer, 1)
+    for _ in range(3):
+        out = guarded._one_request(_Parts, "h", 80, "198.51.100.7", None, None, None)
+        assert out.outcome == "decode_error"
+    assert pacer.held == 0
+    assert guarded._active.acquire(blocking=False)
+
+
+def test_refused_admission_releases_the_semaphore():
+    class Busy:
+        def admit(self, ip):
+            return "network_busy"
+
+    guarded = _guarded(Busy(), 1)
+    for _ in range(3):
+        assert guarded._one_request(_Parts, "h", 80, "198.51.100.7", None, None, None).outcome == "skipped_network_busy"
+    assert guarded._active.acquire(blocking=False)

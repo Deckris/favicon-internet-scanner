@@ -77,6 +77,7 @@ class LimiterClient:
         self._closed = threading.Event()
         self._keepalive: threading.Thread | None = None
         self._last_error = ""
+        self._local = threading.local()         # per thread: the wait hint of its last refused claim
 
     # transport
 
@@ -247,6 +248,10 @@ class LimiterClient:
             out[k] = out.get(k, 0) + 1
         return out
 
+    def wait_hint(self) -> float | None:
+        """Seconds the daemon asked this thread to wait after its last refused claim (None: no hint)."""
+        return getattr(self._local, "hint", None)
+
     def _claim(self, message: dict[str, Any], ticket: int | None, counts: Mapping[str, int],
                ips: Iterable[str] = (), exclusive: bool = False, partial: bool = False) -> dict[str, Any] | None:
         def granted(reply: dict[str, Any]) -> None:
@@ -255,6 +260,13 @@ class LimiterClient:
                 self._granted(self.counts(got) if partial or ips else counts, got, exclusive)
 
         reply = self._call({"op": "claim", "ticket": ticket, "exclusive": exclusive, **message}, strict=True, on_ok=granted)
+        hint: float | None = None
+        if reply is None:
+            hint = max(self._down_until - self._now(), 0.0) or None     # daemon unreachable: no claim before the retry
+        elif not reply.get("granted"):
+            w = reply.get("wait")
+            hint = float(w) if isinstance(w, (int, float)) and not isinstance(w, bool) else None
+        self._local.hint = hint
         if ticket is not None:
             with self._state:
                 if reply is not None and reply.get("granted"):
