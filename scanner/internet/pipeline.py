@@ -1396,6 +1396,9 @@ def _run_stages_with(store, cfg, st, policy, splan, exclusions, run_dir, executo
                     lost = sum(n for _, n in worker_failures)
                     st.errors["favicon_workers"] = (f"{len(worker_failures)} favicon worker process(es) failed, {lost} of {len(fjobs)} lookups "
                                                     f"lost; first: {worker_failures[0][0]}")[:500]
+                    other = [why for why, _ in worker_failures if "LimiterOutage" not in why and "LimiterUnavailable" not in why]
+                    if other:       # workers that failed for other reasons too: not a pure limiter failure
+                        st.errors["favicon_workers_other"] = f"{len(other)} favicon worker failure(s) not caused by the limiter; first: {other[0]}"[:500]
             else:
                 fav.run_favicon_stage(f, fjobs, **common)
             def js_stage() -> None:

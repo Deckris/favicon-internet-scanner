@@ -32,6 +32,7 @@ from scanner.internet import outputs
 from scanner.internet.enrich import document_facts, icon_declaration_facts
 from scanner.internet.icon_store import IconStore
 from scanner.internet.offhost_service import OffhostClient, OffhostService
+from scanner.internet.limiterclient import LimiterOutage, LimiterRefused
 from scanner.internet.pacing import DEFAULT_RETRY_AFTER_MAX_HOLD, DEFAULT_SUBNET_WAIT_MAX, IpPacer, SubnetLimiter, network_key
 from pipeline.favicon_hash import fingerprint as compute_fingerprint
 from scanner.favicon_acquire import acquire_favicons
@@ -587,6 +588,8 @@ def probe_identity(fetcher: WebFetcher, *, scheme: str, ip: str, port: int, host
         html = None         # the page can be megabytes; icon fetches below may wait a long time for pacing
         fill_icon_fields(record, fetcher, url=url, ip=ip, declared=declared, max_icons=max_icons, icon_store=icon_store,
                          selection=selection, fallback=fallback)
+    except (LimiterOutage, LimiterRefused):
+        raise                   # the limiter is gone or refuses this process: the stage must end, not record every lookup as an error
     except Exception as exc:   # one bad endpoint must never abort the stage
         record["error"] = f"{type(exc).__name__}: {exc}"[:300]
         record["favicon_outcome"] = "error"
@@ -1071,9 +1074,9 @@ def _worker_main(index: int, factory: Any, jobs: list[dict[str, Any]], settings:
     try:
         stopped = stop.is_set
         if settings.get("limiter_socket") and settings.get("subnet_cap"):
-            from scanner.internet.limiterclient import LimiterClient
+            from scanner.internet.limiterclient import LimiterClient, start_wait_from_env
             limiter = LimiterClient(settings["limiter_socket"], settings["subnet_cap"], settings["pace"])
-            limiter.require()
+            limiter.require(start_wait_from_env())
         else:
             limiter = (SubnetLimiter(settings["subnet_cap"], max_hold=settings["retry_after_max_hold"])
                        if settings.get("subnet_cap") else None)
@@ -1159,15 +1162,18 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
     def prior_of(job: dict[str, Any]) -> dict[str, Any] | None:
         return done.get((job["ip"], job["port"], job.get("hostname"))) if done else None
 
-    def settle_rest(indexes: list[int], why: str | None) -> None:
-        """Records for the jobs of a partition that never reported: a stop skips them, a failure is an error."""
+    def settle_rest(indexes: list[int], why: str | None, report: bool = False) -> None:
+        """Records for the jobs of a partition that never reported: a stop skips them, a failure is an error.
+
+        ``report`` makes the failure known to ``on_failure`` even when the worker already handed in a record for every
+        job (a worker that fails winds down and skips what it had not started), so a failed worker is never silent."""
         lost = 0
         for k in indexes:
             if k not in sunk:
                 prior = prior_of(jobs[k])
                 lost += prior is None
                 deliver(k, prior or (_failed(jobs[k], why) if why else _skipped(jobs[k])))
-        if why and lost and on_failure is not None:
+        if why and (lost or report) and on_failure is not None:
             on_failure(why, lost)
 
     if killed():
@@ -1240,12 +1246,12 @@ def run_favicon_stage_processes(factory: Any, jobs: list[dict[str, Any]], *, pro
             else:
                 finished.add(i)
         elif kind == "error":
-            settle_rest(rest_of(i), f"favicon worker process {i}: {message[1]}")
+            settle_rest(rest_of(i), f"favicon worker process {i}: {message[1]}", report=True)
             finished.add(i)
 
     def lost(i: int) -> None:
         """Process ``i`` is gone without a result: error records for what it left. The others carry on."""
-        settle_rest(rest_of(i), f"favicon worker process {i}: exited with code {procs[i].exitcode} without a result")
+        settle_rest(rest_of(i), f"favicon worker process {i}: exited with code {procs[i].exitcode} without a result", report=True)
         finished.add(i)
 
     def drain(i: int) -> None:

@@ -12,7 +12,8 @@ StartLimitBurst=10
 Type=simple
 User=scanner
 EnvironmentFile=/etc/scanner/scanner.env
-ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet limiterd --socket "$${SCANNER_LIMITER_SOCKET}" --config "$${SCANNER_CONFIG}"'
+# The daemon is started through its own module, scanner.internet.limiterd.
+ExecStart=/bin/sh -c 'cd "$${SCANNER_HOME}" && exec "$${SCANNER_PYTHON}" -m scanner.internet.limiterd --socket "$${SCANNER_LIMITER_SOCKET}" --config "$${SCANNER_CONFIG}"'
 # The limiter holds the shared rate state, so it comes back after any exit, a clean one included.
 Restart=always
 RestartSec=2

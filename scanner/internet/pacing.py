@@ -25,6 +25,7 @@ import ipaddress
 import logging
 import math
 import os
+import random
 import threading
 import time
 from collections import deque
@@ -37,7 +38,9 @@ _LIMIT_POLL = 0.25          # how often a caller blocked only by the network cap
 DEFAULT_RETRY_AFTER_MAX_HOLD = 30.0     # longest a network is left alone after one Retry-After
 DEFAULT_SUBNET_WAIT_MAX = 120.0         # longest a request waits for a network slot before it is skipped
 WAIT_OK, WAIT_STOPPED, WAIT_BUSY = "ok", "stopped", "network_busy"
-_PRUNE_EVERY = 4096         # releases between sweeps for idle back-off records
+_HINT_CAP = 1.0             # longest delay between two looks of a caller held by a full network
+_HINT_GROWTH = 1.5
+_PRUNE_EVERY = 4096        # releases between sweeps for idle back-off records
 log = logging.getLogger(__name__)
 
 
@@ -102,6 +105,39 @@ def _sleep_until(deadline: float, killed: Callable[[], bool], now: Callable[[], 
         _nap(min(slice_seconds, remaining), sleep, stop_event)
 
 
+def _unreachable(limiter: Any) -> bool:
+    """True if ``limiter`` is a daemon client that cannot reach its daemon now (an in-process limiter never is)."""
+    check = getattr(limiter, "unreachable", None)
+    return callable(check) and check() is True
+
+
+def _retry_in(limiter: Any) -> float:
+    """Seconds until a daemon client tries to reach its daemon again, at least a short beat."""
+    try:
+        return max(float(limiter.retry_in()), 0.05)
+    except (AttributeError, TypeError, ValueError):
+        return 0.05
+
+
+def hint_delay(reason: str | None, wait: float, refusals: int = 0, default: float = _LIMIT_POLL,
+               rng: Callable[[], float] = random.random) -> float:
+    """When to ask the limiter again after a refusal, from the reason and wait it gave (``refusals``: how many
+    refusals came before this one in a row). A pause that is not over is asked about when it ends; a full network
+    starts at the hint, grows by half each time up to a second, and is spread so waiting threads do not ask in step.
+    Only the time of the next question is chosen here: a grant is the limiter's alone."""
+    try:
+        wait = float(wait)
+    except (TypeError, ValueError):
+        return default
+    if reason == "gap" and wait > 0:
+        return max(wait, 0.01)
+    if reason == "startup" and wait > 0:
+        return min(max(wait, 0.05), _HINT_CAP)
+    if reason == "full" and wait > 0:
+        return min(wait * _HINT_GROWTH ** min(refusals, 16), max(_HINT_CAP, wait)) * (0.8 + 0.4 * rng())
+    return default
+
+
 class IpPacer:
     """Thread-safe: a request to an address is released at least ``min_interval`` after the previous release.
 
@@ -163,6 +199,7 @@ class IpPacer:
         counts = {self.limiter.key_of(ip): 1} if self.limiter is not None else None
         slot: float | None = None
         blocked_since: float | None = None      # when the network first refused this caller with its own pause over
+        refusals = 0
         while True:
             if self._killed() or (self._stop is not None and self._stop.is_set()):
                 return WAIT_STOPPED
@@ -187,8 +224,13 @@ class IpPacer:
                     claiming = True
             if claiming:
                 # The limiter may be a daemon behind a socket: ask without holding the pacer lock.
+                reason, hint = None, 0.0
                 try:
-                    got = self.limiter.try_acquire(counts, ips=[ip])
+                    ask = getattr(self.limiter, "try_acquire_hint", None)
+                    if ask is not None:
+                        got, reason, hint = ask(counts, ips=[ip])
+                    else:
+                        got = self.limiter.try_acquire(counts, ips=[ip])
                 finally:
                     with self._lock:
                         self._claiming.discard(ip)
@@ -197,13 +239,19 @@ class IpPacer:
                         self._grant_locked(ip, self._now())
                     return WAIT_OK
                 now = self._now()
-                if blocked_since is None:
-                    blocked_since = now
-                if self.max_wait is not None and now - blocked_since >= self.max_wait:
-                    return WAIT_BUSY
-                delay = _LIMIT_POLL
-                if self.max_wait is not None:
-                    delay = min(delay, max(blocked_since + self.max_wait - now, 0.01))
+                refusals += 1
+                if _unreachable(self.limiter):
+                    # An absent daemon is not a busy network: it does not count against max_wait.
+                    blocked_since = None
+                    delay = _retry_in(self.limiter)
+                else:
+                    if blocked_since is None:
+                        blocked_since = now
+                    if self.max_wait is not None and now - blocked_since >= self.max_wait:
+                        return WAIT_BUSY
+                    delay = hint_delay(reason, hint, refusals - 1, _LIMIT_POLL)
+                    if self.max_wait is not None:
+                        delay = min(delay, max(blocked_since + self.max_wait - now, 0.01))
             _nap(min(self._poll, delay), self._sleep, self._stop)
 
     def done(self, ip: str, result: Any = None) -> None:
@@ -249,6 +297,15 @@ def network_key(ip: str) -> str:
     if addr.ipv4_mapped is not None:
         return network_key(str(addr.ipv4_mapped))
     return "6:" + addr.packed[:6].hex()
+
+
+def quick_key(ip: str) -> str:
+    """``network_key`` for the daemon's loops: the same value for every input; only the plain dotted form is
+    handled inline, anything with a colon takes ``network_key``."""
+    if ":" in ip:
+        return network_key(ip)
+    head, sep, _ = ip.rpartition(".")
+    return head if sep else ip
 
 
 class BackoffState:
@@ -442,6 +499,41 @@ class SubnetLimiter:
                 self._active[key] = self._active.get(key, 0) + n
             return got
 
+    def try_acquire_some_keyed(self, ips: list[str], keys: list[str],
+                               ticket: int | None = None) -> tuple[list[str], dict[str, int]]:
+        """``try_acquire_some`` for a caller that has the network key of every address already (``keys[i]`` is the key of
+        ``ips[i]``). Returns the addresses taken and the slots taken per network, as ``counts`` would give them."""
+        with self._lock:
+            now = self._now()
+            active, states = self._active, self._states
+            taken: dict[str, int] = {}
+            got: list[str] = []
+            wanted: frozenset[str] | None = None
+            if self._waiting or ticket is not None:
+                wanted = frozenset(keys)
+            if not self._waiting or not self._behind_locked(ticket, wanted):
+                for ip, key in zip(ips, keys):
+                    state = states.get(key)
+                    if state is None:
+                        if active.get(key, 0) + taken.get(key, 0) + 1 <= self.cap:
+                            taken[key] = taken.get(key, 0) + 1
+                            got.append(ip)
+                        continue
+                    if state.held(now):
+                        continue
+                    if active.get(key, 0) + taken.get(key, 0) + 1 <= self._limit_locked(key, now):
+                        taken[key] = taken.get(key, 0) + 1
+                        got.append(ip)
+            if not got:
+                if ticket is not None and self._waiting.get(ticket) != wanted:
+                    self._waiting[ticket] = wanted
+                return [], {}
+            if ticket is not None:
+                self._waiting.pop(ticket, None)
+            for key, n in taken.items():
+                active[key] = active.get(key, 0) + n
+            return got, taken
+
     def acquire(self, counts: Mapping[str, int], killed: Callable[[], bool] = lambda: False, stop_event: Any = None,
                 sleep: Callable[[float], None] = time.sleep, poll: float = _LIMIT_POLL) -> bool:
         """Wait for the slots. False means a stop condition fired first."""
@@ -515,9 +607,9 @@ def limiter_for(measurement: Any) -> Any:
     ``SubnetLimiter``, or a client of the machine-wide daemon when ``limiter_socket`` (or ``SCANNER_LIMITER_SOCKET``) is set."""
     path = getattr(measurement, "limiter_socket", None) or os.environ.get("SCANNER_LIMITER_SOCKET")
     if path:
-        from scanner.internet.limiterclient import LimiterClient
+        from scanner.internet.limiterclient import LimiterClient, start_wait_from_env
         client = LimiterClient(path, measurement.max_connections_per_subnet, measurement.min_seconds_between_probes_per_ip)
-        client.require()
+        client.require(start_wait_from_env())
         return client
     return SubnetLimiter(measurement.max_connections_per_subnet, max_hold=measurement.retry_after_max_hold_seconds)
 
@@ -624,6 +716,7 @@ class ContactLedger:
     def _claim(self, ips: list[str], extra: Callable[[float], bool] | None, partial: bool) -> list[str] | None:
         ticket = self.limiter.ticket() if self.limiter is not None else None
         blocked_since: float | None = None      # when the networks first refused a claim that was otherwise ready
+        refusals = 0
         try:
             while True:
                 if self._killed() or (self._stop is not None and self._stop.is_set()):
@@ -647,11 +740,22 @@ class ContactLedger:
                 if ask:
                     # The limiter may be a daemon behind a socket: ask without holding the ledger lock.
                     got: list[str] = []
+                    reason, hint = None, 0.0
                     try:
                         if partial:
-                            got = self.limiter.try_acquire_some(ips, ticket, exclusive=True)
-                        elif self.limiter.try_acquire(self.limiter.counts(ips), ticket, ips=ips, exclusive=True):
-                            got = list(ips)
+                            some = getattr(self.limiter, "try_acquire_some_hint", None)
+                            if some is not None:
+                                got, reason, hint = some(ips, ticket, exclusive=True)
+                            else:
+                                got = self.limiter.try_acquire_some(ips, ticket, exclusive=True)
+                        else:
+                            one = getattr(self.limiter, "try_acquire_hint", None)
+                            if one is not None:
+                                taken, reason, hint = one(self.limiter.counts(ips), ticket, ips=ips, exclusive=True)
+                            else:
+                                taken = self.limiter.try_acquire(self.limiter.counts(ips), ticket, ips=ips, exclusive=True)
+                            if taken:
+                                got = list(ips)
                     finally:
                         with self._lock:
                             self._busy.difference_update(set(ips) - set(got))
@@ -661,12 +765,19 @@ class ContactLedger:
                         return got
                     now = self._now()
                     wait = _SLICE
-                    if partial and self.max_wait is not None:
-                        if blocked_since is None:
-                            blocked_since = now
-                        if now - blocked_since >= self.max_wait:
-                            return []
-                        wait = min(wait, max(blocked_since + self.max_wait - now, 0.01))
+                    refusals += 1
+                    if _unreachable(self.limiter):
+                        # An absent daemon is not a busy network: it does not count against max_wait.
+                        blocked_since = None
+                        wait = _retry_in(self.limiter)
+                    else:
+                        wait = hint_delay(reason, hint, refusals - 1, wait)
+                        if partial and self.max_wait is not None:
+                            if blocked_since is None:
+                                blocked_since = now
+                            if now - blocked_since >= self.max_wait:
+                                return []
+                            wait = min(wait, max(blocked_since + self.max_wait - now, 0.01))
                 _nap(min(_SLICE, max(wait, 0.01)), self._sleep, self._stop)
         finally:
             if self.limiter is not None:

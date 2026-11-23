@@ -300,9 +300,39 @@ def _limiterd(args, ap) -> int:
     return 0
 
 
+def _limiter_failure_only(manifest: dict) -> bool:
+    """True when the stage ended unfinished and every failure it recorded is the limiter daemon being unreachable."""
+    try:
+        from scanner.internet import limiterclient
+        kinds = set(limiterclient.failure_kinds())
+    except (ImportError, AttributeError):
+        kinds = set()
+    if kinds - {"limiter"} or manifest.get("abort_reason") or manifest.get("stages_skipped"):
+        return False
+    texts = [str(v) for v in (manifest.get("stage_errors") or {}).values()]
+    named = [t for t in texts if "LimiterOutage" in t or "LimiterUnavailable" in t]
+    if manifest.get("tool_job_errors"):
+        return False
+    return len(named) == len(texts) and bool(named or kinds)
+
+
 def _stage_worker(args, cfg) -> int:
+    """``_run_stage_worker`` with the start wait of the limiter client defaulted for this call only."""
+    import os
+    key = "SCANNER_LIMITER_START_WAIT"
+    was_set = key in os.environ
+    try:
+        return _run_stage_worker(args, cfg)
+    finally:
+        if not was_set:
+            os.environ.pop(key, None)
+
+
+def _run_stage_worker(args, cfg) -> int:
     """One stage of one shard for the decoupled coordinator. Exit 0 only when the manifest shows the stage finished;
-    ``coordinator.EXIT_RECYCLE`` asks for a fresh process, 2 is a refusal, anything else a failed attempt."""
+    ``coordinator.EXIT_RECYCLE`` asks for a fresh process, ``coordinator.EXIT_LIMITER`` says the limiter daemon was
+    unreachable and nothing else went wrong, 2 is a refusal, anything else a failed attempt."""
+    import os
     from dataclasses import replace
     from scanner.internet import coordinator, supervisor
     if args.stage is None or args.stage_run_dir is None or args.shard is None or not 0 <= args.shard < cfg.shards:
@@ -316,6 +346,7 @@ def _stage_worker(args, cfg) -> int:
         print("the coordinator is gone; not starting", file=sys.stderr)
         return coordinator.EXIT_RECYCLE
     shard_cfg = replace(cfg, shard=args.shard)
+    os.environ.setdefault("SCANNER_LIMITER_START_WAIT", f"{coordinator.LIMITER_START_WAIT:g}")
     try:
         shard_cfg = _favicon_overrides(args, shard_cfg)       # --favicon-processes and --favicon-max-active-requests of the coordinator
         if args.stage == "zmap":
@@ -335,12 +366,14 @@ def _stage_worker(args, cfg) -> int:
         return coordinator.EXIT_RECYCLE
     except Exception as exc:
         print(f"RUN ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if type(exc).__name__ in ("LimiterOutage", "LimiterUnavailable") and _limiter_failure_only({"stage_errors": {"run": type(exc).__name__}}):
+            return coordinator.EXIT_LIMITER
         return 3
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8")) if (run_dir / "manifest.json").is_file() else {}
     if not coordinator.stage_done_in(args.stage, manifest):
         print(f"WARNING: the {args.stage} stage did not finish (abort_reason={manifest.get('abort_reason')}, "
               f"errors={manifest.get('stage_errors')})", file=sys.stderr)
-        return 5
+        return coordinator.EXIT_LIMITER if _limiter_failure_only(manifest) else 5
     print(f"done: {args.stage} {run_dir}", flush=True)
     return 0
 
@@ -700,7 +733,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = coordinator.run_decoupled(cfg, config_path=args.config, confirm=args.confirm, network_workers=args.network_workers,
                                                    favicon_workers=args.favicon_workers or coordinator.DEFAULT_FAVICON_WORKERS,
                                                    retry_failed=args.retry_failed, zmap_lock=args.zmap_lock_file,
-                                                   worker_args=tuple(worker_args), allow_per_process_limits=args.allow_per_process_limits, **span)
+                                                   worker_args=tuple(worker_args), allow_per_process_limits=args.allow_per_process_limits,
+                                                   limiter_probe=coordinator.probe_limiter, **span)
             else:
                 result = (run_campaign(cfg, pipeline_depth=args.pipeline, config_path=args.config, **span) if args.pipeline > 1
                           else run_campaign(cfg, **span))
